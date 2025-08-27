@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Entornos
+.venv/
+.env
+
+# Datos pesados
+/data/*.parquet
+/data/*.csv
+
+# Configs sensibles
+/configs/*.json
+/configs/*.yaml

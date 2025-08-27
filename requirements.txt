@@ -1,0 +1,26 @@
+# Core
+pandas
+numpy
+duckdb
+pyarrow
+matplotlib
+seaborn
+
+# ML / DL
+scikit-learn
+xgboost
+lightgbm
+torch
+
+# AutoGen (multi-agente)
+autogen
+
+# Trading & APIs
+yfinance
+tweepy
+praw
+
+# Utils
+requests
+python-dotenv
+jupyter
