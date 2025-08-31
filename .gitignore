@@ -13,3 +13,16 @@ __pycache__/
 # Configs sensibles
 /configs/*.json
 /configs/*.yaml
+
+# Models
+/models
+
+/debugs_agent.py
+
+/data/
+
+.pytest_cache
+
+requirements-dev.txt
+
+venv
