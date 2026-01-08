@@ -200,7 +200,10 @@ class OrchestratorDecisionAgent:
         if not path.exists():
             return []
         df = pd.read_csv(path)
-        keep = ["ticker", "score", "expected_return", "investment_type"]
+        keep = [
+            "ticker", "score", "expected_return_pct", "investment_type",
+            "volatilidad_pct", "sector", "liquidez", "sentimiento"
+        ]
         for col in keep:
             if col not in df.columns:
                 df[col] = None

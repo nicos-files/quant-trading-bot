@@ -39,6 +39,13 @@ def select_relevant_features(df, target_col, threshold_var=1e-5, max_null_pct=0.
     ]
     return selected
 
+def time_split_indices(df, test_size=0.3, time_col="timestamp_proceso"):
+    if time_col not in df.columns:
+        return None
+    df_sorted = df.sort_values(time_col)
+    split_idx = int(len(df_sorted) * (1 - test_size))
+    return df_sorted.index[:split_idx], df_sorted.index[split_idx:]
+
 
 
 def parse_args():
@@ -112,15 +119,20 @@ for label, target_col in targets_clf.items():
     }
 
     try:
-        df_model = df.dropna(subset=[target_col])
-        df_model = df_model.drop(columns=[col for col in drop_cols if col in df_model.columns])
-        selected_features = select_relevant_features(df_model, target_col)
+        df_model = df.dropna(subset=[target_col]).copy()
+        feature_df = df_model.drop(columns=[col for col in drop_cols if col in df_model.columns and col != target_col])
+        selected_features = select_relevant_features(feature_df, target_col)
         log_entry["selected_features"] = selected_features
-        X = df_model[selected_features].fillna(0)
+        X_all = feature_df[selected_features].fillna(0)
+        y_all = df_model[target_col]
 
-        y = df_model[target_col]
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+        split_idx = time_split_indices(df_model, test_size=0.3)
+        if split_idx:
+            train_idx, test_idx = split_idx
+            X_train, X_test = X_all.loc[train_idx], X_all.loc[test_idx]
+            y_train, y_test = y_all.loc[train_idx], y_all.loc[test_idx]
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.3, random_state=42)
 
         model = xgb.XGBClassifier(use_label_encoder=False, eval_metric="logloss", random_state=42)
         model.fit(X_train, y_train)
@@ -180,11 +192,20 @@ for label, target_col in targets_reg.items():
     }
 
     try:
-        df_model = df.dropna(subset=[target_col])
-        X = df_model.drop(columns=drop_cols)
-        y = df_model[target_col]
+        df_model = df.dropna(subset=[target_col]).copy()
+        feature_df = df_model.drop(columns=[col for col in drop_cols if col in df_model.columns and col != target_col])
+        selected_features_reg = select_relevant_features(feature_df, target_col)
+        log_entry["selected_features"] = selected_features_reg
+        X_all = feature_df[selected_features_reg].fillna(0)
+        y_all = df_model[target_col]
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+        split_idx = time_split_indices(df_model, test_size=0.3)
+        if split_idx:
+            train_idx, test_idx = split_idx
+            X_train, X_test = X_all.loc[train_idx], X_all.loc[test_idx]
+            y_train, y_test = y_all.loc[train_idx], y_all.loc[test_idx]
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.3, random_state=42)
 
         model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=100, random_state=42)
         model.fit(X_train, y_train)
@@ -202,7 +223,7 @@ for label, target_col in targets_reg.items():
         print(f" Modelo guardado: {model_path}")
 
         importance = model.feature_importances_
-        features = X.columns
+        features = X_all.columns
         sorted_idx = np.argsort(importance)[::-1]
 
         plt.figure(figsize=(10, 6))
@@ -220,7 +241,7 @@ for label, target_col in targets_reg.items():
             "rmse": round(rmse, 5),
             "r2_score": round(r2, 5),
             "modelo_path": model_path,
-            "selected_features": selected_features 
+            "selected_features": selected_features_reg
         })
 
     except Exception as e:

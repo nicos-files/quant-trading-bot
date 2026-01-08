@@ -35,7 +35,7 @@ class IntradayDecisionAgent:
         max_positions = context.get("max_positions", 10)
 
         # Filtrar señales relevantes y completas
-        required_keys = ["ticker", "score", "expected_return"]
+        required_keys = ["ticker", "score", "expected_return_pct"]
         signals = [s for s in raw_signals if s.get("investment_type") == "intraday"]
         signals = [s for s in signals if all(k in s for k in required_keys)]
         signals = sorted(signals, key=lambda x: x.get("score", 0), reverse=True)[:30]
@@ -51,7 +51,7 @@ class IntradayDecisionAgent:
         for s in signals:
             ticker = s["ticker"]
             score = round(s["score"], 2)
-            ret_val = s.get("expected_return")
+            ret_val = s.get("expected_return_pct")
             ret = round(ret_val, 2) if isinstance(ret_val, (int, float)) else "N/A"
             sent = sentiment.get(ticker, [{}])[0].get("combined_score", "N/A")
             prompt += f"{ticker}: score={score}, ret={ret}, sent={sent}\n"

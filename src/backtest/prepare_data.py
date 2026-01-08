@@ -10,7 +10,14 @@ def prepare_data(features_path, model_path, clip_ret, stop_loss, take_profit):
 
     # Validar índice temporal
     if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("El índice del dataset no es de tipo fecha. Se esperaba un DatetimeIndex.")
+        if "timestamp_proceso" in df.columns:
+            df["timestamp_proceso"] = pd.to_datetime(df["timestamp_proceso"], errors="coerce")
+            df = df.set_index("timestamp_proceso")
+        elif "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.set_index("date")
+        else:
+            raise ValueError("No se encontro un indice temporal valido (index, timestamp_proceso o date).")
     df.index = df.index.normalize()
 
     # Validar columna ticker

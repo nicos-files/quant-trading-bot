@@ -15,15 +15,20 @@ ALPHA_VANTAGE_API_KEY = "TGES6LEV1PPQSVIB"
 ROOT = Path(__file__).resolve().parents[3] 
 RAW_PATH = ROOT / "data" / "raw"/"prices"
 
+def has_prior_data(ticker: str) -> bool:
+    base = RAW_PATH / "alphaV" / ticker
+    return base.exists() and any(base.rglob("*.parquet"))
+
 def fetch_from_alpha_vantage(ticker: str) -> Optional[pd.DataFrame]:
     print(f"Alpha Vantage: {ticker}")
     symbol = ticker.replace(".US", "").replace(".BA", "")
 
     url = "https://www.alphavantage.co/query"
+    outputsize = "compact" if has_prior_data(ticker) else "full"
     params = {
         "function": "TIME_SERIES_DAILY",
         "symbol": symbol,
-        "outputsize": "full",
+        "outputsize": outputsize,
         "apikey": ALPHA_VANTAGE_API_KEY
     }
 

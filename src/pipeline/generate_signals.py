@@ -57,7 +57,7 @@ def load_data(date_str: Optional[str]):
     df = pd.read_parquet(path)
 
     # Filtrado mínimo para señales de largo plazo
-    df = df.dropna(subset=["target_regresion_t+1", "target_clasificacion_t+1"])
+    # Evita filtrar por labels futuros en inferencia
 
     return df
 
@@ -105,9 +105,30 @@ def estimate_volatility_pct(df: pd.DataFrame) -> pd.Series:
         return vol
     return pd.Series(np.nan, index=df.index)
 
+def estimate_expected_return_pct(df: pd.DataFrame, window: int = 60) -> pd.Series:
+    """
+    Estima retorno esperado por ticker usando mediana de retornos recientes.
+    No usa labels futuros.
+    """
+    use_col = "daily_return_t-1" if "daily_return_t-1" in df.columns else "daily_return"
+    if use_col not in df.columns:
+        return pd.Series(np.nan, index=df.index)
+    df_sorted = df.sort_values("timestamp_proceso") if "timestamp_proceso" in df.columns else df
+    medians = df_sorted.groupby("ticker")[use_col].apply(lambda s: s.tail(window).median())
+    return df["ticker"].map(medians) * 100.0
+
+def select_latest_snapshot(df: pd.DataFrame) -> pd.DataFrame:
+    if "timestamp_proceso" in df.columns:
+        latest_ts = df["timestamp_proceso"].max()
+        return df[df["timestamp_proceso"] == latest_ts].copy()
+    return df.sort_index().groupby("ticker").tail(1).copy()
+
 def infer_investment_type(row) -> str:
     # Umbral de 2% para “long_term” vs “intraday”
-    return "long_term" if abs(row["target_regresion_t+1"]) > 0.02 else "intraday"
+    exp_ret = row.get("expected_return_pct")
+    if exp_ret is None or pd.isna(exp_ret):
+        return "intraday"
+    return "long_term" if abs(exp_ret) > 2.0 else "intraday"
 
 def score_and_predict(df: pd.DataFrame, model):
     # Obtener las columnas que el modelo espera
@@ -140,7 +161,11 @@ def optional_equity(df: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
         return df  # sin timestamp, omitimos equity
 
     df_equity = df.copy()
-    df_equity["estrategia_return"] = np.where(df_equity["prediccion"] == 1, df_equity["target_regresion_t+1"], 0.0)
+    df_equity["estrategia_return"] = np.where(
+        df_equity["prediccion"] == 1,
+        (df_equity.get("expected_return_pct", 0.0) / 100.0),
+        0.0
+    )
     df_equity["estrategia_return"] = pd.to_numeric(df_equity["estrategia_return"], errors="coerce").fillna(0.0)
     df_equity["estrategia_return"] = df_equity["estrategia_return"].clip(-0.5, 0.5)
 
@@ -158,7 +183,9 @@ def optional_equity(df: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
 def generate_signals(df: pd.DataFrame) -> list[dict]:
     signals = []
     for _, row in df.iterrows():
-        retorno_pct = round(float(row["target_regresion_t+1"]) * 100.0, 2)
+        retorno_pct = 0.0
+        if "expected_return_pct" in df.columns and not pd.isna(row["expected_return_pct"]):
+            retorno_pct = round(float(row["expected_return_pct"]), 2)
         sentimiento = None
         # Si tenés ambas columnas, combinamos; si no, usamos la disponible
         if "sentimiento_especifico" in df.columns and "sentimiento_general" in df.columns:
@@ -229,21 +256,22 @@ def print_summary(signals: list[dict]):
 
 def main():
     args = parse_args()
-    df = load_data(args.date)
-    df = enrich_with_metadata(df)
-    # Volatilidad estimada
-    df["volatilidad_pct"] = estimate_volatility_pct(df)
+    df_all = load_data(args.date)
+    df_all = enrich_with_metadata(df_all)
+    df_all["volatilidad_pct"] = estimate_volatility_pct(df_all)
+    df_all["expected_return_pct"] = estimate_expected_return_pct(df_all)
 
     # Score y predicción
     model = load_model()
-    df = score_and_predict(df, model)
+    df_latest = select_latest_snapshot(df_all)
+    df_latest = score_and_predict(df_latest, model)
 
     # Opcional equity conservadora por timestamp
     if args.simulate_equity:
-        df = optional_equity(df, initial_capital=args.equity_initial)
+        df_latest = optional_equity(df_latest, initial_capital=args.equity_initial)
 
     # Generar señales
-    signals = generate_signals(df)
+    signals = generate_signals(df_latest)
 
     # Filtro y ranking
     signals = filter_and_rank(signals, min_score=args.min_score, top_n=args.top_n)
@@ -251,25 +279,10 @@ def main():
     # Guardar
     save_signals(signals)
     if args.simulate_equity:
-        save_equity_outputs(df)
+        save_equity_outputs(df_latest)
 
     print_summary(signals)
 
 if __name__ == "__main__":
-    args = parse_args()
-    df = load_data(args.date)
-    df = enrich_with_metadata(df)
-    df["volatilidad_pct"] = estimate_volatility_pct(df)
-
-    model = load_model()
-    df = score_and_predict(df, model)
-
-    if args.simulate_equity:
-        df = optional_equity(df, args.equity_initial)
-        save_equity_outputs(df)
-
-    signals = generate_signals(df)
-    filtered = filter_and_rank(signals, args.min_score, args.top_n)
-    save_signals(filtered)
-    print_summary(filtered)
+    main()
 

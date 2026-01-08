@@ -30,6 +30,24 @@ ROOT = Path(__file__).resolve().parents[3]
 RAW_PATH = ROOT / "data" / "raw"
 REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
+def get_latest_raw_date(ticker: str) -> Optional[pd.Timestamp]:
+    base = RAW_PATH / FUENTE / ticker
+    if not base.exists():
+        return None
+    files = list(base.rglob("*.parquet"))
+    if not files:
+        return None
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    try:
+        df = pd.read_parquet(latest)
+        if "date" in df.columns:
+            return pd.to_datetime(df["date"], errors="coerce").max()
+        if df.index.name and isinstance(df.index, pd.DatetimeIndex):
+            return df.index.max()
+    except Exception:
+        return None
+    return None
+
 def save_raw_data(df: pd.DataFrame, fuente: str, ticker: str, date: datetime, hour: Optional[str]):
     target_dir = ensure_date_dir(
         base=RAW_PATH / fuente / ticker,
@@ -43,7 +61,14 @@ def save_raw_data(df: pd.DataFrame, fuente: str, ticker: str, date: datetime, ho
 def fetch_price_data(ticker: str) -> Optional[pd.DataFrame]:
     print(f" Intentando descargar {ticker} desde Stooq...")
     try:
-        df = web.DataReader(ticker, "stooq", START_DATE, END_DATE)
+        latest_dt = get_latest_raw_date(ticker)
+        start_date = START_DATE
+        if latest_dt is not None and pd.notna(latest_dt):
+            start_date = (latest_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            if start_date >= END_DATE:
+                print(f" {ticker}: sin nuevos datos desde {latest_dt.date()}")
+                return None
+        df = web.DataReader(ticker, "stooq", start_date, END_DATE)
         if df.empty:
             print(f" Stooq sin datos para {ticker}")
             return None
@@ -54,6 +79,8 @@ def fetch_price_data(ticker: str) -> Optional[pd.DataFrame]:
     df.reset_index(inplace=True)
     df.columns = [col.lower() for col in df.columns]
     df["ticker"] = ticker
+    if "date" in df.columns:
+        df = df.sort_values("date")
 
     if not all(col in df.columns for col in REQUIRED_COLS):
         print(f" Datos incompletos para {ticker}, se omite.")

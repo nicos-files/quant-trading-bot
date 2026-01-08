@@ -1,6 +1,7 @@
 # src/utils/cache_manager.py
 
 import os
+from pathlib import Path
 import pandas as pd
 import hashlib
 import re
@@ -23,15 +24,22 @@ def hash_text(text: str) -> str:
     return hashlib.md5(texto_norm.encode("utf-8")).hexdigest()
 
 
-def load_cache(cache_file: str) -> dict:
-    path = os.path.join(CACHE_PATH, cache_file)
+def _resolve_cache_path(cache_file) -> str:
+    if isinstance(cache_file, Path):
+        return str(cache_file)
+    if isinstance(cache_file, str) and (os.sep in cache_file or cache_file.startswith(".")):
+        return cache_file
+    return os.path.join(CACHE_PATH, cache_file)
+
+def load_cache(cache_file) -> dict:
+    path = _resolve_cache_path(cache_file)
     if os.path.exists(path):
         df = pd.read_parquet(path)
         return dict(zip(df["hash"], df["respuesta"]))
     return {}
 
-def save_to_cache(cache_file: str, nuevos: list):
-    path = os.path.join(CACHE_PATH, cache_file)
+def save_to_cache(cache_file, nuevos: list):
+    path = _resolve_cache_path(cache_file)
     df_nuevos = pd.DataFrame(nuevos)
     if os.path.exists(path):
         df_existente = pd.read_parquet(path)

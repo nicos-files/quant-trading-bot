@@ -31,7 +31,7 @@ PRICE_CHANGE_THRESHOLD_PCT = 0.10
 
 # Globs esperados (Parquet por la refactorización)
 EXPECTED_RAW = {
-    "alphaV": RAW_DIR / "fundamentals" / "alphaV",
+    "alphaV": RAW_DIR / "prices" / "alphaV",
     "prices": RAW_DIR / "prices",
     "fundamentals": RAW_DIR / "fundamentals",
     "sentiment": RAW_DIR / "sentiment"
