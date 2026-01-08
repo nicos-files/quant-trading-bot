@@ -1,29 +1,21 @@
+import os
+from openai import OpenAI
+
 class StrategyAgent:
-    def __init__(self, name="StrategyAgent"):
-        self.name = name
+    def __init__(self, model="gpt-4o", api_key=os.getenv("OPENAI_API_KEY")):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
 
-    def generate_strategy(self, sentiment, indicators, fundamentals, prediction_score):
-        """
-        Combina los inputs y genera una estrategia de inversión.
-        """
-        strategy = {}
-
-        # Evaluación básica
-        if prediction_score > 0.7 and sentiment == "positivo":
-            strategy["acción"] = "comprar"
-            strategy["justificación"] = "El modelo predice alta probabilidad de éxito y el sentimiento es positivo."
-        elif prediction_score < 0.4 or sentiment == "negativo":
-            strategy["acción"] = "evitar"
-            strategy["justificación"] = "El riesgo es alto por baja predicción o sentimiento negativo."
-        else:
-            strategy["acción"] = "mantener"
-            strategy["justificación"] = "No hay señales claras, se recomienda esperar."
-
-        # Agregar contexto técnico y fundamental
-        strategy["RSI"] = indicators.get("RSI")
-        strategy["MACD"] = indicators.get("MACD")
-        strategy["SMA"] = indicators.get("SMA")
-        strategy["ROE"] = fundamentals.get("ROE")
-        strategy["P/E"] = fundamentals.get("PE")
-
-        return strategy
+    def generate_strategy(self, contexto):
+        prompt = (
+            "Sos un estratega financiero con razonamiento avanzado. "
+            "Tu tarea es combinar señales de modelos predictivos, sentimiento del mercado, "
+            "y análisis fundamental para recomendar acciones concretas: comprar, vender, mantener o ajustar riesgo. "
+            f"Contexto: {contexto}"
+        )
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        return response.choices[0].message.content.strip()

@@ -9,8 +9,8 @@ from execution.ingest.fetch_prices import fetch_price_data_safe, save_to_parquet
 from execution.ingest.scrape_news import get_all_headlines
 from features.technical_indicators import calculate_indicators
 from features.fundamental_analysis import get_fundamentals
-from features.feature_engineering import combine_features
-from agents.strategy_agent import StrategyAgent
+from pipeline.feature_engineering import combine_features
+from agents.strategy_llm_agent import StrategyAgent
 from agents.agent_definitions import sentiment_agent
 import pandas as pd 
 

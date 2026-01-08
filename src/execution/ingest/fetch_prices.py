@@ -1,74 +1,78 @@
+import time
+import argparse
+import pandas as pd
+from pathlib import Path
 from pandas_datareader import data as web
 from datetime import datetime
-import pandas as pd
-import os
+from typing import Optional
+from src.utils.execution_context import (
+    get_execution_date,
+    get_execution_hour,
+    ensure_date_dir
+)
 
-
+# Tickers
 tickers_us = [
-    "AAPL.US",   # Apple
-    "TSLA.US",   # Tesla
-    "GOOGL.US",  # Google (Alphabet)
-    "MSFT.US",   # Microsoft
-    "META.US",   # Meta (Facebook)
-    "NVDA.US",   # Nvidia
-    "AMZN.US",   # Amazon
-    "JPM.US",    # JPMorgan Chase
-    "BRK.B.US",  # Berkshire Hathaway
-    "V.US",      # Visa
-    "MA.US",     # Mastercard
-    "DIS.US",    # Disney
-    "NFLX.US",   # Netflix
-    "INTC.US",   # Intel
-    "AMD.US",    # AMD
+    "AAPL.US", "TSLA.US", "GOOGL.US", "MSFT.US", "META.US", "NVDA.US",
+    "AMZN.US", "JPM.US", "BRK.B.US", "V.US", "MA.US", "DIS.US", "NFLX.US",
+    "INTC.US", "AMD.US"
 ]
 
 tickers_ba = [
-    "GGAL.BA",   # Grupo Galicia
-    "YPFD.BA",   # YPF
-    "PAMP.BA",   # Pampa Energía
-    "BMA.BA",    # Banco Macro
-    "TXAR.BA",   # Ternium
-    "CEPU.BA",   # Central Puerto
-    "AAPL.BA",   # CEDEAR Apple
-    "TSLA.BA",   # CEDEAR Tesla
-    "GOOGL.BA",  # CEDEAR Google
-    "MSFT.BA",   # CEDEAR Microsoft
+    "GGAL.BA", "YPFD.BA", "PAMP.BA", "BMA.BA", "TXAR.BA", "CEPU.BA",
+    "AAPL.BA", "TSLA.BA", "GOOGL.BA", "MSFT.BA"
 ]
 
+START_DATE = "2018-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+FUENTE = "prices"
+ROOT = Path(__file__).resolve().parents[3] 
+RAW_PATH = ROOT / "data" / "raw"
+REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
+def save_raw_data(df: pd.DataFrame, fuente: str, ticker: str, date: datetime, hour: Optional[str]):
+    target_dir = ensure_date_dir(
+        base=RAW_PATH / fuente / ticker,
+        date=date,
+        hour=hour
+    )
+    path = target_dir / f"{fuente}_{ticker}.parquet"
+    df.to_parquet(path)
+    print(f" Guardado: {path}")
 
-def fetch_price_data_safe(ticker, start="2023-01-01", end="2025-08-29"):
-    print(f"📡 Intentando descargar {ticker}...")
+def fetch_price_data(ticker: str) -> Optional[pd.DataFrame]:
+    print(f" Intentando descargar {ticker} desde Stooq...")
     try:
-        df = web.DataReader(ticker, "stooq", start, end)
+        df = web.DataReader(ticker, "stooq", START_DATE, END_DATE)
         if df.empty:
-            print(f"⚠️ Sin datos para {ticker}.")
+            print(f" Stooq sin datos para {ticker}")
             return None
-        df.reset_index(inplace=True)
-        df["ticker"] = ticker
-        print(f"✅ {ticker}: {len(df)} registros.")
-        return df
     except Exception as e:
-        print(f"❌ Error con {ticker}: {e}")
+        print(f" Error con Stooq para {ticker}: {e}")
         return None
 
-# Ejecutar con fallback
-all_tickers = tickers_ba + tickers_us
-dataframes = []
+    df.reset_index(inplace=True)
+    df.columns = [col.lower() for col in df.columns]
+    df["ticker"] = ticker
 
-for ticker in all_tickers:
-    df = fetch_price_data_safe(ticker)
-    if df is not None:
-        dataframes.append(df)
+    if not all(col in df.columns for col in REQUIRED_COLS):
+        print(f" Datos incompletos para {ticker}, se omite.")
+        return None
 
+    return df
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", type=str, help="Fecha en formato YYYY-MM-DD")
+    parser.add_argument("--hour", type=str, help="Hora en formato HHMM")
+    args = parser.parse_args()
 
-def save_to_parquet(df: pd.DataFrame, ticker: str):
-    """
-    Guarda el DataFrame en formato Parquet en data/raw/
-    """
-    os.makedirs("data/raw/", exist_ok=True)
-    path = f"data/raw/{ticker.replace('.', '_')}.parquet"
-    df.to_parquet(path, index=False)
-    print(f"✅ Datos guardados en {path}")
+    date = get_execution_date(args.date)
+    hour = get_execution_hour(args.hour)
 
+    all_tickers = tickers_ba + tickers_us
+    for ticker in all_tickers:
+        df = fetch_price_data(ticker)
+        if df is not None:
+            save_raw_data(df, fuente=FUENTE, ticker=ticker, date=date, hour=hour)
+        time.sleep(1)  # para evitar bloqueos por exceso de llamadas
