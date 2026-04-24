@@ -32,7 +32,7 @@ class IntradayCryptoEngineTests(unittest.TestCase):
         self.assertIsInstance(result, EngineResult)
         self.assertIsInstance(result.recommendations, RecommendationOutput)
         self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
-        self.assertTrue(any("No crypto symbols configured" in warning for warning in result.diagnostics.warnings))
+        self.assertTrue(any("No crypto universe configured" in warning for warning in result.diagnostics.warnings))
 
     def test_non_crypto_universe_is_noop(self) -> None:
         engine = IntradayCryptoEngine()
@@ -41,13 +41,14 @@ class IntradayCryptoEngineTests(unittest.TestCase):
             run_id="20260421-1200",
             mode="test",
             universe=["AAPL", "MSFT", "GGAL.BA"],
+            config={"crypto_universe": [{"symbol": "BTCUSDT", "enabled": False, "strategy_enabled": False}]},
             metadata={"asof_date": "2026-04-21"},
         )
 
         result = engine.run(context)
 
         self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
-        self.assertEqual(result.diagnostics.metadata["crypto_symbols_seen"], [])
+        self.assertEqual(result.diagnostics.metadata["enabled_crypto_symbols"], [])
 
     def test_crypto_universe_detects_symbols_and_returns_safe_noop(self) -> None:
         engine = IntradayCryptoEngine()
@@ -56,16 +57,22 @@ class IntradayCryptoEngineTests(unittest.TestCase):
             run_id="20260421-1200",
             mode="test",
             universe=["BTC-USD", "ETH/USDT", "AAPL"],
+            config={
+                "crypto_universe": [
+                    {"symbol": "BTCUSDT", "enabled": True, "strategy_enabled": False},
+                    {"symbol": "ETHUSDT", "enabled": True, "strategy_enabled": False},
+                ]
+            },
             metadata={"asof_date": "2026-04-21"},
         )
 
         result = engine.run(context)
 
-        self.assertEqual(result.diagnostics.metadata["crypto_symbols_seen"], ["BTC-USD", "ETH/USDT"])
+        self.assertEqual(result.diagnostics.metadata["crypto_symbols_seen"], ["BTCUSDT", "ETHUSDT"])
         self.assertIn("AAPL", result.diagnostics.metadata["non_crypto_symbols_ignored"])
         self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
         self.assertTrue(
-            any("Crypto-specific scoring is not implemented yet" in warning for warning in result.diagnostics.warnings)
+            any("strategy disabled" in warning for warning in result.diagnostics.warnings)
         )
 
     def test_explicit_crypto_config_is_supported(self) -> None:
@@ -81,7 +88,7 @@ class IntradayCryptoEngineTests(unittest.TestCase):
 
         result = engine.run(context)
 
-        self.assertEqual(result.diagnostics.metadata["crypto_symbols_seen"], ["BTC-USD"])
+        self.assertEqual(result.diagnostics.metadata["crypto_symbols_seen"], ["BTCUSDT"])
         self.assertIsInstance(result.recommendations, RecommendationOutput)
 
 

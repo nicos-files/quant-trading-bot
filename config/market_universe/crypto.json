@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "market": "crypto",
+  "default_quote_currency": "USDT",
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "base": "BTC",
+      "quote": "USDT",
+      "exchange": "binance_spot",
+      "asset_class": "crypto",
+      "enabled": true,
+      "min_timeframe": "1m",
+      "strategy_enabled": false,
+      "paper_enabled": true,
+      "live_enabled": false
+    },
+    {
+      "symbol": "ETHUSDT",
+      "base": "ETH",
+      "quote": "USDT",
+      "exchange": "binance_spot",
+      "asset_class": "crypto",
+      "enabled": true,
+      "min_timeframe": "1m",
+      "strategy_enabled": false,
+      "paper_enabled": true,
+      "live_enabled": false
+    }
+  ]
+}

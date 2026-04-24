@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-from typing import Iterable
-
 from src.decision_intel.contracts.recommendations.recommendation_models import RecommendationOutput
+from src.market_data.crypto_symbols import enabled_crypto_symbols, is_crypto_symbol, load_crypto_universe, normalize_crypto_symbol
 
 from .base import EngineContext, EngineDiagnostics, EngineResult
-
-
-_CRYPTO_TOKENS = ("BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE")
 
 
 class IntradayCryptoEngine:
@@ -16,48 +12,87 @@ class IntradayCryptoEngine:
 
     def run(self, context: EngineContext) -> EngineResult:
         diagnostics = EngineDiagnostics(engine_name=self.name)
-        crypto_symbols = self._detect_crypto_symbols(context)
-        diagnostics.metadata["crypto_symbols_seen"] = list(crypto_symbols)
-        diagnostics.metadata["non_crypto_symbols_ignored"] = sorted(set(context.universe) - set(crypto_symbols))
+        crypto_config = self._load_crypto_config(context)
+        provider_name = str(context.metadata.get("crypto_provider_name") or "binance_spot")
+        provider_health = context.provider_health.get(provider_name) if isinstance(context.provider_health, dict) else None
 
-        if not crypto_symbols:
-            diagnostics.warnings.append("No crypto symbols configured; intraday crypto engine skipped.")
-            return EngineResult(
-                engine_name=self.name,
-                horizon=self.horizon,
-                recommendations=self._empty_output(context),
-                diagnostics=diagnostics,
+        diagnostics.metadata["provider_name"] = provider_name
+        diagnostics.metadata["provider_health"] = provider_health
+
+        if crypto_config is None:
+            diagnostics.metadata["crypto_symbols_seen"] = []
+            diagnostics.metadata["enabled_crypto_symbols"] = []
+            diagnostics.metadata["strategy_enabled_count"] = 0
+            diagnostics.metadata["non_crypto_symbols_ignored"] = sorted(
+                symbol for symbol in (context.universe or []) if not is_crypto_symbol(symbol)
             )
+            diagnostics.warnings.append("No crypto universe configured; intraday crypto engine skipped.")
+            return self._result(context, diagnostics)
 
-        diagnostics.candidates_seen = len(crypto_symbols)
-        diagnostics.warnings.append("Crypto-specific scoring is not implemented yet; engine returned no-op.")
+        symbols_seen = [str(item.get("symbol") or "").strip().upper() for item in crypto_config if item.get("symbol")]
+        enabled_symbols = enabled_crypto_symbols(crypto_config)
+        strategy_enabled = [
+            normalize_crypto_symbol(item.get("symbol", ""))
+            for item in crypto_config
+            if item.get("enabled") and item.get("strategy_enabled")
+        ]
+        diagnostics.metadata["crypto_symbols_seen"] = symbols_seen
+        diagnostics.metadata["enabled_crypto_symbols"] = enabled_symbols
+        diagnostics.metadata["strategy_enabled_count"] = len([item for item in strategy_enabled if item])
+        diagnostics.metadata["non_crypto_symbols_ignored"] = sorted(
+            symbol for symbol in (context.universe or []) if not is_crypto_symbol(symbol, crypto_config)
+        )
+        diagnostics.candidates_seen = len(enabled_symbols)
+
+        if not enabled_symbols:
+            diagnostics.warnings.append("No enabled crypto symbols configured; intraday crypto engine skipped.")
+            return self._result(context, diagnostics)
+
+        if isinstance(provider_health, dict) and provider_health.get("status") == "unhealthy":
+            diagnostics.warnings.append("Crypto provider unhealthy; intraday crypto engine remains in no-op mode.")
+
+        if not strategy_enabled:
+            diagnostics.warnings.append("Crypto universe detected but strategy disabled; intraday crypto engine skipped.")
+            return self._result(context, diagnostics)
+
+        diagnostics.warnings.append("Crypto strategy not implemented yet; engine returned no-op.")
+        return self._result(context, diagnostics)
+
+    def _load_crypto_config(self, context: EngineContext) -> list[dict] | None:
+        config_payload = context.config.get("crypto_universe")
+        if isinstance(config_payload, list):
+            return config_payload
+
+        explicit = context.config.get("crypto_symbols")
+        if isinstance(explicit, list):
+            return [
+                {
+                    "symbol": normalize_crypto_symbol(symbol),
+                    "exchange": "binance_spot",
+                    "asset_class": "crypto",
+                    "enabled": True,
+                    "strategy_enabled": False,
+                    "paper_enabled": True,
+                    "live_enabled": False,
+                }
+                for symbol in explicit
+                if normalize_crypto_symbol(symbol)
+            ]
+
+        config_path = context.config.get("crypto_universe_path")
+        if config_path:
+            return load_crypto_universe(config_path)
+        return None
+
+    def _result(self, context: EngineContext, diagnostics: EngineDiagnostics) -> EngineResult:
+        diagnostics.candidates_scored = 0
+        diagnostics.candidates_rejected = diagnostics.candidates_seen
         return EngineResult(
             engine_name=self.name,
             horizon=self.horizon,
             recommendations=self._empty_output(context),
             diagnostics=diagnostics,
         )
-
-    def _detect_crypto_symbols(self, context: EngineContext) -> list[str]:
-        explicit = context.config.get("crypto_symbols")
-        if isinstance(explicit, list):
-            return [str(symbol).strip().upper() for symbol in explicit if str(symbol).strip()]
-
-        universe = [str(symbol).strip().upper() for symbol in (context.universe or []) if str(symbol).strip()]
-        detected: list[str] = []
-        for symbol in universe:
-            if self._looks_like_crypto(symbol):
-                detected.append(symbol)
-        return detected
-
-    def _looks_like_crypto(self, symbol: str) -> bool:
-        upper = symbol.strip().upper()
-        if any(token in upper for token in _CRYPTO_TOKENS):
-            return True
-        if upper.endswith(("-USD", "-USDT", "/USD", "/USDT")):
-            base = upper.split("-")[0].split("/")[0]
-            return base in _CRYPTO_TOKENS
-        return False
 
     def _empty_output(self, context: EngineContext) -> RecommendationOutput:
         return RecommendationOutput.build(

@@ -17,9 +17,12 @@ from src.decision_intel.exports.artifact_exporter import export_artifacts
 from src.decision_intel.integrations.quant_trading_bot_adapter import build_decision_intel_artifacts
 from src.decision_intel.policies.topk_net_after_fees import CAPITAL_USD
 from src.engines import EngineContext, IntradayCryptoEngine, LongTermPortfolioEngine
+from src.market_data.crypto_symbols import enabled_crypto_symbols, load_crypto_universe
+from src.market_data.providers import BinanceSpotMarketDataProvider
 
 ROOT = Path(__file__).resolve().parents[2]
 FEATURES_BASE = ROOT / "data" / "processed" / "features"
+CRYPTO_UNIVERSE_PATH = ROOT / "config" / "market_universe" / "crypto.json"
 INTRADAY_MODEL_PATH = ROOT / "models" / "xgb_clf_intraday.pkl"
 INTRADAY_MODEL_FALLBACK_PATH = ROOT / "models" / "xgb_clf_futuro.pkl"
 LONG_TERM_MODEL_PATH = ROOT / "models" / "xgb_reg_long_term.pkl"
@@ -420,14 +423,21 @@ def _generate_final_decision(
         if "ticker" in current_df.columns
         else []
     )
+    crypto_universe = load_crypto_universe(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else []
+    crypto_provider_health = _load_crypto_provider_health() if crypto_universe else {}
     engine_context = EngineContext(
         as_of=_parse_date(asof_date),
         run_id=run_id,
         mode="decision_generation",
         universe=universe,
         prices=current_df,
-        config={},
-        provider_health={},
+        config={
+            "crypto_universe_path": str(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else None,
+            "crypto_universe": crypto_universe,
+            "crypto_symbols": enabled_crypto_symbols(crypto_universe) if crypto_universe else [],
+            "enable_crypto_market_data": _env_flag("ENABLE_CRYPTO_MARKET_DATA"),
+        },
+        provider_health=crypto_provider_health,
         metadata={
             "asof_date": asof_date,
             "execution_date": execution_date,
@@ -436,6 +446,7 @@ def _generate_final_decision(
             "history_df": history_df,
             "top_k": top_k,
             "oos_ticker_stats": oos_ticker_stats,
+            "crypto_provider_name": BinanceSpotMarketDataProvider.provider_name,
         },
     )
 
@@ -486,6 +497,25 @@ def _log_engine_result(result: Any) -> None:
     )
     for warning in diagnostics.warnings:
         print(f"[RUN-ALL] engine={result.engine_name} warning={warning}")
+
+
+def _env_flag(name: str) -> bool:
+    value = str(os.getenv(name) or "").strip().lower()
+    return value in {"1", "true", "yes", "y", "si", "s"}
+
+
+def _load_crypto_provider_health() -> dict[str, dict[str, str]]:
+    if not _env_flag("ENABLE_CRYPTO_MARKET_DATA"):
+        return {}
+    provider = BinanceSpotMarketDataProvider()
+    health = provider.health_check()
+    return {
+        provider.provider_name: {
+            "status": health.status,
+            "message": health.message,
+            "checked_at_utc": health.checked_at_utc,
+        }
+    }
 
 
 def _resolve_model_path(primary: Path, fallback: Path | None = None) -> Path:
