@@ -23,7 +23,8 @@ HASH_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 TICKERS = ["AAPL", "TSLA", "GOOGL", "MSFT", "META", "NVDA", "AMZN"]
 API_KEY = "9a1cce8fb2df4f2f9b47b238e68e6a3e"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "quant-trading-bot/0.1 (by naguilar)"}
+
 
 # =========================
 # FUNCIONES AUXILIARES
@@ -75,7 +76,11 @@ def fetch_general_news_raw(api_key, date, hour):
     }
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=20)
+        if response.status_code != 200:
+            print(f" Error HTTP {response.status_code} NewsAPI economy. Body: {response.text[:200]}")
+            return
+
         articles = response.json().get("articles", [])
         df = pd.DataFrame([{
             "source": "newsapi",
@@ -97,38 +102,47 @@ def fetch_general_reddit_raw(date, hour):
     url = f"https://www.reddit.com/search.json?q={query}&limit=30"
 
     try:
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        if response.status_code != 200:
+            print(f" Reddit HTTP {response.status_code} economy. Body: {response.text[:200]}")
+            return
+
+        ct = response.headers.get("Content-Type", "")
+        if "application/json" not in ct:
+            print(f" Reddit economy no devolvió JSON (Content-Type={ct}). Body: {response.text[:200]}")
+            return
+
         posts = response.json().get("data", {}).get("children", [])
         df = pd.DataFrame([{
             "source": "reddit",
             "title": p["data"].get("title"),
             "subreddit": p["data"].get("subreddit"),
             "publishedAt": p["data"].get("created_utc")
-        } for p in posts if "title" in p["data"]])
+        } for p in posts if "title" in p.get("data", {})])
+
         df = filter_new_headlines(df, HASH_INDEX_PATH)
         if not df.empty:
             save_sentiment(df, ticker="economy", source="reddit", date=date, hour=hour)
             update_seen_hashes(df, HASH_INDEX_PATH)
             time.sleep(1)
-    except Exception as e:
-        print(f" Error al descargar posts generales de Reddit: {e}")
 
-def fetch_newsapi_sentiment(ticker, api_key, date, hour):
-    print(f"NewsAPI para {ticker}")
-    url = "https://newsapi.org/v2/everything"
+    except Exception as e:
+        print(f" Error al descargar posts generales: {e}")
+
+def fetch_newsapi_headlines_fallback(ticker, api_key, date, hour):
+    print(f"NewsAPI fallback top-headlines para {ticker}")
+    url = "https://newsapi.org/v2/top-headlines"
     params = {
         "q": ticker,
-        "from": "2025-09-01",
-        "sortBy": "popularity",
         "language": "en",
         "apiKey": api_key,
         "pageSize": 20
     }
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=20)
         if response.status_code != 200:
-            print(f"  Error HTTP {response.status_code} NewsAPI {ticker}")
+            print(f"  Fallback Error HTTP {response.status_code} NewsAPI {ticker}. Body: {response.text[:200]}")
             return
 
         articles = response.json().get("articles", [])
@@ -136,15 +150,55 @@ def fetch_newsapi_sentiment(ticker, api_key, date, hour):
             "source": "newsapi",
             "title": a.get("title"),
             "publishedAt": a.get("publishedAt")
-        } for a in articles if "title" in a])
+        } for a in articles if a.get("title")])
+
         df = filter_new_headlines(df, HASH_INDEX_PATH)
         if not df.empty:
             save_sentiment(df, ticker=ticker, source="newsapi", date=date, hour=hour)
             update_seen_hashes(df, HASH_INDEX_PATH)
+
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"  Error fallback NewsAPI {ticker}: {e}")
+
+
+def fetch_newsapi_sentiment(ticker, api_key, date, hour):
+    print(f"NewsAPI para {ticker}")
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": ticker,
+        "from": (pd.to_datetime(date) - pd.Timedelta(days=14)).strftime("%Y-%m-%d"),
+        "sortBy": "publishedAt",
+        "language": "en",
+        "apiKey": api_key,
+        "pageSize": 20
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=20)
+        if response.status_code != 200:
+            print(f"  Error HTTP {response.status_code} NewsAPI {ticker}. Body: {response.text[:200]}")
+            # fallback más permisivo
+            return fetch_newsapi_headlines_fallback(ticker, api_key, date, hour)
+
+        articles = response.json().get("articles", [])
+        df = pd.DataFrame([{
+            "source": "newsapi",
+            "title": a.get("title"),
+            "publishedAt": a.get("publishedAt")
+        } for a in articles if "title" in a])
+
+        df = filter_new_headlines(df, HASH_INDEX_PATH)
+        if not df.empty:
+            save_sentiment(df, ticker=ticker, source="newsapi", date=date, hour=hour)
+            update_seen_hashes(df, HASH_INDEX_PATH)
+
         time.sleep(1)
 
     except Exception as e:
         print(f"  Error NewsAPI {ticker}: {e}")
+
 
 
 def fetch_reddit_by_ticker(ticker, date, hour):
@@ -152,20 +206,32 @@ def fetch_reddit_by_ticker(ticker, date, hour):
     url = f"https://www.reddit.com/search.json?q={ticker}&limit=20"
 
     try:
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        if response.status_code != 200:
+            print(f" Reddit HTTP {response.status_code} {ticker}. Body: {response.text[:200]}")
+            return
+
+        ct = response.headers.get("Content-Type", "")
+        if "application/json" not in ct:
+            print(f" Reddit {ticker} no devolvió JSON (Content-Type={ct}). Body: {response.text[:200]}")
+            return
+
         posts = response.json().get("data", {}).get("children", [])
         df = pd.DataFrame([{
             "source": "reddit",
-            "title": p["data"]["title"],
+            "title": p["data"].get("title"),
             "publishedAt": p["data"].get("created_utc")
-        } for p in posts if "title" in p["data"]])
+        } for p in posts if "data" in p and p["data"].get("title")])
+
         df = filter_new_headlines(df, HASH_INDEX_PATH)
         if not df.empty:
             save_sentiment(df, ticker=ticker, source="reddit", date=date, hour=hour)
             update_seen_hashes(df, HASH_INDEX_PATH)
             time.sleep(1)
+
     except Exception as e:
         print(f"Error Reddit {ticker}: {e}")
+
 
 # =========================
 # EJECUCIÓN PRINCIPAL

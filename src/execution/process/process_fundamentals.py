@@ -43,42 +43,56 @@ RAW_BASE = ROOT / "data" / "raw" / "fundamentals"
 PROCESSED_BASE = ROOT / "data" / "processed" / "fundamentals"
 FUENTES = ["alphaV", "finnhub"]
 
+def _raw_path(provider: str, ticker: str, date, hour: str) -> Path:
+    return RAW_BASE / provider / ticker / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}" / hour / f"{ticker}.parquet"
+
+
+def _load_optional_parquet(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(path)
+    except Exception as exc:
+        print(f" Error leyendo {path}: {exc}")
+        return pd.DataFrame()
+
+
 def process_fundamentals(ticker: str, date, hour: str):
-    base_dir = RAW_BASE / "alphaV" / ticker / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}" / hour
-    alpha_path = base_dir / f"{ticker}.parquet"
+    alpha_path = _raw_path("alphaV", ticker, date, hour)
+    finnhub_path = _raw_path("finnhub", ticker, date, hour)
 
-    base_dir = RAW_BASE / "finnhub" / ticker / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}" / hour
-    finnhub_path = base_dir / f"{ticker}.parquet"
-
-    if not alpha_path.exists() or not finnhub_path.exists():
+    df_alpha = _load_optional_parquet(alpha_path)
+    df_finnhub = _load_optional_parquet(finnhub_path)
+    if df_alpha.empty and df_finnhub.empty:
         print(f" Archivos faltantes para {ticker}")
         return
 
     print(f" Procesando fundamentales: {ticker}")
-    df_alpha = pd.read_parquet(alpha_path)
-    df_finnhub = pd.read_parquet(finnhub_path)
 
     final_data = {v: None for v in alpha_cols.values()}
     final_data.update({v: None for v in finnhub_cols.values()})
 
-    for raw_col, final_col in alpha_cols.items():
-        if raw_col in df_alpha.columns:
-            final_data[final_col] = df_alpha.at[0, raw_col]
+    if not df_alpha.empty:
+        for raw_col, final_col in alpha_cols.items():
+            if raw_col in df_alpha.columns:
+                final_data[final_col] = df_alpha.at[0, raw_col]
 
-    for raw_col, final_col in finnhub_cols.items():
-        if raw_col in df_finnhub.columns:
-            final_data[final_col] = df_finnhub.at[0, raw_col]
+    if not df_finnhub.empty:
+        for raw_col, final_col in finnhub_cols.items():
+            if raw_col in df_finnhub.columns:
+                final_data[final_col] = df_finnhub.at[0, raw_col]
 
     df = pd.DataFrame([final_data])
     df["ticker"] = ticker
+    df["source_count"] = int((not df_alpha.empty) + (not df_finnhub.empty))
     df = df.convert_dtypes()
 
     nulls = df.isnull().sum().sum()
-    total = df.shape[1] - 1
+    total = df.shape[1] - 2
     completeness = (total - nulls) / total
 
-    UMBRAL_MINIMO = 0.7
-    if completeness >= UMBRAL_MINIMO:
+    umbral_minimo = 0.35 if df["source_count"].iloc[0] == 1 else 0.55
+    if completeness >= umbral_minimo:
         out_dir = ensure_date_dir(PROCESSED_BASE, date, hour)
         out_path = out_dir / f"{ticker}.parquet"
         df.to_parquet(out_path, index=False)
@@ -95,9 +109,9 @@ if __name__ == "__main__":
     date = get_execution_date(args.date)
     hour = get_execution_hour(args.hour)
 
-    tickers_alpha = [d.name for d in (RAW_BASE / "alphaV").iterdir() if d.is_dir()]
-    tickers_finnhub = [d.name for d in (RAW_BASE / "finnhub").iterdir() if d.is_dir()]
-    tickers = sorted(set(tickers_alpha) & set(tickers_finnhub))  # Solo tickers con ambas fuentes
+    tickers_alpha = [d.name for d in (RAW_BASE / "alphaV").iterdir() if d.is_dir()] if (RAW_BASE / "alphaV").exists() else []
+    tickers_finnhub = [d.name for d in (RAW_BASE / "finnhub").iterdir() if d.is_dir()] if (RAW_BASE / "finnhub").exists() else []
+    tickers = sorted(set(tickers_alpha) | set(tickers_finnhub))
 
     for ticker in tickers:
         process_fundamentals(ticker, date, hour)

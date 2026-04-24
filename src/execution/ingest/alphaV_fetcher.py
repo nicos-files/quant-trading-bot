@@ -24,7 +24,8 @@ def fetch_from_alpha_vantage(ticker: str) -> Optional[pd.DataFrame]:
     symbol = ticker.replace(".US", "").replace(".BA", "")
 
     url = "https://www.alphavantage.co/query"
-    outputsize = "compact" if has_prior_data(ticker) else "full"
+    #outputsize = "compact" if has_prior_data(ticker) else "full" --REVISAR A FUTURO SI PAGAMOS SUSCRIPCION
+    outputsize = "compact"
     params = {
         "function": "TIME_SERIES_DAILY",
         "symbol": symbol,

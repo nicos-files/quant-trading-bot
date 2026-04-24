@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 from src.execution.curated.daily_consolidator import consolidate_module
+import time
 
 # =========================
 # Config y rutas
@@ -24,6 +25,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_FILE = LOG_DIR / "data_orchestrator_state.json"
 EVENT_LOG = LOG_DIR / "data_orchestrator.log.jsonl"
+DEFAULT_SUBPROCESS_TIMEOUT_SEC = 300
+RAW_VALIDATION_ENV = "ETL_VALIDATE_RAW"
+SUBPROCESS_TIMEOUT_ENV = "ETL_SUBPROCESS_TIMEOUT_SEC"
 
 # Guard de variación (desactivado por defecto hasta estabilizar)
 ENABLE_PRICE_VARIATION_GUARD = False
@@ -54,6 +58,7 @@ SCRIPTS = {
     "ingest_sentiment": "src.execution.ingest.ingest_sentiment",
     # Proceso
     "process_prices": "src.execution.process.process_prices",
+    "normalize_prices": "src.execution.process.normalize_prices",
     "process_indicators": "src.execution.process.process_indicators",
     "process_fundamentals": "src.execution.process.process_fundamentals",
     "relevance_filter": "src.execution.process.relevance_filter",
@@ -88,21 +93,36 @@ def log_event(component: str, level: str, payload: Dict[str, Any]) -> None:
     with open(EVENT_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+class RawContractError(RuntimeError):
+    pass
+
+def _tail_lines(text: str, max_lines: int = 50) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[-max_lines:])
+
 def run_script(name: str, module: str, args: Optional[List[str]] = None) -> bool:
     cmd = [sys.executable, "-m", module] + (args or [])
-    log_event(name, "RUN", {"cmd": " ".join(cmd)})
+    timeout_sec = int(os.getenv(SUBPROCESS_TIMEOUT_ENV, DEFAULT_SUBPROCESS_TIMEOUT_SEC))
+    log_event(name, "STEP_START", {"cmd": " ".join(cmd), "cwd": str(ROOT_DIR), "timeout_sec": timeout_sec})
+    start = time.monotonic()
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, cwd=str(ROOT_DIR))
         ok = res.returncode == 0
+        elapsed_ms = int((time.monotonic() - start) * 1000)
         details = {"returncode": res.returncode}
         if res.stdout:
-            details["stdout_tail"] = res.stdout[-1000:]
+            details["stdout_tail"] = _tail_lines(res.stdout)
         if res.stderr:
-            details["stderr_tail"] = res.stderr[-1000:]
-        log_event(name, "OK" if ok else "ERROR", details)
+            details["stderr_tail"] = _tail_lines(res.stderr)
+        log_event(name, "STEP_END", {**details, "status": "OK" if ok else "ERROR", "elapsed_ms": elapsed_ms})
         return ok
+    except subprocess.TimeoutExpired:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        log_event(name, "STEP_END", {"status": "ERROR", "reason": "timeout", "elapsed_ms": elapsed_ms})
+        raise RuntimeError(f"Step timeout: {name} cmd={' '.join(cmd)}")
     except Exception as e:
-        log_event(name, "ERROR", {"exception": str(e)})
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        log_event(name, "STEP_END", {"status": "ERROR", "reason": str(e), "elapsed_ms": elapsed_ms})
         return False
 
 # =========================
@@ -136,6 +156,25 @@ def any_new_file_since(base: Path, pattern: str = "*.parquet", last_ts: Optional
     if last_ts is None:
         return True
     return any(f.stat().st_mtime > last_ts for f in files)
+
+def _validate_raw_outputs(step_name: str, expected_bases: List[Path], pattern: str = "*.parquet") -> None:
+    if os.getenv(RAW_VALIDATION_ENV) != "1":
+        return
+    missing: List[str] = []
+    found: List[str] = []
+    for base in expected_bases:
+        if not base.exists():
+            missing.append(str(base))
+            continue
+        matches = [p for p in base.rglob(pattern) if p.is_file()]
+        if not matches:
+            missing.append(str(base))
+            continue
+        found.extend([str(p) for p in matches[:5]])
+    if missing:
+        log_event(step_name, "RAW_CONTRACT_FAIL", {"missing": missing, "found_samples": found})
+        raise RawContractError(f"RawContractError: step={step_name} missing={missing}")
+    log_event(step_name, "RAW_CONTRACT_OK", {"found_samples": found})
 
 def compare_latest_raw_vs_processed_parquet(raw_base: Path, proc_base: Path) -> Optional[float]:
     raw_file = latest_file(raw_base)
@@ -182,14 +221,19 @@ def orchestrate(forwarded_args: List[str], args,execution_date, execution_hour) 
         ("ingest_sentiment", SCRIPTS["ingest_sentiment"], EXPECTED_RAW["sentiment"]),
     ]
 
-    if not args.skip_alpha and not run_script("alphaV_fetcher", SCRIPTS["alphaV_fetcher"], forwarded_args):
-        log_event("alphaV_fetcher", "WARN", {"reason": "ingest failed; continuing"})
-    if not args.skip_fetch_prices and not run_script("fetch_prices", SCRIPTS["fetch_prices"], forwarded_args):
-        log_event("fetch_prices", "WARN", {"reason": "ingest failed; continuing"})
-    if not args.skip_fundamentals and not run_script("ingest_fundamentals", SCRIPTS["ingest_fundamentals"], forwarded_args):
-        log_event("ingest_fundamentals", "WARN", {"reason": "ingest failed; continuing"})
-    if not args.skip_sentiment and not run_script("ingest_sentiment", SCRIPTS["ingest_sentiment"], forwarded_args):
-        log_event("ingest_sentiment", "WARN", {"reason": "ingest failed; continuing"})
+    def _run_ingest_step(step_name: str, module: str, expected: List[Path], skip: bool) -> None:
+        if skip:
+            log_event(step_name, "SKIPPED", {"reason": "flag"})
+            return
+        if not run_script(step_name, module, forwarded_args):
+            log_event(step_name, "WARN", {"reason": "ingest failed; continuing"})
+            return
+        _validate_raw_outputs(step_name, expected)
+
+    _run_ingest_step("alphaV_fetcher", SCRIPTS["alphaV_fetcher"], [EXPECTED_RAW["alphaV"]], args.skip_alpha)
+    _run_ingest_step("fetch_prices", SCRIPTS["fetch_prices"], [EXPECTED_RAW["prices"]], args.skip_fetch_prices)
+    _run_ingest_step("ingest_fundamentals", SCRIPTS["ingest_fundamentals"], [EXPECTED_RAW["fundamentals"]], args.skip_fundamentals)
+    _run_ingest_step("ingest_sentiment", SCRIPTS["ingest_sentiment"], [EXPECTED_RAW["sentiment"]], args.skip_sentiment)
 
     # Registrar mtimes de ingesta (no confundir con los de proceso)
     for step_name, _, expect_glob in ingest_steps:
@@ -236,6 +280,10 @@ def orchestrate(forwarded_args: List[str], args,execution_date, execution_hour) 
         state["last"]["process_prices_raw_mtime"] = file_mtime(last_raw_prices)
         save_state(state)
     
+        if not run_script("normalize_prices", SCRIPTS["normalize_prices"], forwarded_args):
+            log_event("normalize_prices", "ABORT", {"reason": "processing failed"})
+            sys.exit(1)
+
         if not run_script("process_indicators", SCRIPTS["process_indicators"], forwarded_args):
             log_event("process_indicators", "ABORT", {"reason": "processing failed"})
             sys.exit(1)
@@ -270,7 +318,9 @@ def orchestrate(forwarded_args: List[str], args,execution_date, execution_hour) 
         last_ts=state["last"].get("relevance_filter_raw_mtime")
     )
     should_run_filter = new_senti or args.force_relevance
-    
+    if args.skip_relevance:
+        should_run_filter = False
+
     if should_run_filter:
         if not run_script("relevance_filter", SCRIPTS["relevance_filter"], forwarded_args):
             log_event("relevance_filter", "ABORT", {"reason": "processing failed"})
@@ -279,7 +329,8 @@ def orchestrate(forwarded_args: List[str], args,execution_date, execution_hour) 
         state["last"]["relevance_filter_raw_mtime"] = file_mtime(last_raw_senti)
         save_state(state)
     else:
-        log_event("relevance_filter", "SKIPPED", {"reason": "no new sentiment raw files"})
+        reason = "flag" if args.skip_relevance else "no new sentiment raw files"
+        log_event("relevance_filter", "SKIPPED", {"reason": reason})
     
     # Paso 2: decidir si correr process_sentiment (basado en archivos relevantes)
     new_relevant = any_new_file_since(
@@ -288,6 +339,8 @@ def orchestrate(forwarded_args: List[str], args,execution_date, execution_hour) 
         last_ts=state["last"].get("process_sentiment_raw_mtime")
     )
     should_process_senti = new_relevant or args.force_sentiment
+    if args.skip_sentiment:
+        should_process_senti = False
     reason_senti = (
         "forced by flag"
         if args.force_sentiment

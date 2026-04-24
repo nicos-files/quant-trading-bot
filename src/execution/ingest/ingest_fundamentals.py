@@ -3,9 +3,12 @@ import requests
 import pandas as pd
 import argparse
 import hashlib
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+from src.asset_universe import iter_assets
+from src.source_profiles import filter_free_fundamentals_assets, get_profile_asset_ids
 from src.utils.execution_context import (
     get_execution_date,
     get_execution_hour,
@@ -20,11 +23,6 @@ FINNHUB_API_KEY = "d2qr8j1r01qluccpn6agd2qr8j1r01qluccpn6b0"
 ROOT = Path(__file__).resolve().parents[3] 
 RAW_PATH = ROOT / "data" / "raw"
 FUNDAMENTALS_DIR = RAW_PATH / "fundamentals"
-
-tickers_us = [
-    "AAPL", "TSLA", "GOOGL", "MSFT", "META", "NVDA", "AMZN",
-    "JPM", "V", "MA", "DIS", "NFLX", "INTC", "AMD"
-]
 
 def save_raw_data_if_changed(df: pd.DataFrame, origen: str, ticker: str, date: datetime, hour: Optional[str]) -> bool:
     target_dir = ensure_date_dir(FUNDAMENTALS_DIR / origen / ticker, date, hour)
@@ -60,7 +58,7 @@ def fetch_fundamentals_alpha(ticker: str) -> Optional[pd.DataFrame]:
     }
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=30)
         data = response.json()
         if not data or "Symbol" not in data:
             print(f"No data from Alpha Vantage for {ticker}")
@@ -82,7 +80,7 @@ def fetch_fundamentals_finnhub(ticker: str) -> Optional[pd.DataFrame]:
     }
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=30)
         data = response.json()
         if "metric" not in data:
             print(f" No data from Finnhub for {ticker}")
@@ -94,16 +92,33 @@ def fetch_fundamentals_finnhub(ticker: str) -> Optional[pd.DataFrame]:
         print(f" Error Finnhub: {e}")
         return None
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=str, help="Fecha en formato YYYY-MM-DD")
     parser.add_argument("--hour", type=str, help="Hora en formato HHMM")
-    args = parser.parse_args()
+    parser.add_argument("--asset-id", action="append", dest="asset_ids")
+    parser.add_argument("--profile", type=str, help="Universe profile, e.g. free-core/free-portfolio")
+    parser.add_argument("--free-only", action="store_true", help="Limit to assets with viable free fundamentals today")
+    parser.add_argument("--max-assets", type=int, help="Cap selected assets after filters")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
 
     date = get_execution_date(args.date)
     hour = get_execution_hour(args.hour)
 
-    for ticker in tickers_us:
+    selected_asset_ids = args.asset_ids or get_profile_asset_ids(args.profile)
+    universe = iter_assets(enabled_only=True, asset_ids=selected_asset_ids, markets=["US"], asset_classes=["EQUITY"])
+    if args.free_only:
+        universe = filter_free_fundamentals_assets(universe)
+    if args.max_assets and args.max_assets > 0:
+        universe = universe[: args.max_assets]
+
+    print(f"[FUND] universo seleccionado={len(universe)}")
+    for asset in universe:
+        ticker = asset.asset_id.replace(".US", "")
         df_alpha = fetch_fundamentals_alpha(ticker)
         df_finnhub = fetch_fundamentals_finnhub(ticker)
 
@@ -120,3 +135,4 @@ if __name__ == "__main__":
             save_raw_data_if_changed(df_finnhub, origen="finnhub", ticker=ticker, date=date, hour=hour)
         else:
             print(" No data from Finnhub")
+        time.sleep(1.1)

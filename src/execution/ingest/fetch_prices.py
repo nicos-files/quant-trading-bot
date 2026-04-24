@@ -1,40 +1,41 @@
-import time
 import argparse
-import pandas as pd
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from pandas_datareader import data as web
-from datetime import datetime
 from typing import Optional
+
+import pandas as pd
+
+from src.asset_universe import AssetDefinition, iter_assets
+from src.market_data.providers import (
+    ALPHAV_PROVIDER,
+    YFINANCE_PROVIDER,
+    build_default_price_providers,
+    fetch_price_history_with_fallback,
+)
+from src.source_profiles import filter_free_price_assets, get_profile_asset_ids
 from src.utils.execution_context import (
     get_execution_date,
     get_execution_hour,
     ensure_date_dir
 )
 
-# Tickers
-tickers_us = [
-    "AAPL.US", "TSLA.US", "GOOGL.US", "MSFT.US", "META.US", "NVDA.US",
-    "AMZN.US", "JPM.US", "BRK.B.US", "V.US", "MA.US", "DIS.US", "NFLX.US",
-    "INTC.US", "AMD.US"
-]
-
-tickers_ba = [
-    "GGAL.BA", "YPFD.BA", "PAMP.BA", "BMA.BA", "TXAR.BA", "CEPU.BA",
-    "AAPL.BA", "TSLA.BA", "GOOGL.BA", "MSFT.BA"
-]
-
 START_DATE = "2018-01-01"
-END_DATE = datetime.today().strftime("%Y-%m-%d")
 FUENTE = "prices"
 ROOT = Path(__file__).resolve().parents[3] 
 RAW_PATH = ROOT / "data" / "raw"
 REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
 def get_latest_raw_date(ticker: str) -> Optional[pd.Timestamp]:
-    base = RAW_PATH / FUENTE / ticker
-    if not base.exists():
-        return None
-    files = list(base.rglob("*.parquet"))
+    files = []
+    for provider in (YFINANCE_PROVIDER, ALPHAV_PROVIDER):
+        provider_base = RAW_PATH / FUENTE / provider / ticker
+        if provider_base.exists():
+            files.extend(provider_base.rglob("*.parquet"))
+    if not files:
+        legacy_base = RAW_PATH / FUENTE / ticker
+        if legacy_base.exists():
+            files.extend(legacy_base.rglob("*.parquet"))
     if not files:
         return None
     latest = max(files, key=lambda p: p.stat().st_mtime)
@@ -48,58 +49,67 @@ def get_latest_raw_date(ticker: str) -> Optional[pd.Timestamp]:
         return None
     return None
 
-def save_raw_data(df: pd.DataFrame, fuente: str, ticker: str, date: datetime, hour: Optional[str]):
+def save_raw_data(df: pd.DataFrame, fuente: str, provider: str, ticker: str, date: datetime, hour: Optional[str]):
     target_dir = ensure_date_dir(
-        base=RAW_PATH / fuente / ticker,
+        base=RAW_PATH / fuente / provider / ticker,
         date=date,
         hour=hour
     )
     path = target_dir / f"{fuente}_{ticker}.parquet"
     df.to_parquet(path)
-    print(f" Guardado: {path}")
+    print(f"[FETCH] guardado {ticker} -> {path}")
 
-def fetch_price_data(ticker: str) -> Optional[pd.DataFrame]:
-    print(f" Intentando descargar {ticker} desde Stooq...")
-    try:
-        latest_dt = get_latest_raw_date(ticker)
-        start_date = START_DATE
-        if latest_dt is not None and pd.notna(latest_dt):
-            start_date = (latest_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            if start_date >= END_DATE:
-                print(f" {ticker}: sin nuevos datos desde {latest_dt.date()}")
-                return None
-        df = web.DataReader(ticker, "stooq", start_date, END_DATE)
-        if df.empty:
-            print(f" Stooq sin datos para {ticker}")
-            return None
-    except Exception as e:
-        print(f" Error con Stooq para {ticker}: {e}")
-        return None
+def fetch_price_data(asset: AssetDefinition) -> tuple[str, Optional[pd.DataFrame]]:
+    latest_dt = get_latest_raw_date(asset.asset_id)
+    start_date = START_DATE
+    if latest_dt is not None and pd.notna(latest_dt):
+        start_date = (latest_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        if pd.Timestamp(start_date) >= pd.Timestamp((datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")):
+            print(f"[FETCH] {asset.asset_id}: sin nuevos datos desde {latest_dt.date()}")
+            return YFINANCE_PROVIDER, None
+    return fetch_price_history_with_fallback(
+        asset=asset,
+        start_date=start_date,
+        providers=build_default_price_providers(),
+    )
 
-    df.reset_index(inplace=True)
-    df.columns = [col.lower() for col in df.columns]
-    df["ticker"] = ticker
-    if "date" in df.columns:
-        df = df.sort_values("date")
 
-    if not all(col in df.columns for col in REQUIRED_COLS):
-        print(f" Datos incompletos para {ticker}, se omite.")
-        return None
-
-    return df
-
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=str, help="Fecha en formato YYYY-MM-DD")
     parser.add_argument("--hour", type=str, help="Hora en formato HHMM")
-    args = parser.parse_args()
+    parser.add_argument("--asset-class", action="append", dest="asset_classes")
+    parser.add_argument("--market", action="append", dest="markets")
+    parser.add_argument("--asset-id", action="append", dest="asset_ids")
+    parser.add_argument("--profile", type=str, help="Universe profile, e.g. free-core/free-us-small/free-forex")
+    parser.add_argument("--free-only", action="store_true", help="Limit to assets with a viable free price source today")
+    parser.add_argument("--max-assets", type=int, help="Cap selected assets after filters")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
 
     date = get_execution_date(args.date)
     hour = get_execution_hour(args.hour)
 
-    all_tickers = tickers_ba + tickers_us
-    for ticker in all_tickers:
-        df = fetch_price_data(ticker)
+    selected_asset_ids = args.asset_ids or get_profile_asset_ids(args.profile)
+    universe = iter_assets(
+        enabled_only=True,
+        asset_classes=args.asset_classes,
+        markets=args.markets,
+        asset_ids=selected_asset_ids,
+    )
+    if args.free_only:
+        universe = filter_free_price_assets(universe)
+    if args.max_assets and args.max_assets > 0:
+        universe = universe[: args.max_assets]
+    print(f"[FETCH] universo seleccionado={len(universe)}")
+
+    for asset in universe:
+        provider, df = fetch_price_data(asset)
         if df is not None:
-            save_raw_data(df, fuente=FUENTE, ticker=ticker, date=date, hour=hour)
-        time.sleep(1)  # para evitar bloqueos por exceso de llamadas
+            save_raw_data(df, fuente=FUENTE, provider=provider, ticker=asset.asset_id, date=date, hour=hour)
+        if provider == ALPHAV_PROVIDER:
+            time.sleep(1.2)
+        else:
+            time.sleep(0.2)

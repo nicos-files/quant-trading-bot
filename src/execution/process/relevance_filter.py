@@ -1,4 +1,3 @@
-###RELEVANCE_FILTER ANTES DEL CRUCE MANUAL ORQUESTADOI
 import os
 import sys
 import time
@@ -9,12 +8,24 @@ from pathlib import Path
 from textblob import TextBlob
 import re
 
+from dotenv import load_dotenv
+
+# Cargar .env desde la raíz del proyecto
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+load_dotenv(PROJECT_ROOT / ".env")
+
+# Asegurar que OPENAI_API_KEY quede disponible para imports posteriores
+api_key = os.getenv("OPENAI_API_KEY")
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
+
+
 def clean_text(texto: str) -> str:
     # Elimina emojis y caracteres fuera del rango ASCII
     return re.sub(r'[^\x00-\x7F]+', '', texto)
 
 
-sys.path.append("C:/Users/NAguilar/Proyectos/AutoGen/quant-trading-bot")
+
 from src.agents.agent_definitions import sentiment_agent
 from src.utils.llm_logger import log_llm_interaction
 from src.utils.cache_manager import hash_text, load_cache, save_to_cache

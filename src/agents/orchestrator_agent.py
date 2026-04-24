@@ -10,9 +10,6 @@ import sys
 import subprocess
 from pathlib import Path
 from src.orchestrator.data_orchestrator import run_etl_pipeline
-from src.autogen.orchestrator import create_orchestrator
-from src.agents.long_term_agent import LongTermDecisionAgent
-from src.agents.intraday_agent import IntradayDecisionAgent
 from src.utils.llm_logger import log_llm_interaction
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,9 +35,11 @@ class OrchestratorDecisionAgent:
         self.args = args
         self.threshold = args.threshold
         self.max_positions = args.max_positions
-        self.lt_agent = LongTermDecisionAgent()
-        self.intra_agent = IntradayDecisionAgent()
-        self.manager, self.agents, self.user_proxy = create_orchestrator()
+        self.lt_agent = None
+        self.intra_agent = None
+        self.manager = None
+        self.agents = None
+        self.user_proxy = None
 
 
     # ---------- Entry point ----------
@@ -79,6 +78,7 @@ class OrchestratorDecisionAgent:
             self._validate_context(context)
 
             # 4) Decisión de agentes
+            self._ensure_agents()
             self._log_info("decision", "Ejecutando lógica de decisión de agentes")
             lt_decision = self.lt_agent.decide(context)
             self.lt_agent.save_decision(lt_decision)
@@ -142,6 +142,16 @@ class OrchestratorDecisionAgent:
                     time.sleep(RETRY_SLEEP)
                 else:
                     raise
+
+    def _ensure_agents(self):
+        if self.lt_agent is None or self.intra_agent is None or self.manager is None:
+            from src.autogen.orchestrator import create_orchestrator
+            from src.agents.long_term_agent import LongTermDecisionAgent
+            from src.agents.intraday_agent import IntradayDecisionAgent
+
+            self.lt_agent = LongTermDecisionAgent()
+            self.intra_agent = IntradayDecisionAgent()
+            self.manager, self.agents, self.user_proxy = create_orchestrator()
 
     def _build_context(self) -> Dict[str, Any]:
         signals = self._load_signals(PATHS["signals"])

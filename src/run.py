@@ -4,7 +4,6 @@ import argparse
 import subprocess
 from dotenv import load_dotenv
 from src.utils.execution_context import get_etl_args, get_current_args
-from src.agents.orchestrator_agent import OrchestratorDecisionAgent
 
 # Cargar variables de entorno
 load_dotenv(dotenv_path=".env")
@@ -18,7 +17,7 @@ if __name__ == "__main__" and __package__ is None:
 
 # -------------------- Argumentos --------------------
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Ejecuta el sistema de recomendación de inversiones.")
 
     # Configuración general
@@ -47,12 +46,11 @@ def parse_args():
     parser.add_argument("--force-relevance", action="store_true")
     parser.add_argument("--force-sentiment", action="store_true")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 # -------------------- Ejecución principal --------------------
 
-def main():
-    args = parse_args()
+def run_pipeline(args):
 
     # Determinar fecha y hora
     if args.date and args.hour:
@@ -85,7 +83,8 @@ def main():
     }
 
 
-    # Crear agente orquestador
+    # Crear agente orquestador (lazy import para evitar autogen/openai en ETL-only)
+    from src.agents.orchestrator_agent import OrchestratorDecisionAgent
     agent = OrchestratorDecisionAgent(args)
 
 
@@ -117,6 +116,12 @@ def main():
         print(" No se encontraron decisiones en el resultado.")
 
     print("\n Ejecución completada sin errores.")
+
+    return {"decision": decision, "date": date, "hour": hour}
+
+def main():
+    args = parse_args()
+    run_pipeline(args)
 
 # -------------------- Entry point --------------------
 

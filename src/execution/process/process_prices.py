@@ -31,13 +31,25 @@ def set_time_index(df: pd.DataFrame) -> pd.DataFrame:
             break
     return df
 
-def clean_price_data(ticker: str, date, hour: str):
+def _build_raw_dir(provider: str, ticker: str, date, hour: str) -> Path:
+    base = RAW_BASE / provider / ticker if provider else RAW_BASE / ticker
+    return base / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}" / hour
+
+def clean_price_data(provider: str, ticker: str, date, hour: str):
+    ticker = str(ticker).split("/")[0].strip()
     if isinstance(date, str):
         date = datetime.strptime(date, "%Y-%m-%d").date()
-    raw_dir = RAW_BASE / ticker / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}" / hour
+    raw_dir = _build_raw_dir(provider, ticker, date, hour)
+    if provider is None and raw_dir.exists():
+        print(f" [WARN] Layout legacy usado para {ticker}: {raw_dir}")
     if not raw_dir.exists():
-        print(f" No se encontró carpeta de precios para {ticker} en {raw_dir}")
-        return
+        legacy_dir = _build_raw_dir(None, ticker, date, hour)
+        if legacy_dir.exists():
+            print(f" [WARN] Layout legacy usado para {ticker}: {legacy_dir}")
+            raw_dir = legacy_dir
+        else:
+            print(f" No se encontro carpeta de precios para {provider}/{ticker} en {raw_dir}")
+            return
 
     archivos = list(raw_dir.glob("*.parquet"))
     if not archivos:
@@ -71,6 +83,7 @@ def clean_price_data(ticker: str, date, hour: str):
             out_dir = ensure_date_dir(PROCESSED_BASE, date, hour)
 
             out_path = out_dir / f"{ticker}.parquet"
+            #  out_path = out_dir / f"{provider}_{ticker}.parquet"  CAMBIO A FUTURO REVISAR
             df[REQUIRED_COLS].to_parquet(out_path)
             print(f" Precios procesados para {ticker}: {out_path}")
 
@@ -95,6 +108,28 @@ if __name__ == "__main__":
         print(f" No existe la base raw {RAW_BASE}")
         raise SystemExit(0)
 
-    tickers = [d.name for d in RAW_BASE.iterdir() if d.is_dir()]
-    for ticker in tickers:
-        clean_price_data(ticker, date, hour)
+    def _is_year_dir(path: Path) -> bool:
+        return path.is_dir() and path.name.isdigit() and len(path.name) == 4
+
+    providers = []
+    legacy_tickers = []
+    for entry in RAW_BASE.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name == "normalized":
+            continue
+        child_dirs = [d for d in entry.iterdir() if d.is_dir()]
+        if any(_is_year_dir(d) for d in child_dirs):
+            legacy_tickers.append(entry.name)
+        else:
+            providers.append(entry)
+
+    for prov_dir in providers:
+        provider = prov_dir.name
+    
+        tickers = [d.name for d in prov_dir.iterdir() if d.is_dir()]
+        for ticker in tickers:
+            clean_price_data(provider, ticker, date, hour)
+
+    for ticker in legacy_tickers:
+        clean_price_data(None, ticker, date, hour)

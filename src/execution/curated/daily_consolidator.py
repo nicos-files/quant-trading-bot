@@ -61,7 +61,7 @@ def consolidate_module(modulo: str, date: datetime, hour: str) -> dict:
         }
 
     for archivo in archivos:
-        ticker = archivo.stem.replace(".US", "").replace(".BA", "")
+        ticker = archivo.stem
         if ticker == "sentimiento_general":
             ticker = "GENERAL"
 
@@ -89,12 +89,37 @@ def consolidate_module(modulo: str, date: datetime, hour: str) -> dict:
     dfs_finales = []
     for ticker, dfs in ticker_map.items():
         try:
-            dfs_utiles = [df for df in dfs if not df.empty and not df.isna().all(axis=1).all()]
+            
+            empty_count = 0
+            all_na_count = 0
+            dfs_utiles = []
+
+            for df in dfs:
+                if df is None or df.empty:
+                    empty_count += 1
+                    continue
+                
+                # "all-NA" frame: after dropping rows that are entirely NA, nothing remains
+                if df.dropna(how="all").empty:
+                    all_na_count += 1
+                    continue
+                
+                dfs_utiles.append(df)
+
+            if empty_count or all_na_count:
+                print(
+                    f"[WARN] daily_consolidator {modulo}/{ticker}: descartados "
+                    f"empty={empty_count}, all_na={all_na_count}, valid={len(dfs_utiles)}"
+                )
+
             if not dfs_utiles:
                 continue
+            
+            dfs_utiles = [df.dropna(axis=1, how="all") for df in dfs_utiles]
             df_final = pd.concat(dfs_utiles, ignore_index=True).drop_duplicates()
             df_final["ticker"] = ticker
             df_final = clean_numeric_columns(df_final, modulo)
+            df_final["ticker"] = df_final["ticker"].astype(str).str.strip()
             dfs_finales.append(df_final)
         except Exception as e:
             errores_detectados += 1
@@ -131,6 +156,7 @@ def consolidate_module(modulo: str, date: datetime, hour: str) -> dict:
             }
         descartados_post_concat = [df for df in dfs_finales if not es_util(df)]
         print(f"[INFO] DataFrames descartados antes del concat final: {len(descartados_post_concat)}")
+        dfs_utiles = [df.dropna(axis=1, how="all") for df in dfs_utiles]
         df_consolidado = pd.concat(dfs_utiles, ignore_index=True).drop_duplicates()
     except Exception as e:
         errores_detectados += 1
@@ -156,9 +182,19 @@ def consolidate_module(modulo: str, date: datetime, hour: str) -> dict:
         except Exception as e:
             print(f"[WARNING] Falló la lectura del consolidado previo: {e}")
 
+    if modulo == "sentiment" and "fecha" in df_consolidado.columns:
+        df_consolidado["fecha"] = pd.to_datetime(df_consolidado["fecha"], errors="coerce")
+        df_consolidado["fecha"] = df_consolidado["fecha"].dt.normalize()
+    if modulo == "fundamentals":
+        for col in ["net_margin", "free_cash_flow"]:
+            if col in df_consolidado.columns:
+                df_consolidado[col] = pd.to_numeric(df_consolidado[col], errors="coerce")
+        if "ticker" in df_consolidado.columns:
+            df_consolidado["ticker"] = df_consolidado["ticker"].astype(str).str.strip()
+
     try:
         df_consolidado.to_parquet(out_path, index=False)
-        print(f"[SUCCESS] Consolidado '{modulo}' → {out_path} ({len(df_consolidado)} registros)")
+        print(f"[SUCCESS] Consolidado '{modulo}' -> {out_path} ({len(df_consolidado)} registros)")
     except Exception as e:
         errores_detectados += 1
         print(f"[ERROR] Falló el guardado del consolidado '{modulo}': {e}")
@@ -214,7 +250,7 @@ def main():
 
     try:
         df_log.to_parquet(LOG_PATH, index=False)
-        print(f"[INFO] Log de consolidación actualizado → {LOG_PATH}")
+        print(f"[INFO] Log de consolidación actualizado -> {LOG_PATH}")
     except Exception as e:
         print(f"[ERROR] Falló guardado del log de consolidación: {e}")
 

@@ -266,22 +266,25 @@ def main():
     df_latest = select_latest_snapshot(df_all)
     df_latest = score_and_predict(df_latest, model)
 
-    # Opcional equity conservadora por timestamp
-    if args.simulate_equity:
-        df_latest = optional_equity(df_latest, initial_capital=args.equity_initial)
+    signals_latest = generate_signals(df_latest)
+    signals_latest = filter_and_rank(signals_latest, min_score=args.min_score, top_n=args.top_n)
 
-    # Generar señales
-    signals = generate_signals(df_latest)
-
-    # Filtro y ranking
-    signals = filter_and_rank(signals, min_score=args.min_score, top_n=args.top_n)
-
-    # Guardar
-    save_signals(signals)
-    if args.simulate_equity:
-        save_equity_outputs(df_latest)
-
-    print_summary(signals)
+    # Guardar snapshot separado
+    latest_path = SIGNALS_PATH.parent / "strategy_signals_latest.csv"
+    pd.DataFrame(signals_latest).to_csv(latest_path, index=False)
+    print(f" Señales (snapshot) guardadas en: {latest_path}")
+    
+    # 2) (Opcional) Histórico para análisis/backtest por señales
+    # OJO: esto puede ser pesado si tenés muchos años/tickers
+    df_hist = df_all.copy()
+    df_hist = score_and_predict(df_hist, model)
+    
+    signals_hist = generate_signals(df_hist)
+    hist_path = SIGNALS_PATH.parent / "strategy_signals_history.csv"
+    pd.DataFrame(signals_hist).to_csv(hist_path, index=False)
+    print(f" Señales (histórico) guardadas en: {hist_path}")
+    
+    print_summary(signals_latest)
 
 if __name__ == "__main__":
     main()
