@@ -251,6 +251,10 @@ class IntradayCryptoEngine:
             "stop_loss": signal.stop_loss,
             "take_profit": signal.take_profit,
             "confidence": signal.confidence,
+            "paper_only": True,
+            "live_enabled": False,
+            "asset_class": "crypto",
+            "max_paper_notional": signal.max_notional,
         }
 
     def _result(self, context: EngineContext, diagnostics: EngineDiagnostics) -> EngineResult:
