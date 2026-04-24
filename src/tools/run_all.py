@@ -17,7 +17,7 @@ from src.decision_intel.exports.artifact_exporter import export_artifacts
 from src.decision_intel.integrations.quant_trading_bot_adapter import build_decision_intel_artifacts
 from src.decision_intel.policies.topk_net_after_fees import CAPITAL_USD
 from src.engines import EngineContext, IntradayCryptoEngine, LongTermPortfolioEngine
-from src.market_data.crypto_symbols import enabled_crypto_symbols, load_crypto_universe
+from src.market_data.crypto_symbols import enabled_crypto_symbols, load_crypto_universe_config
 from src.market_data.providers import BinanceSpotMarketDataProvider
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -423,7 +423,8 @@ def _generate_final_decision(
         if "ticker" in current_df.columns
         else []
     )
-    crypto_universe = load_crypto_universe(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else []
+    crypto_config = load_crypto_universe_config(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else {}
+    crypto_universe = list(crypto_config.get("symbols") or [])
     crypto_provider_health = _load_crypto_provider_health() if crypto_universe else {}
     engine_context = EngineContext(
         as_of=_parse_date(asof_date),
@@ -435,6 +436,7 @@ def _generate_final_decision(
             "crypto_universe_path": str(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else None,
             "crypto_universe": crypto_universe,
             "crypto_symbols": enabled_crypto_symbols(crypto_universe) if crypto_universe else [],
+            "crypto_strategy": dict(crypto_config.get("strategy") or {}),
             "enable_crypto_market_data": _env_flag("ENABLE_CRYPTO_MARKET_DATA"),
         },
         provider_health=crypto_provider_health,

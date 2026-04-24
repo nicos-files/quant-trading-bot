@@ -24,18 +24,23 @@ def normalize_crypto_symbol(symbol: str, exchange: str = "binance_spot") -> str:
 
 
 def load_crypto_universe(path: str | Path | None = None) -> list[dict[str, Any]]:
+    config = load_crypto_universe_config(path)
+    return list(config.get("symbols") or [])
+
+
+def load_crypto_universe_config(path: str | Path | None = None) -> dict[str, Any]:
     target = Path(path) if path is not None else DEFAULT_CRYPTO_UNIVERSE_PATH
     if not target.exists():
-        return []
+        return {}
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return {}
     if not isinstance(payload, dict):
-        return []
+        return {}
     symbols = payload.get("symbols")
     if not isinstance(symbols, list):
-        return []
+        return {}
 
     default_quote = str(payload.get("default_quote_currency") or "USDT").strip().upper() or "USDT"
     normalized: list[dict[str, Any]] = []
@@ -61,7 +66,14 @@ def load_crypto_universe(path: str | Path | None = None) -> list[dict[str, Any]]
                 "live_enabled": bool(item.get("live_enabled", False)),
             }
         )
-    return normalized
+    strategy = payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {}
+    return {
+        "version": payload.get("version"),
+        "market": payload.get("market"),
+        "default_quote_currency": default_quote,
+        "strategy": dict(strategy),
+        "symbols": normalized,
+    }
 
 
 def enabled_crypto_symbols(config_or_path: Any = None) -> list[str]:

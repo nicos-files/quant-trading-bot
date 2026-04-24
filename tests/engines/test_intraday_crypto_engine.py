@@ -58,6 +58,7 @@ class IntradayCryptoEngineTests(unittest.TestCase):
             mode="test",
             universe=["BTC-USD", "ETH/USDT", "AAPL"],
             config={
+                "crypto_strategy": {"enabled": True},
                 "crypto_universe": [
                     {"symbol": "BTCUSDT", "enabled": True, "strategy_enabled": False},
                     {"symbol": "ETHUSDT", "enabled": True, "strategy_enabled": False},
@@ -72,7 +73,7 @@ class IntradayCryptoEngineTests(unittest.TestCase):
         self.assertIn("AAPL", result.diagnostics.metadata["non_crypto_symbols_ignored"])
         self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
         self.assertTrue(
-            any("strategy disabled" in warning for warning in result.diagnostics.warnings)
+            any("No strategy-enabled crypto symbols" in warning for warning in result.diagnostics.warnings)
         )
 
     def test_explicit_crypto_config_is_supported(self) -> None:
