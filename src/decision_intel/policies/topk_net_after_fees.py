@@ -12,6 +12,7 @@ from src.decision_intel.brokers.broker_selector import (
     select_broker,
 )
 from src.decision_intel.positions.positions_store import PositionRecord
+from src.risk import DEFAULT_RISK_CONFIG, RiskCheckInput, RiskCheckResult, RiskEngine
 
 
 POLICY_ID = "policy.topk.net_after_fees.v1"
@@ -28,6 +29,7 @@ ORDER_TYPE_DEFAULT = "MARKET"
 TIME_IN_FORCE_DEFAULT = "DAY"
 CASH_POLICY = "clip_to_available"
 ENABLE_INTRADAY_TO_LONG_TERM_FALLBACK = False
+POLICY_RISK_CONFIG = dict(DEFAULT_RISK_CONFIG)
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ def apply_topk_net_after_fees(
     cash_by_currency: Dict[str, float] | None = None,
     cash_by_broker: Dict[str, Dict[str, float]] | None = None,
 ) -> List[Dict[str, Any]]:
+    risk_engine = _build_risk_engine()
     decisions_aug = list(decisions)
     has_long_term = _has_decision_type(decisions, "long_term")
     if ENABLE_INTRADAY_TO_LONG_TERM_FALLBACK and not has_long_term:
@@ -80,6 +83,7 @@ def apply_topk_net_after_fees(
             cash_by_currency,
             cash_by_broker,
             shared_cash_pools,
+            risk_engine,
         )
     )
     recommendations.extend(
@@ -95,6 +99,7 @@ def apply_topk_net_after_fees(
             cash_by_currency,
             cash_by_broker,
             shared_cash_pools,
+            risk_engine,
         )
     )
     return recommendations
@@ -112,6 +117,7 @@ def _build_for_horizon(
     cash_by_currency: Dict[str, float] | None,
     cash_by_broker: Dict[str, Dict[str, float]] | None,
     cash_pools: _CashPools | None = None,
+    risk_engine: RiskEngine | None = None,
 ) -> List[Dict[str, Any]]:
     candidates = _collect_candidates(decisions, decision_type)
     if not candidates and not positions:
@@ -171,6 +177,7 @@ def _build_for_horizon(
         cash_by_currency,
         cash_by_broker,
         cash_pools,
+        risk_engine,
     )
     return list(items.values())
 
@@ -496,6 +503,7 @@ def _renormalize_buys(
     cash_by_currency: Dict[str, float] | None,
     cash_by_broker: Dict[str, Dict[str, float]] | None,
     cash_pools: _CashPools | None = None,
+    risk_engine: RiskEngine | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     buy_weights = {key: item["weight"] for key, item in items.items() if item["action"] == "BUY"}
     buy_weights = _normalize_weights(buy_weights)
@@ -507,11 +515,12 @@ def _renormalize_buys(
         threshold,
         price_map,
         positions,
-        cash_by_currency,
-        cash_by_broker,
-        horizon,
-        cash_pools,
-    )
+            cash_by_currency,
+            cash_by_broker,
+            horizon,
+            cash_pools,
+            risk_engine,
+        )
 
     failed = [key for key, item in items.items() if item["action"] == "BUY" and item["expected_return_net_pct"] < threshold]
     if failed:
@@ -531,6 +540,7 @@ def _renormalize_buys(
             cash_by_broker,
             horizon,
             cash_pools,
+            risk_engine,
         )
 
     _apply_guardrails(items, horizon, capital, cap, threshold, price_map, positions, cash_by_currency, cash_by_broker)
@@ -556,8 +566,10 @@ def _apply_buy_weights(
     cash_by_broker: Dict[str, Dict[str, float]] | None,
     horizon: str,
     cash_pools: _CashPools | None = None,
+    risk_engine: RiskEngine | None = None,
 ) -> None:
     pools = cash_pools or _build_cash_pools(cash_by_currency, cash_by_broker, capital)
+    active_risk_engine = risk_engine or _build_risk_engine()
     buy_keys = [key for key, item in items.items() if item.get("action") == "BUY"]
     buy_keys.sort(
         key=lambda key: (
@@ -693,11 +705,35 @@ def _apply_buy_weights(
             broker_override=broker_selected,
         )
 
-        _consume_cash_usd(pools, cash_bucket, currency, cash_consumed_usd, fx_rate_used)
-
         net_pct = _net_pct(gross_pct, fees_round_trip, usd_effective)
         net_usd = _net_usd(gross_pct, fees_round_trip, usd_effective)
         delta_qty = qty_target - current_qty
+        risk_result = active_risk_engine.evaluate(
+            RiskCheckInput(
+                symbol=key,
+                side="BUY",
+                quantity=qty_target,
+                notional=usd_effective,
+                price=price_usd,
+                cash_available=best_choice["available_cash_usd"],
+                fees_estimate=fees_one_way,
+                expected_net_edge=net_pct,
+                provider_healthy=True,
+                metadata={"horizon": horizon, "broker_selected": broker_selected},
+            )
+        )
+        if not risk_result.approved:
+            _zero_trade_fields(item)
+            item["action"] = _resolve_action(current_qty, 0.0, price_used)
+            item["order_side"] = "BUY"
+            item["order_status"] = "BLOCKED_RISK"
+            _append_constraint(item, "risk_rejected")
+            for tag in risk_result.risk_tags:
+                _append_constraint(item, f"risk:{tag}")
+            item["reason"] = _build_risk_rejected_reason(item.get("_base_reason"), risk_result)
+            continue
+
+        _consume_cash_usd(pools, cash_bucket, currency, cash_consumed_usd, fx_rate_used)
         item["usd_target_effective"] = usd_effective
         item["weight"] = (usd_effective / capital) if capital > 0 else 0.0
         item["qty_target"] = qty_target
@@ -740,6 +776,21 @@ def _apply_buy_weights(
             _append_constraint(item, "fx_rate_missing")
         if usd_effective < best_choice["spend_limit"] - 1e-9:
             _append_constraint(item, "lot_size_rounding")
+
+
+def _build_risk_engine() -> RiskEngine:
+    return RiskEngine(POLICY_RISK_CONFIG)
+
+
+def _build_risk_rejected_reason(base_reason: str | None, result: RiskCheckResult) -> str:
+    parts = []
+    if base_reason:
+        parts.append(base_reason)
+    if result.rejected_reason:
+        parts.append(f"risk:{result.rejected_reason}")
+    if result.risk_tags:
+        parts.append(f"risk_tags={','.join(result.risk_tags)}")
+    return " | ".join(parts)
 
 
 def _append_constraint(item: Dict[str, Any], constraint: str) -> None:
@@ -854,7 +905,19 @@ def _apply_guardrails(
                     _append_constraint(items[key], "max_turnover_long_term")
                 buy_weights = {key: max(float(items[key].get("weight") or 0.0), 0.0) for key in buy_keys}
                 buy_weights = _apply_caps_retain(buy_weights, cap)
-                _apply_buy_weights(items, buy_weights, capital, threshold, price_map, positions, cash_by_currency, cash_by_broker, horizon)
+                _apply_buy_weights(
+                    items,
+                    buy_weights,
+                    capital,
+                    threshold,
+                    price_map,
+                    positions,
+                    cash_by_currency,
+                    cash_by_broker,
+                    horizon,
+                    None,
+                    risk_engine,
+                )
 
     _mark_cap_relaxed(items, cap)
 

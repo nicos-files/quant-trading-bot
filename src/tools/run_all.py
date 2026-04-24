@@ -16,6 +16,7 @@ from src.decision_intel.execution.execution_engine import execute_plan
 from src.decision_intel.exports.artifact_exporter import export_artifacts
 from src.decision_intel.integrations.quant_trading_bot_adapter import build_decision_intel_artifacts
 from src.decision_intel.policies.topk_net_after_fees import CAPITAL_USD
+from src.engines import EngineContext, IntradayCryptoEngine, LongTermPortfolioEngine
 
 ROOT = Path(__file__).resolve().parents[2]
 FEATURES_BASE = ROOT / "data" / "processed" / "features"
@@ -413,6 +414,31 @@ def _generate_final_decision(
     current_df = pd.read_parquet(features_path)
     history_df = _load_decision_history(asof_date, DECISION_HISTORY_DAYS)
     oos_ticker_stats = _load_oos_ticker_stats()
+    run_id = execution_date.replace("-", "") + "-" + execution_hour
+    universe = (
+        current_df["ticker"].astype(str).str.strip().str.upper().dropna().drop_duplicates().tolist()
+        if "ticker" in current_df.columns
+        else []
+    )
+    engine_context = EngineContext(
+        as_of=_parse_date(asof_date),
+        run_id=run_id,
+        mode="decision_generation",
+        universe=universe,
+        prices=current_df,
+        config={},
+        provider_health={},
+        metadata={
+            "asof_date": asof_date,
+            "execution_date": execution_date,
+            "execution_hour": execution_hour,
+            "features_path": str(features_path),
+            "history_df": history_df,
+            "top_k": top_k,
+            "oos_ticker_stats": oos_ticker_stats,
+        },
+    )
+
     intraday = _build_intraday_candidates(
         current_df=current_df,
         history_df=history_df,
@@ -421,12 +447,17 @@ def _generate_final_decision(
         top_k=top_k,
         oos_ticker_stats=oos_ticker_stats,
     )
-    long_term = _build_long_term_candidates(
-        current_df=current_df,
-        history_df=history_df,
-        asof_date=asof_date,
-        top_k=top_k,
-    )
+    long_term_engine = LongTermPortfolioEngine()
+    long_term_result = long_term_engine.run(engine_context)
+    _log_engine_result(long_term_result)
+    long_term = list(long_term_result.diagnostics.metadata.get("decision_rows", []))
+
+    crypto_engine = IntradayCryptoEngine()
+    crypto_result = crypto_engine.run(engine_context)
+    _log_engine_result(crypto_result)
+    crypto_rows = list(crypto_result.diagnostics.metadata.get("decision_rows", []))
+    if crypto_rows:
+        intraday = intraday + crypto_rows
 
     payload = {
         "decision": {
@@ -444,6 +475,17 @@ def _generate_final_decision(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def _log_engine_result(result: Any) -> None:
+    diagnostics = result.diagnostics
+    print(
+        f"[RUN-ALL] engine={result.engine_name} horizon={result.horizon} "
+        f"seen={diagnostics.candidates_seen} scored={diagnostics.candidates_scored} "
+        f"rejected={diagnostics.candidates_rejected}"
+    )
+    for warning in diagnostics.warnings:
+        print(f"[RUN-ALL] engine={result.engine_name} warning={warning}")
 
 
 def _resolve_model_path(primary: Path, fallback: Path | None = None) -> Path:
