@@ -9,7 +9,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.decision_intel.contracts.recommendations.recommendation_models import RecommendationOutput
 from src.execution.crypto_paper_executor import CryptoPaperExecutor
-from src.execution.crypto_paper_models import CryptoPaperExecutionConfig
+from src.execution.crypto_paper_ledger import CryptoPaperLedger
+from src.execution.crypto_paper_models import CryptoPaperExecutionConfig, CryptoPaperExitEvent
 from src.risk import RiskEngine
 
 
@@ -96,6 +97,53 @@ class CryptoPaperExecutorTests(unittest.TestCase):
         rec = {"ticker": "BTCUSDT", "asset_id": "BTCUSDT", "horizon": "INTRADAY", "action": "BUY", "usd_target": 10.0, "usd_target_effective": 10.0, "price_used": 100.0, "currency": "USDT", "policy_id": "x", "policy_version": "1", "reason": "x", "sizing_rule": "x", "paper_only": True}
         result = self.executor.execute(_output([rec]), {"BTCUSDT": {"ask": 100.0}}, self.now)
         self.assertEqual(len(result.accepted_orders), 1)
+
+    def test_exit_event_creates_sell_fill(self) -> None:
+        buy = {"ticker": "BTCUSDT", "asset_id": "BTCUSDT", "horizon": "INTRADAY", "action": "BUY", "usd_target": 10.0, "usd_target_effective": 10.0, "price_used": 100.0, "currency": "USDT", "policy_id": "x", "policy_version": "1", "reason": "x", "sizing_rule": "x", "paper_only": True}
+        ledger = CryptoPaperLedger(CryptoPaperExecutionConfig(starting_cash=100.0, max_notional_per_order=25.0))
+        initial = self.executor.execute(_output([buy]), {"BTCUSDT": {"ask": 100.0, "last_price": 100.0}}, self.now, ledger=ledger)
+        exit_event = CryptoPaperExitEvent("e1", "BTCUSDT", initial.portfolio_snapshot.positions[0].quantity, initial.portfolio_snapshot.positions[0].quantity, "STOP_LOSS", 95.0, 95.0, 0.0, 0.0, 0.0, 0.0, self.now, "unit", {"avg_entry_price": 100.0})
+        result = self.executor.execute(_output([]), {"BTCUSDT": {"bid": 95.0, "last_price": 95.0}}, self.now, ledger=ledger, exit_events=[exit_event])
+        self.assertTrue(any(fill.side == "SELL" for fill in result.fills))
+
+    def test_stop_loss_exit_uses_negative_slippage(self) -> None:
+        ledger = CryptoPaperLedger(CryptoPaperExecutionConfig(starting_cash=100.0, max_notional_per_order=25.0))
+        buy = {"ticker": "BTCUSDT", "asset_id": "BTCUSDT", "horizon": "INTRADAY", "action": "BUY", "usd_target": 10.0, "usd_target_effective": 10.0, "price_used": 100.0, "currency": "USDT", "policy_id": "x", "policy_version": "1", "reason": "x", "sizing_rule": "x", "paper_only": True}
+        self.executor.execute(_output([buy]), {"BTCUSDT": {"ask": 100.0, "last_price": 100.0}}, self.now, ledger=ledger)
+        qty = ledger.positions["BTCUSDT"].quantity
+        event = CryptoPaperExitEvent("e1", "BTCUSDT", qty, qty, "STOP_LOSS", 95.0, 95.0, 0.0, 0.0, 0.0, 0.0, self.now, "unit", {"avg_entry_price": 100.0})
+        result = self.executor.execute(_output([]), {"BTCUSDT": {"bid": 95.0}}, self.now, ledger=ledger, exit_events=[event])
+        self.assertLess(result.fills[0].fill_price, 95.0)
+
+    def test_take_profit_exit_uses_negative_slippage(self) -> None:
+        ledger = CryptoPaperLedger(CryptoPaperExecutionConfig(starting_cash=100.0, max_notional_per_order=25.0))
+        buy = {"ticker": "BTCUSDT", "asset_id": "BTCUSDT", "horizon": "INTRADAY", "action": "BUY", "usd_target": 10.0, "usd_target_effective": 10.0, "price_used": 100.0, "currency": "USDT", "policy_id": "x", "policy_version": "1", "reason": "x", "sizing_rule": "x", "paper_only": True}
+        self.executor.execute(_output([buy]), {"BTCUSDT": {"ask": 100.0, "last_price": 100.0}}, self.now, ledger=ledger)
+        qty = ledger.positions["BTCUSDT"].quantity
+        event = CryptoPaperExitEvent("e1", "BTCUSDT", qty, qty, "TAKE_PROFIT", 110.0, 110.0, 0.0, 0.0, 0.0, 0.0, self.now, "unit", {"avg_entry_price": 100.0})
+        result = self.executor.execute(_output([]), {"BTCUSDT": {"bid": 110.0}}, self.now, ledger=ledger, exit_events=[event])
+        self.assertLess(result.fills[0].fill_price, 110.0)
+
+    def test_exit_with_no_position_is_rejected(self) -> None:
+        event = CryptoPaperExitEvent("e1", "BTCUSDT", 0.1, 0.1, "STOP_LOSS", 95.0, 95.0, 0.0, 0.0, 0.0, 0.0, self.now, "unit")
+        result = self.executor.execute(_output([]), {"BTCUSDT": {"bid": 95.0}}, self.now, exit_events=[event])
+        self.assertEqual(result.rejected_orders[0].reason, "position_not_found")
+
+    def test_exit_updates_cash_position_and_snapshot(self) -> None:
+        ledger = CryptoPaperLedger(CryptoPaperExecutionConfig(starting_cash=100.0, max_notional_per_order=25.0))
+        buy = {"ticker": "BTCUSDT", "asset_id": "BTCUSDT", "horizon": "INTRADAY", "action": "BUY", "usd_target": 10.0, "usd_target_effective": 10.0, "price_used": 100.0, "currency": "USDT", "policy_id": "x", "policy_version": "1", "reason": "x", "sizing_rule": "x", "paper_only": True}
+        self.executor.execute(_output([buy]), {"BTCUSDT": {"ask": 100.0, "last_price": 100.0}}, self.now, ledger=ledger)
+        qty = ledger.positions["BTCUSDT"].quantity
+        before_cash = ledger.cash
+        event = CryptoPaperExitEvent("e1", "BTCUSDT", qty, qty, "TAKE_PROFIT", 110.0, 110.0, 0.0, 0.0, 0.0, 0.0, self.now, "unit", {"avg_entry_price": 100.0})
+        result = self.executor.execute(_output([]), {"BTCUSDT": {"bid": 110.0}}, self.now, ledger=ledger, exit_events=[event])
+        self.assertGreater(result.portfolio_snapshot.cash, before_cash)
+        self.assertEqual(result.portfolio_snapshot.positions, [])
+        self.assertGreater(result.portfolio_snapshot.realized_pnl, 0.0)
+
+    def test_exit_event_is_json_serializable(self) -> None:
+        event = CryptoPaperExitEvent("e1", "BTCUSDT", 0.1, 0.1, "TAKE_PROFIT", 110.0, 109.0, 10.9, 0.01, 0.05, 0.89, self.now, "unit")
+        self.assertEqual(event.to_dict()["symbol"], "BTCUSDT")
 
 
 if __name__ == "__main__":

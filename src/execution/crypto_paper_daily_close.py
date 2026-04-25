@@ -65,6 +65,7 @@ def close_crypto_paper_day(
     current_snapshot = _updated_snapshot(current_snapshot, marked_positions, starting_cash, as_of)
     accepted_orders_count, rejected_orders_count = _order_counts(loaded)
     fills_count = _fills_count(loaded)
+    exit_events_count = _exit_events_count(loaded)
     performance = compute_crypto_paper_performance(
         as_of=as_of,
         positions=marked_positions,
@@ -75,9 +76,15 @@ def close_crypto_paper_day(
         fills_count=fills_count,
         accepted_orders_count=accepted_orders_count,
         rejected_orders_count=rejected_orders_count,
+        exit_events_count=exit_events_count,
         warnings=warnings,
         provider_health=dict(provider_health or {}),
-        metadata={"source_artifacts": sorted(loaded["found"]), "paper_only": True, "live_trading": False},
+        metadata={
+            "source_artifacts": sorted(loaded["found"]),
+            "paper_only": True,
+            "live_trading": False,
+            "exit_events_count": exit_events_count,
+        },
     )
     result = CryptoPaperDailyCloseResult(
         as_of=as_of,
@@ -110,9 +117,11 @@ def close_crypto_paper_day(
 def load_crypto_paper_artifacts(artifact_root: str | Path, warnings: list[str] | None = None) -> dict[str, Any]:
     root = Path(artifact_root)
     warnings_list = warnings if warnings is not None else []
+    optional_files = {"exit_events"}
     files = {
         "orders": root / "crypto_paper_orders.json",
         "fills": root / "crypto_paper_fills.json",
+        "exit_events": root / "crypto_paper_exit_events.json",
         "positions": root / "crypto_paper_positions.json",
         "snapshot": root / "crypto_paper_snapshot.json",
         "execution_result": root / "crypto_paper_execution_result.json",
@@ -121,7 +130,8 @@ def load_crypto_paper_artifacts(artifact_root: str | Path, warnings: list[str] |
     payloads: dict[str, Any] = {}
     for name, path in files.items():
         if not path.exists():
-            warnings_list.append(f"Missing artifact: {path.name}")
+            if name not in optional_files:
+                warnings_list.append(f"Missing artifact: {path.name}")
             payloads[name] = None
             continue
         found.append(path.name)
@@ -172,7 +182,9 @@ def build_crypto_paper_daily_report(result: CryptoPaperDailyCloseResult) -> str:
         f"- Ending equity: {performance.ending_equity:.6f}",
         f"- Total P&L: {performance.total_pnl:.6f}",
         f"- Total return %: {performance.total_return_pct * 100.0:.4f}",
+        f"- Realized P&L: {performance.realized_pnl:.6f}",
         f"- Fees paid: {performance.fees_paid:.6f}",
+        f"- Exit events: {performance.exit_events_count}",
         "",
         "## Positions",
     ]
@@ -200,6 +212,7 @@ def build_crypto_paper_daily_report(result: CryptoPaperDailyCloseResult) -> str:
             f"- Accepted orders: {performance.accepted_orders_count}",
             f"- Rejected orders: {performance.rejected_orders_count}",
             f"- Fills: {performance.fills_count}",
+            f"- Exit events: {performance.exit_events_count}",
             "",
             "## Warnings",
         ]
@@ -357,6 +370,14 @@ def _fills_count(loaded: dict[str, Any]) -> int:
         return len(execution_payload["fills"])
     fills = loaded.get("fills")
     return len(fills) if isinstance(fills, list) else 0
+
+
+def _exit_events_count(loaded: dict[str, Any]) -> int:
+    execution_payload = loaded.get("execution_result")
+    if isinstance(execution_payload, dict) and isinstance(execution_payload.get("exit_events"), list):
+        return len(execution_payload["exit_events"])
+    events = loaded.get("exit_events")
+    return len(events) if isinstance(events, list) else 0
 
 
 def _position_from_payload(payload: dict[str, Any]) -> CryptoPaperPosition | None:

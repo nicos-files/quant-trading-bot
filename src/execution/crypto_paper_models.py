@@ -28,6 +28,9 @@ class CryptoPaperExecutionConfig:
     allow_fractional_quantity: bool = True
     allow_short: bool = False
     allow_live_trading: bool = False
+    enable_exits: bool = False
+    exit_full_position: bool = True
+    conservative_same_candle_policy: str = "stop_loss_first"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,6 +66,27 @@ class CryptoPaperFill:
     slippage: float
     net_notional: float
     filled_at: datetime
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
+
+
+@dataclass(frozen=True)
+class CryptoPaperExitEvent:
+    exit_id: str
+    symbol: str
+    position_quantity_before: float
+    exit_quantity: float
+    exit_reason: str
+    trigger_price: float
+    fill_price: float
+    gross_notional: float
+    fee: float
+    slippage: float
+    realized_pnl: float
+    exited_at: datetime
+    source: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,6 +131,7 @@ class CryptoPaperExecutionResult:
     fills: list[CryptoPaperFill]
     portfolio_snapshot: CryptoPaperPortfolioSnapshot
     warnings: list[str] = field(default_factory=list)
+    exit_events: list[CryptoPaperExitEvent] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

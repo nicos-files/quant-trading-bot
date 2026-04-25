@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.execution.crypto_paper_daily_close import close_crypto_paper_day
 from src.execution.crypto_paper_models import (
     CryptoPaperExecutionResult,
+    CryptoPaperExitEvent,
     CryptoPaperFill,
     CryptoPaperOrder,
     CryptoPaperPortfolioSnapshot,
@@ -23,7 +24,7 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.as_of = datetime(2026, 4, 24, 19, 0, 0)
 
-    def _write_artifacts(self, root: Path, last_price: float = 102.0) -> None:
+    def _write_artifacts(self, root: Path, last_price: float = 102.0, realized_pnl: float = 0.0, with_exit: bool = False) -> None:
         root.mkdir(parents=True, exist_ok=True)
         order = CryptoPaperOrder(
             order_id="crypto-paper-order-0001",
@@ -64,17 +65,37 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
             cash=89.9,
             equity=100.1,
             positions_value=10.2,
-            realized_pnl=0.0,
+            realized_pnl=realized_pnl,
             unrealized_pnl=0.2,
             fees_paid=0.1,
             positions=[position],
             metadata={"quote_currency": "USDT"},
         )
+        exit_events = []
+        if with_exit:
+            exit_events.append(
+                CryptoPaperExitEvent(
+                    exit_id="exit-1",
+                    symbol="BTCUSDT",
+                    position_quantity_before=0.1,
+                    exit_quantity=0.1,
+                    exit_reason="TAKE_PROFIT",
+                    trigger_price=105.0,
+                    fill_price=104.95,
+                    gross_notional=10.495,
+                    fee=0.01,
+                    slippage=0.05,
+                    realized_pnl=realized_pnl,
+                    exited_at=self.as_of,
+                    source="unit",
+                )
+            )
         execution_result = CryptoPaperExecutionResult(
             accepted_orders=[order],
             rejected_orders=[],
             fills=[fill],
             portfolio_snapshot=snapshot,
+            exit_events=exit_events,
             metadata={"quote_currency": "USDT"},
         )
         (root / "crypto_paper_orders.json").write_text(json.dumps([order.to_dict()], ensure_ascii=False), encoding="utf-8")
@@ -82,6 +103,8 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
         (root / "crypto_paper_positions.json").write_text(json.dumps([position.to_dict()], ensure_ascii=False), encoding="utf-8")
         (root / "crypto_paper_snapshot.json").write_text(json.dumps(snapshot.to_dict(), ensure_ascii=False), encoding="utf-8")
         (root / "crypto_paper_execution_result.json").write_text(json.dumps(execution_result.to_dict(), ensure_ascii=False), encoding="utf-8")
+        if with_exit:
+            (root / "crypto_paper_exit_events.json").write_text(json.dumps([event.to_dict() for event in exit_events], ensure_ascii=False), encoding="utf-8")
 
     def test_missing_artifacts_do_not_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,6 +196,21 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
             result = close_crypto_paper_day(artifacts_dir=root, as_of=self.as_of)
             self.assertTrue(result.paper_only)
             self.assertFalse(result.live_trading)
+
+    def test_daily_close_includes_realized_pnl_after_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_artifacts(root, realized_pnl=1.25, with_exit=True)
+            result = close_crypto_paper_day(artifacts_dir=root, as_of=self.as_of)
+            self.assertAlmostEqual(result.performance.realized_pnl, 1.25, places=6)
+
+    def test_daily_close_report_mentions_exits_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_artifacts(root, realized_pnl=1.25, with_exit=True)
+            close_crypto_paper_day(artifacts_dir=root, as_of=self.as_of)
+            report = (root / "daily_close" / "crypto_paper_daily_report.md").read_text(encoding="utf-8")
+            self.assertIn("Exit events", report)
 
 
 if __name__ == "__main__":

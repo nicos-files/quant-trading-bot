@@ -7,7 +7,8 @@ from typing import Any
 
 from src.decision_intel.contracts.recommendations.recommendation_models import RecommendationOutput
 from src.engines import EngineContext, IntradayCryptoEngine
-from src.execution.crypto_paper_executor import CryptoPaperExecutor, write_crypto_paper_execution_artifacts
+from src.execution.crypto_paper_executor import CryptoPaperExecutor, load_crypto_paper_ledger, write_crypto_paper_execution_artifacts
+from src.execution.crypto_paper_exits import evaluate_crypto_exit_triggers
 from src.execution.crypto_paper_models import CryptoPaperExecutionConfig
 from src.market_data.crypto_symbols import enabled_crypto_symbols, load_crypto_universe_config
 from src.market_data.providers import BinanceSpotMarketDataProvider
@@ -36,6 +37,7 @@ def run_crypto_paper(
     now = as_of or datetime.utcnow()
     active_provider = provider or BinanceSpotMarketDataProvider()
     health = active_provider.health_check()
+    active_config = CryptoPaperExecutionConfig(enable_exits=_flag("ENABLE_CRYPTO_PAPER_EXITS"))
     context = EngineContext(
         as_of=now,
         run_id=run_id,
@@ -65,7 +67,8 @@ def run_crypto_paper(
     )
     active_engine = engine or IntradayCryptoEngine()
     engine_result = active_engine.run(context)
-    active_executor = executor or CryptoPaperExecutor(CryptoPaperExecutionConfig())
+    active_executor = executor or CryptoPaperExecutor(active_config)
+    active_ledger = load_crypto_paper_ledger(run_id=run_id, base_path=base_path, config=active_config) if _flag("ENABLE_CRYPTO_PAPER_EXITS") else None
 
     latest_quotes = {}
     for item in engine_result.recommendations.recommendations:
@@ -75,10 +78,32 @@ def run_crypto_paper(
             "provider": item.extensions.get("provider"),
         }
 
+    exit_events = []
+    if _flag("ENABLE_CRYPTO_PAPER_EXITS") and active_ledger is not None:
+        candles_by_symbol: dict[str, Any] = {}
+        for symbol, position in active_ledger.positions.items():
+            try:
+                candles_by_symbol[symbol] = active_provider.get_historical_bars(
+                    symbol=symbol,
+                    timeframe=str(strategy_config.get("timeframe", "5m")),
+                    limit=int(strategy_config.get("lookback_limit", 120)),
+                )
+                latest_quotes.setdefault(symbol, active_provider.get_latest_quote(symbol))
+            except Exception:
+                continue
+        exit_events = evaluate_crypto_exit_triggers(
+            positions=list(active_ledger.positions.values()),
+            candles_by_symbol=candles_by_symbol,
+            as_of=now,
+            config=active_config,
+        )
+
     execution_result = active_executor.execute(
         recommendations=engine_result.recommendations,
         latest_quotes=latest_quotes,
         as_of=now,
+        ledger=active_ledger,
+        exit_events=exit_events,
     )
     artifacts = write_crypto_paper_execution_artifacts(run_id=run_id, result=execution_result, base_path=base_path)
     return {
@@ -86,6 +111,7 @@ def run_crypto_paper(
         "artifacts": {name: str(path) for name, path in artifacts.items()},
         "recommendation_count": len(engine_result.recommendations.recommendations),
         "fill_count": len(execution_result.fills),
+        "exit_count": len(execution_result.exit_events),
     }
 
 

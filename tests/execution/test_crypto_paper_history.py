@@ -215,6 +215,27 @@ class CryptoPaperHistoryTests(unittest.TestCase):
             self.assertTrue(all(entry.paper_only for entry in entries))
             self.assertFalse(any(entry.live_trading for entry in entries))
 
+    def test_history_uses_realized_pnl_from_daily_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = Path(tmp) / "daily_close"
+            history = Path(tmp) / "history"
+            self._write_daily_close(
+                daily,
+                as_of="2026-04-24T19:00:00",
+                starting_equity=100.0,
+                ending_equity=101.0,
+                total_pnl=1.0,
+                total_return_pct=0.01,
+                fees_paid=0.1,
+                fills_count=1,
+                rejected_orders_count=0,
+            )
+            payload = json.loads((daily / "crypto_paper_performance_summary.json").read_text(encoding="utf-8"))
+            payload["realized_pnl"] = 1.5
+            (daily / "crypto_paper_performance_summary.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            entries, _, _, _, _, _ = update_crypto_paper_history(daily_close_dir=daily, history_dir=history)
+            self.assertAlmostEqual(entries[0].realized_pnl, 1.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

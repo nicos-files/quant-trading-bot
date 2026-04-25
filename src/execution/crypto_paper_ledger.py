@@ -35,6 +35,8 @@ class CryptoPaperLedger:
         avg_entry = (new_cost_basis / new_qty) if new_qty > 0 else 0.0
         self.cash -= total_cost
         self.fees_paid += float(fill.fee)
+        metadata = dict(existing.metadata) if existing else {}
+        metadata.update(dict(fill.metadata or {}))
         self.positions[fill.symbol] = CryptoPaperPosition(
             symbol=fill.symbol,
             quantity=new_qty,
@@ -43,7 +45,42 @@ class CryptoPaperLedger:
             unrealized_pnl=float(existing.unrealized_pnl) if existing else 0.0,
             last_price=fill.fill_price,
             updated_at=fill.filled_at,
-            metadata=dict(existing.metadata) if existing else {},
+            metadata=metadata,
+        )
+
+    def apply_sell_fill(self, fill: CryptoPaperFill) -> None:
+        existing = self.positions.get(fill.symbol)
+        if existing is None or float(existing.quantity) <= 0.0:
+            raise ValueError("position_not_found")
+        sell_qty = float(fill.quantity)
+        if sell_qty <= 0.0:
+            raise ValueError("invalid_sell_quantity")
+        if sell_qty > float(existing.quantity) + 1e-9:
+            raise ValueError("sell_qty_exceeds_position")
+
+        gross_notional = float(fill.gross_notional)
+        fee = float(fill.fee)
+        realized = (float(fill.fill_price) - float(existing.avg_entry_price)) * sell_qty - fee
+        remaining_qty = float(existing.quantity) - sell_qty
+
+        self.cash += gross_notional - fee
+        self.fees_paid += fee
+        self.realized_pnl += realized
+
+        if remaining_qty <= 1e-9:
+            self.positions.pop(fill.symbol, None)
+            return
+
+        remaining_unrealized = (float(fill.fill_price) - float(existing.avg_entry_price)) * remaining_qty
+        self.positions[fill.symbol] = replace(
+            existing,
+            quantity=remaining_qty,
+            avg_entry_price=float(existing.avg_entry_price),
+            realized_pnl=float(existing.realized_pnl or 0.0) + realized,
+            unrealized_pnl=remaining_unrealized,
+            last_price=float(fill.fill_price),
+            updated_at=fill.filled_at,
+            metadata=dict(existing.metadata or {}),
         )
 
     def mark_to_market(self, latest_prices: dict[str, float], as_of: datetime) -> None:

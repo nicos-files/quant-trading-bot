@@ -11,6 +11,7 @@ from src.market_data.crypto_symbols import is_crypto_symbol, normalize_crypto_sy
 from src.risk import RiskCheckInput, RiskEngine
 
 from .crypto_paper_ledger import CryptoPaperLedger
+from .crypto_paper_models import CryptoPaperExitEvent, CryptoPaperPosition
 from .crypto_paper_models import (
     CryptoPaperExecutionConfig,
     CryptoPaperExecutionResult,
@@ -34,12 +35,14 @@ class CryptoPaperExecutor:
         latest_quotes: dict[str, Any],
         as_of: datetime,
         ledger: CryptoPaperLedger | None = None,
+        exit_events: list[CryptoPaperExitEvent] | None = None,
     ) -> CryptoPaperExecutionResult:
         active_ledger = ledger or CryptoPaperLedger(self.config)
         accepted_orders: list[CryptoPaperOrder] = []
         rejected_orders: list[CryptoPaperOrder] = []
         fills: list[CryptoPaperFill] = []
         warnings: list[str] = []
+        applied_exit_events: list[CryptoPaperExitEvent] = []
 
         for index, item in enumerate(recommendations.recommendations, start=1):
             order = self._build_order(item, as_of, index)
@@ -80,6 +83,39 @@ class CryptoPaperExecutor:
             accepted_orders.append(order)
             fills.append(fill)
 
+        for offset, exit_event in enumerate(list(exit_events or []), start=1):
+            order = self._build_exit_order(exit_event, as_of, len(accepted_orders) + len(rejected_orders) + offset)
+            rejection_reason = self._validate_exit_event(exit_event, active_ledger)
+            if rejection_reason:
+                rejected_orders.append(self._reject(order, rejection_reason))
+                continue
+            fill = self._build_exit_fill(order, exit_event, as_of, len(fills) + offset)
+            try:
+                active_ledger.apply_sell_fill(fill)
+            except ValueError as exc:
+                rejected_orders.append(self._reject(order, str(exc)))
+                continue
+            accepted_orders.append(order)
+            fills.append(fill)
+            applied_exit_events.append(
+                CryptoPaperExitEvent(
+                    exit_id=exit_event.exit_id,
+                    symbol=exit_event.symbol,
+                    position_quantity_before=exit_event.position_quantity_before,
+                    exit_quantity=exit_event.exit_quantity,
+                    exit_reason=exit_event.exit_reason,
+                    trigger_price=exit_event.trigger_price,
+                    fill_price=fill.fill_price,
+                    gross_notional=fill.gross_notional,
+                    fee=fill.fee,
+                    slippage=fill.slippage,
+                    realized_pnl=((fill.fill_price - exit_event.metadata.get("avg_entry_price", 0.0)) * fill.quantity) - fill.fee,
+                    exited_at=fill.filled_at,
+                    source=exit_event.source,
+                    metadata=dict(exit_event.metadata or {}),
+                )
+            )
+
         marks = {
             normalize_crypto_symbol(symbol): self._extract_price(quote)
             for symbol, quote in latest_quotes.items()
@@ -93,7 +129,8 @@ class CryptoPaperExecutor:
             fills=fills,
             portfolio_snapshot=snapshot,
             warnings=warnings,
-            metadata={"quote_currency": self.config.quote_currency},
+            exit_events=applied_exit_events,
+            metadata={"quote_currency": self.config.quote_currency, "exit_events_count": len(applied_exit_events)},
         )
 
     def _build_order(self, item: Any, as_of: datetime, index: int) -> CryptoPaperOrder | None:
@@ -131,6 +168,16 @@ class CryptoPaperExecutor:
             return "below_min_notional"
         if notional > float(self.config.max_notional_per_order):
             return "above_max_notional"
+        return None
+
+    def _validate_exit_event(self, event: CryptoPaperExitEvent, ledger: CryptoPaperLedger) -> str | None:
+        position = ledger.positions.get(normalize_crypto_symbol(event.symbol))
+        if position is None or float(position.quantity) <= 0.0:
+            return "position_not_found"
+        if float(event.exit_quantity or 0.0) <= 0.0:
+            return "invalid_exit_quantity"
+        if float(event.exit_quantity) > float(position.quantity) + 1e-9:
+            return "sell_qty_exceeds_position"
         return None
 
     def _requested_notional(self, item: Any) -> float:
@@ -201,6 +248,42 @@ class CryptoPaperExecutor:
             },
         )
 
+    def _build_exit_order(self, event: CryptoPaperExitEvent, as_of: datetime, index: int) -> CryptoPaperOrder:
+        return CryptoPaperOrder(
+            order_id=f"crypto-paper-exit-order-{index:04d}",
+            symbol=normalize_crypto_symbol(event.symbol),
+            side="SELL",
+            requested_notional=float(event.gross_notional or 0.0),
+            requested_quantity=float(event.exit_quantity or 0.0),
+            reference_price=float(event.trigger_price or 0.0),
+            status="PENDING",
+            reason=None,
+            created_at=as_of,
+            metadata={"exit_reason": event.exit_reason, "source": event.source, **dict(event.metadata or {})},
+        )
+
+    def _build_exit_fill(self, order: CryptoPaperOrder, event: CryptoPaperExitEvent, as_of: datetime, index: int) -> CryptoPaperFill:
+        reference_price = float(event.trigger_price or order.reference_price or 0.0)
+        slippage = float(reference_price) * float(self.config.slippage_bps) / 10000.0
+        fill_price = float(reference_price) - slippage
+        quantity = float(event.exit_quantity or 0.0)
+        gross_notional = quantity * fill_price
+        fee = self._estimate_fee(gross_notional)
+        return CryptoPaperFill(
+            fill_id=f"crypto-paper-exit-fill-{index:04d}",
+            order_id=order.order_id,
+            symbol=order.symbol,
+            side="SELL",
+            quantity=quantity,
+            fill_price=fill_price,
+            gross_notional=gross_notional,
+            fee=fee,
+            slippage=slippage,
+            net_notional=gross_notional - fee,
+            filled_at=event.exited_at or as_of,
+            metadata={"exit_reason": event.exit_reason, "source": event.source, **dict(event.metadata or {})},
+        )
+
     def _reject(self, order: CryptoPaperOrder, reason: str) -> CryptoPaperOrder:
         return CryptoPaperOrder(
             order_id=order.order_id,
@@ -227,6 +310,7 @@ def write_crypto_paper_execution_artifacts(
     payloads = {
         "crypto_paper_orders.json": [order.to_dict() for order in result.accepted_orders + result.rejected_orders],
         "crypto_paper_fills.json": [fill.to_dict() for fill in result.fills],
+        "crypto_paper_exit_events.json": [event.to_dict() for event in result.exit_events],
         "crypto_paper_positions.json": [position.to_dict() for position in result.portfolio_snapshot.positions],
         "crypto_paper_snapshot.json": result.portfolio_snapshot.to_dict(),
         "crypto_paper_execution_result.json": result.to_dict(),
@@ -241,3 +325,55 @@ def write_crypto_paper_execution_artifacts(
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def load_crypto_paper_ledger(
+    run_id: str,
+    base_path: str = "runs",
+    config: CryptoPaperExecutionConfig | None = None,
+) -> CryptoPaperLedger:
+    active_config = config or CryptoPaperExecutionConfig()
+    ledger = CryptoPaperLedger(active_config)
+    root = Path(base_path) / run_id / "artifacts" / "crypto_paper"
+    snapshot_path = root / "crypto_paper_snapshot.json"
+    positions_path = root / "crypto_paper_positions.json"
+    if snapshot_path.exists():
+        try:
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            if isinstance(snapshot, dict):
+                ledger.cash = float(snapshot.get("cash") or ledger.cash)
+                ledger.fees_paid = float(snapshot.get("fees_paid") or 0.0)
+                ledger.realized_pnl = float(snapshot.get("realized_pnl") or 0.0)
+        except Exception:
+            pass
+    if positions_path.exists():
+        try:
+            payload = json.loads(positions_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = []
+        if isinstance(payload, list):
+            for item in payload:
+                position = _position_from_payload(item)
+                if position is not None and float(position.quantity) > 0.0:
+                    ledger.positions[position.symbol] = position
+    return ledger
+
+
+def _position_from_payload(payload: Any) -> CryptoPaperPosition | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        updated = payload.get("updated_at")
+        updated_at = datetime.fromisoformat(str(updated).replace("Z", "+00:00")) if updated else None
+        return CryptoPaperPosition(
+            symbol=normalize_crypto_symbol(payload.get("symbol") or ""),
+            quantity=float(payload.get("quantity") or 0.0),
+            avg_entry_price=float(payload.get("avg_entry_price") or 0.0),
+            realized_pnl=float(payload.get("realized_pnl") or 0.0),
+            unrealized_pnl=float(payload.get("unrealized_pnl") or 0.0),
+            last_price=float(payload["last_price"]) if payload.get("last_price") is not None else None,
+            updated_at=updated_at,
+            metadata=dict(payload.get("metadata") or {}),
+        )
+    except Exception:
+        return None

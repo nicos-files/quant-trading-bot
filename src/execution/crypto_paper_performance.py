@@ -39,6 +39,7 @@ class CryptoPaperPerformanceSummary:
     symbols_held: list[str]
     best_position: dict[str, Any] | None
     worst_position: dict[str, Any] | None
+    exit_events_count: int = 0
     data_quality_warnings: list[str] = field(default_factory=list)
     provider_health: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -60,6 +61,7 @@ def compute_crypto_paper_performance(
     fills_count: int = 0,
     accepted_orders_count: int = 0,
     rejected_orders_count: int = 0,
+    exit_events_count: int = 0,
     warnings: list[str] | None = None,
     provider_health: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
@@ -103,6 +105,7 @@ def compute_crypto_paper_performance(
         rejected_orders_count=int(rejected_orders_count),
         open_positions_count=len(held_positions),
         symbols_held=sorted(position.symbol for position in held_positions),
+        exit_events_count=int(exit_events_count),
         best_position=best_position,
         worst_position=worst_position,
         data_quality_warnings=warnings_list,
