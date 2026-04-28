@@ -159,6 +159,12 @@ def build_crypto_paper_trade_log(payloads: dict[str, Any]) -> tuple[list[CryptoP
     fills = payloads.get("fills")
     snapshot = payloads.get("snapshot")
     exit_events = payloads.get("exit_events")
+    snapshot_positions_payload = _snapshot_positions(snapshot if isinstance(snapshot, dict) else {})
+    fills_is_empty = (not isinstance(fills, list)) or (isinstance(fills, list) and len(fills) == 0)
+    if fills_is_empty and snapshot_positions_payload:
+        warnings.append(
+            "ledger_history_inconsistency: positions exist but no fills found in cumulative log."
+        )
     if not isinstance(fills, list):
         warnings.append("No fills available; strategy trade log is limited.")
         return [], [], warnings

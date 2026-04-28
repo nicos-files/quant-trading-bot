@@ -740,16 +740,98 @@ def _position_from_payload(payload: Any) -> CryptoPaperPosition | None:
 
 def _write_execution_artifacts(*, artifact_root: Path, result: CryptoPaperExecutionResult) -> None:
     artifact_root.mkdir(parents=True, exist_ok=True)
+    current_orders = [order.to_dict() for order in result.accepted_orders + result.rejected_orders]
+    current_fills = [fill.to_dict() for fill in result.fills]
+    current_exits = [event.to_dict() for event in result.exit_events]
+
+    merged_orders = _merge_cumulative_records(
+        path=artifact_root / "crypto_paper_orders.json",
+        current=current_orders,
+        id_key="order_id",
+        sort_keys=("created_at", "order_id"),
+    )
+    merged_fills = _merge_cumulative_records(
+        path=artifact_root / "crypto_paper_fills.json",
+        current=current_fills,
+        id_key="fill_id",
+        sort_keys=("filled_at", "fill_id"),
+    )
+    merged_exits = _merge_cumulative_records(
+        path=artifact_root / "crypto_paper_exit_events.json",
+        current=current_exits,
+        id_key="exit_id",
+        sort_keys=("exited_at", "exit_id"),
+    )
+
     payloads = {
-        "crypto_paper_orders.json": [order.to_dict() for order in result.accepted_orders + result.rejected_orders],
-        "crypto_paper_fills.json": [fill.to_dict() for fill in result.fills],
-        "crypto_paper_exit_events.json": [event.to_dict() for event in result.exit_events],
+        "crypto_paper_orders.json": merged_orders,
+        "crypto_paper_fills.json": merged_fills,
+        "crypto_paper_exit_events.json": merged_exits,
         "crypto_paper_positions.json": [position.to_dict() for position in result.portfolio_snapshot.positions],
         "crypto_paper_snapshot.json": result.portfolio_snapshot.to_dict(),
         "crypto_paper_execution_result.json": result.to_dict(),
     }
     for filename, payload in payloads.items():
         (artifact_root / filename).write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+
+
+def _merge_cumulative_records(
+    *,
+    path: Path,
+    current: list[dict[str, Any]],
+    id_key: str,
+    sort_keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Merge current-run records with persisted cumulative records.
+
+    - Items with a stable id (``id_key``) are deduplicated by id; current-run
+      values take precedence on collision so corrections in the latest run win.
+    - Items without an id are deduplicated by canonical JSON content so reruns
+      do not duplicate identical no-id rows.
+    - Output is deterministically sorted by ``sort_keys``.
+    - Existing data is preserved when the current run produced zero items.
+    - Malformed/empty existing files are treated as empty (no crash).
+    """
+
+    existing: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                payload = json.loads(text)
+                if isinstance(payload, list):
+                    existing = [item for item in payload if isinstance(item, dict)]
+        except Exception:
+            existing = []
+
+    by_id: dict[str, dict[str, Any]] = {}
+    no_id_records: list[dict[str, Any]] = []
+    seen_no_id_keys: set[str] = set()
+
+    for source in (existing, current):
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            identifier = item.get(id_key)
+            if isinstance(identifier, str) and identifier:
+                by_id[identifier] = item
+                continue
+            try:
+                content_key = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+            except Exception:
+                content_key = repr(item)
+            if content_key in seen_no_id_keys:
+                continue
+            seen_no_id_keys.add(content_key)
+            no_id_records.append(item)
+
+    merged = list(by_id.values()) + no_id_records
+
+    def _sort_key(record: dict[str, Any]) -> tuple:
+        return tuple(("" if record.get(key) is None else str(record.get(key))) for key in sort_keys)
+
+    merged.sort(key=_sort_key)
+    return merged
 
 
 def _empty_recommendations(context: EngineContext) -> RecommendationOutput:
