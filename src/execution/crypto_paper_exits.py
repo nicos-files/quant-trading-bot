@@ -8,6 +8,13 @@ import pandas as pd
 from .crypto_paper_models import CryptoPaperExecutionConfig, CryptoPaperExitEvent, CryptoPaperPosition
 
 
+def _exit_id_stamp(value: datetime | None) -> str:
+    moment = value if isinstance(value, datetime) else datetime.utcnow()
+    if moment.tzinfo is not None:
+        moment = moment.astimezone().replace(tzinfo=None)
+    return moment.strftime("%Y%m%dT%H%M%S")
+
+
 def evaluate_crypto_exit_triggers(
     positions: list[CryptoPaperPosition],
     candles_by_symbol: dict[str, Any],
@@ -15,6 +22,7 @@ def evaluate_crypto_exit_triggers(
     config: CryptoPaperExecutionConfig,
 ) -> list[CryptoPaperExitEvent]:
     events: list[CryptoPaperExitEvent] = []
+    stamp = _exit_id_stamp(as_of)
     for position in positions:
         quantity = float(position.quantity or 0.0)
         if quantity <= 0.0:
@@ -47,7 +55,7 @@ def evaluate_crypto_exit_triggers(
                 reason = "TAKE_PROFIT"
             events.append(
                 CryptoPaperExitEvent(
-                    exit_id=f"crypto-exit-{position.symbol}-{len(events) + 1:04d}",
+                    exit_id=f"crypto-exit-{position.symbol}-{stamp}-{len(events) + 1:04d}",
                     symbol=position.symbol,
                     position_quantity_before=quantity,
                     exit_quantity=quantity if bool(config.exit_full_position) else quantity,

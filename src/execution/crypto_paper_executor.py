@@ -20,6 +20,19 @@ from .crypto_paper_models import (
 )
 
 
+def format_id_stamp(value: datetime | None) -> str:
+    """Return a compact UTC stamp ``YYYYMMDDTHHMMSS`` used in artifact IDs.
+
+    Used to make fill_id/order_id/exit_id globally unique across runs so that
+    cumulative artifact merging never silently drops historical records.
+    """
+
+    moment = value if isinstance(value, datetime) else utc_now()
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment.strftime("%Y%m%dT%H%M%S")
+
+
 class CryptoPaperExecutor:
     def __init__(
         self,
@@ -138,7 +151,7 @@ class CryptoPaperExecutor:
         if not asset_id:
             return None
         return CryptoPaperOrder(
-            order_id=f"crypto-paper-order-{index:04d}",
+            order_id=f"crypto-paper-order-{format_id_stamp(as_of)}-{index:04d}",
             symbol=asset_id,
             side=str(item.action or "").upper(),
             requested_notional=self._requested_notional(item),
@@ -230,7 +243,7 @@ class CryptoPaperExecutor:
         fee = self._estimate_fee(gross_notional)
         quantity = gross_notional / fill_price if fill_price > 0 else 0.0
         return CryptoPaperFill(
-            fill_id=f"crypto-paper-fill-{index:04d}",
+            fill_id=f"crypto-paper-fill-{format_id_stamp(as_of)}-{index:04d}",
             order_id=order.order_id,
             symbol=order.symbol,
             side=order.side,
@@ -250,7 +263,7 @@ class CryptoPaperExecutor:
 
     def _build_exit_order(self, event: CryptoPaperExitEvent, as_of: datetime, index: int) -> CryptoPaperOrder:
         return CryptoPaperOrder(
-            order_id=f"crypto-paper-exit-order-{index:04d}",
+            order_id=f"crypto-paper-exit-order-{format_id_stamp(as_of)}-{index:04d}",
             symbol=normalize_crypto_symbol(event.symbol),
             side="SELL",
             requested_notional=float(event.gross_notional or 0.0),
@@ -270,7 +283,7 @@ class CryptoPaperExecutor:
         gross_notional = quantity * fill_price
         fee = self._estimate_fee(gross_notional)
         return CryptoPaperFill(
-            fill_id=f"crypto-paper-exit-fill-{index:04d}",
+            fill_id=f"crypto-paper-exit-fill-{format_id_stamp(as_of)}-{index:04d}",
             order_id=order.order_id,
             symbol=order.symbol,
             side="SELL",

@@ -12,7 +12,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.execution.crypto_paper_evaluation import evaluate_crypto_paper_strategy
-from src.execution.crypto_paper_forward import run_crypto_paper_forward
+from src.execution.crypto_paper_forward import (
+    _merge_cumulative_records,
+    _write_execution_artifacts,
+    run_crypto_paper_forward,
+)
+from src.execution.crypto_paper_models import (
+    CryptoPaperExecutionResult,
+    CryptoPaperFill,
+    CryptoPaperOrder,
+    CryptoPaperPortfolioSnapshot,
+)
 
 
 def _candidate_config() -> dict:
@@ -344,6 +354,400 @@ class CryptoPaperForwardCumulativeArtifactsTests(unittest.TestCase):
                 any("ledger_history_inconsistency" in str(item) for item in metrics.warnings),
                 f"expected ledger_history_inconsistency warning in metrics, got: {metrics.warnings}",
             )
+
+
+class CryptoPaperCumulativeIdCollisionTests(unittest.TestCase):
+    def test_two_fills_with_same_fill_id_but_different_content_are_both_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crypto_paper_fills.json"
+            existing = [
+                {
+                    "fill_id": "crypto-paper-fill-0001",
+                    "order_id": "crypto-paper-order-0001",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 0.001,
+                    "fill_price": 76000.0,
+                    "gross_notional": 76.0,
+                    "fee": 0.025,
+                    "slippage": 0.0,
+                    "net_notional": 76.025,
+                    "filled_at": "2026-04-29T12:00:00",
+                    "metadata": {"day": "first"},
+                }
+            ]
+            path.write_text(json.dumps(existing, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+
+            current = [
+                {
+                    "fill_id": "crypto-paper-fill-0001",
+                    "order_id": "crypto-paper-order-0001",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 0.001,
+                    "fill_price": 77000.0,
+                    "gross_notional": 77.0,
+                    "fee": 0.025,
+                    "slippage": 0.0,
+                    "net_notional": 77.025,
+                    "filled_at": "2026-04-30T12:00:00",
+                    "metadata": {"day": "second"},
+                }
+            ]
+
+            merged, warnings = _merge_cumulative_records(
+                path=path,
+                current=current,
+                id_key="fill_id",
+                sort_keys=("filled_at", "fill_id"),
+            )
+            self.assertEqual(len(merged), 2, f"expected both fills preserved, got {merged}")
+            filled_ats = sorted(item["filled_at"] for item in merged)
+            self.assertEqual(filled_ats, ["2026-04-29T12:00:00", "2026-04-30T12:00:00"])
+            self.assertTrue(
+                any("id_collision_with_diff_content:fill_id=crypto-paper-fill-0001" in w for w in warnings),
+                f"expected id-collision warning, got: {warnings}",
+            )
+
+    def test_identical_fill_with_same_id_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crypto_paper_fills.json"
+            record = {
+                "fill_id": "crypto-paper-fill-0001",
+                "order_id": "crypto-paper-order-0001",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "quantity": 0.001,
+                "fill_price": 76000.0,
+                "gross_notional": 76.0,
+                "fee": 0.025,
+                "slippage": 0.0,
+                "net_notional": 76.025,
+                "filled_at": "2026-04-29T12:00:00",
+                "metadata": {"day": "first"},
+            }
+            path.write_text(
+                json.dumps([record], sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            merged, warnings = _merge_cumulative_records(
+                path=path,
+                current=[dict(record)],
+                id_key="fill_id",
+                sort_keys=("filled_at", "fill_id"),
+            )
+            self.assertEqual(len(merged), 1)
+            self.assertEqual(warnings, [])
+
+    def test_rejected_order_does_not_overwrite_prior_accepted_order_with_same_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crypto_paper_orders.json"
+            accepted = {
+                "order_id": "crypto-paper-order-0001",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "requested_notional": 25.0,
+                "requested_quantity": None,
+                "reference_price": 76000.0,
+                "status": "PENDING",
+                "reason": None,
+                "created_at": "2026-04-29T12:00:00",
+                "metadata": {},
+            }
+            path.write_text(
+                json.dumps([accepted], sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            rejected = dict(accepted)
+            rejected["status"] = "REJECTED"
+            rejected["reason"] = "insufficient_cash"
+            rejected["created_at"] = "2026-04-30T12:00:00"
+
+            merged, warnings = _merge_cumulative_records(
+                path=path,
+                current=[rejected],
+                id_key="order_id",
+                sort_keys=("created_at", "order_id"),
+            )
+            statuses = sorted(item["status"] for item in merged)
+            self.assertEqual(statuses, ["PENDING", "REJECTED"])
+            self.assertTrue(
+                any("id_collision_with_diff_content:order_id=crypto-paper-order-0001" in w for w in warnings),
+                f"expected id-collision warning, got: {warnings}",
+            )
+
+    def test_executor_generated_ids_are_globally_unique_across_two_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            candidate = _candidate_config()
+            candidate_path, prices_path = _write_inputs(
+                root, candidate=candidate, bundle=_bundle_with_buy_signal()
+            )
+            run1 = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-04-29T10:20:00+00:00",
+            )
+            self.assertEqual(run1["status"], "SUCCESS")
+            self.assertGreaterEqual(run1["fills_count"], 1)
+            fills_after_run1 = _read_json(artifacts_dir / "crypto_paper_fills.json")
+            run1_fill_ids = sorted(item["fill_id"] for item in fills_after_run1)
+
+            candidate2 = dict(candidate)
+            candidate2["strategy"] = dict(candidate["strategy"])
+            candidate2["strategy"]["max_paper_notional"] = 20.0
+            bundle2 = _bundle_with_buy_signal_offset(start="2026-04-30T10:00:00Z")
+            candidate_path2, prices_path2 = _write_inputs(
+                root, candidate=candidate2, bundle=bundle2
+            )
+            run2 = run_crypto_paper_forward(
+                candidate_config=candidate_path2,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path2,
+                as_of="2026-04-30T10:20:00+00:00",
+            )
+            self.assertIn(run2["status"], ("SUCCESS", "PARTIAL"))
+            self.assertGreaterEqual(run2["fills_count"], 1)
+
+            fills_after_run2 = _read_json(artifacts_dir / "crypto_paper_fills.json")
+            run2_fill_ids = sorted(item["fill_id"] for item in fills_after_run2)
+
+            self.assertGreater(
+                len(run2_fill_ids),
+                len(run1_fill_ids),
+                "cumulative fills must grow when a second run produces new fills",
+            )
+            for fill_id in run1_fill_ids:
+                self.assertIn(fill_id, run2_fill_ids)
+
+            for fill in fills_after_run2:
+                self.assertRegex(
+                    fill["fill_id"],
+                    r"crypto-paper-(?:exit-)?fill-\d{8}T\d{6}-\d{4}",
+                    f"expected timestamped fill_id, got: {fill['fill_id']}",
+                )
+
+            orders_after_run2 = _read_json(artifacts_dir / "crypto_paper_orders.json")
+            for order in orders_after_run2:
+                self.assertRegex(
+                    order["order_id"],
+                    r"crypto-paper(?:-exit)?-order-\d{8}T\d{6}-\d{4}",
+                    f"expected timestamped order_id, got: {order['order_id']}",
+                )
+
+    def test_evaluation_reconstructs_multiple_open_lots_from_multiple_cumulative_fills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts_dir = Path(tmp) / "artifacts" / "crypto_paper"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            fills = [
+                {
+                    "fill_id": "crypto-paper-fill-20260429T120000-0001",
+                    "order_id": "crypto-paper-order-20260429T120000-0001",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 0.001,
+                    "fill_price": 76000.0,
+                    "gross_notional": 76.0,
+                    "fee": 0.025,
+                    "slippage": 0.0,
+                    "net_notional": 76.025,
+                    "filled_at": "2026-04-29T12:00:00",
+                    "metadata": {},
+                },
+                {
+                    "fill_id": "crypto-paper-fill-20260430T120000-0001",
+                    "order_id": "crypto-paper-order-20260430T120000-0001",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 0.001,
+                    "fill_price": 77000.0,
+                    "gross_notional": 77.0,
+                    "fee": 0.025,
+                    "slippage": 0.0,
+                    "net_notional": 77.025,
+                    "filled_at": "2026-04-30T12:00:00",
+                    "metadata": {},
+                },
+            ]
+            (artifacts_dir / "crypto_paper_fills.json").write_text(
+                json.dumps(fills, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            (artifacts_dir / "crypto_paper_orders.json").write_text(
+                json.dumps([], sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            (artifacts_dir / "crypto_paper_exit_events.json").write_text(
+                json.dumps([], sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            (artifacts_dir / "crypto_paper_snapshot.json").write_text(
+                json.dumps(
+                    {
+                        "as_of": "2026-04-30T12:00:00",
+                        "cash": 47.95,
+                        "equity": 200.0,
+                        "positions_value": 152.05,
+                        "realized_pnl": 0.0,
+                        "unrealized_pnl": 0.0,
+                        "fees_paid": 0.05,
+                        "positions": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "quantity": 0.002,
+                                "avg_entry_price": 76500.0,
+                                "realized_pnl": 0.0,
+                                "unrealized_pnl": 0.0,
+                                "last_price": 77000.0,
+                                "updated_at": "2026-04-30T12:00:00",
+                                "metadata": {},
+                            }
+                        ],
+                        "metadata": {},
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            (artifacts_dir / "crypto_paper_positions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "quantity": 0.002,
+                            "avg_entry_price": 76500.0,
+                            "realized_pnl": 0.0,
+                            "unrealized_pnl": 0.0,
+                            "last_price": 77000.0,
+                            "updated_at": "2026-04-30T12:00:00",
+                            "metadata": {},
+                        }
+                    ],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            closed_trades, open_trades, _, _, _, _, _ = evaluate_crypto_paper_strategy(
+                artifacts_dir=artifacts_dir,
+                output_dir=artifacts_dir / "evaluation",
+            )
+            self.assertEqual(closed_trades, [])
+            self.assertEqual(
+                len(open_trades), 2,
+                f"expected two open lots reconstructed from cumulative fills, got: {open_trades}",
+            )
+
+    def test_writer_returns_id_collision_warning_when_existing_record_collides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            existing_fill = {
+                "fill_id": "crypto-paper-fill-0001",
+                "order_id": "crypto-paper-order-0001",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "quantity": 0.001,
+                "fill_price": 76000.0,
+                "gross_notional": 76.0,
+                "fee": 0.025,
+                "slippage": 0.0,
+                "net_notional": 76.025,
+                "filled_at": "2026-04-29T12:00:00",
+                "metadata": {"day": "first"},
+            }
+            (artifact_root / "crypto_paper_fills.json").write_text(
+                json.dumps([existing_fill], sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            (artifact_root / "crypto_paper_orders.json").write_text(
+                json.dumps([], sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+            colliding_fill = CryptoPaperFill(
+                fill_id="crypto-paper-fill-0001",
+                order_id="crypto-paper-order-0001",
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=0.001,
+                fill_price=77000.0,
+                gross_notional=77.0,
+                fee=0.025,
+                slippage=0.0,
+                net_notional=77.025,
+                filled_at=__import__("datetime").datetime.fromisoformat("2026-04-30T12:00:00"),
+                metadata={"day": "second"},
+            )
+            colliding_order = CryptoPaperOrder(
+                order_id="crypto-paper-order-0001",
+                symbol="BTCUSDT",
+                side="BUY",
+                requested_notional=25.0,
+                requested_quantity=None,
+                reference_price=77000.0,
+                status="PENDING",
+                reason=None,
+                created_at=__import__("datetime").datetime.fromisoformat("2026-04-30T12:00:00"),
+                metadata={},
+            )
+            snapshot = CryptoPaperPortfolioSnapshot(
+                as_of=__import__("datetime").datetime.fromisoformat("2026-04-30T12:00:00"),
+                cash=23.0,
+                equity=100.0,
+                positions_value=77.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                fees_paid=0.05,
+                positions=[],
+                metadata={},
+            )
+            result = CryptoPaperExecutionResult(
+                accepted_orders=[colliding_order],
+                rejected_orders=[],
+                fills=[colliding_fill],
+                portfolio_snapshot=snapshot,
+                warnings=[],
+                exit_events=[],
+                metadata={},
+            )
+
+            writer_warnings = _write_execution_artifacts(artifact_root=artifact_root, result=result)
+            self.assertTrue(
+                any("id_collision_with_diff_content:fill_id=crypto-paper-fill-0001" in w for w in writer_warnings),
+                f"expected fill collision warning, got: {writer_warnings}",
+            )
+
+            persisted_fills = _read_json(artifact_root / "crypto_paper_fills.json")
+            self.assertEqual(len(persisted_fills), 2)
+
+
+def _bundle_with_buy_signal_offset(*, start: str) -> dict:
+    """Variant of _bundle_with_buy_signal with a different starting timestamp."""
+
+    base = pd_like_offsets(start)
+    return {
+        "candles": {
+            "BTCUSDT": [
+                {"timestamp": base[0], "open": 200.0, "high": 200.5, "low": 199.5, "close": 200.0, "volume": 10.0},
+                {"timestamp": base[1], "open": 200.0, "high": 201.5, "low": 199.9, "close": 201.0, "volume": 10.0},
+                {"timestamp": base[2], "open": 201.0, "high": 202.5, "low": 200.9, "close": 202.0, "volume": 11.0},
+                {"timestamp": base[3], "open": 202.0, "high": 203.5, "low": 201.8, "close": 203.0, "volume": 12.0},
+                {"timestamp": base[4], "open": 203.0, "high": 204.0, "low": 202.8, "close": 203.5, "volume": 12.0},
+            ]
+        }
+    }
+
+
+def pd_like_offsets(start_iso: str) -> list[str]:
+    import pandas as pd
+
+    base_ts = pd.Timestamp(start_iso)
+    return [(base_ts + pd.Timedelta(minutes=5 * idx)).strftime("%Y-%m-%dT%H:%M:%SZ") for idx in range(5)]
 
 
 if __name__ == "__main__":

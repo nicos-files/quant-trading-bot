@@ -318,7 +318,8 @@ def run_crypto_paper_forward(
             exit_events=exit_events,
         )
         combined_execution = _merge_execution_results(entry_result, exit_result, ledger.snapshot(effective_as_of, metadata={"quote_currency": active_executor.config.quote_currency}))
-        _write_execution_artifacts(artifact_root=artifact_root, result=combined_execution)
+        write_warnings = _write_execution_artifacts(artifact_root=artifact_root, result=combined_execution)
+        warnings.extend(write_warnings)
         step_status["execution"] = "SUCCESS"
     except Exception as exc:
         step_status["execution"] = "FAILED"
@@ -738,25 +739,27 @@ def _position_from_payload(payload: Any) -> CryptoPaperPosition | None:
         return None
 
 
-def _write_execution_artifacts(*, artifact_root: Path, result: CryptoPaperExecutionResult) -> None:
+def _write_execution_artifacts(*, artifact_root: Path, result: CryptoPaperExecutionResult) -> list[str]:
+    """Persist execution artifacts cumulatively. Returns merge warnings."""
+
     artifact_root.mkdir(parents=True, exist_ok=True)
     current_orders = [order.to_dict() for order in result.accepted_orders + result.rejected_orders]
     current_fills = [fill.to_dict() for fill in result.fills]
     current_exits = [event.to_dict() for event in result.exit_events]
 
-    merged_orders = _merge_cumulative_records(
+    merged_orders, order_warnings = _merge_cumulative_records(
         path=artifact_root / "crypto_paper_orders.json",
         current=current_orders,
         id_key="order_id",
         sort_keys=("created_at", "order_id"),
     )
-    merged_fills = _merge_cumulative_records(
+    merged_fills, fill_warnings = _merge_cumulative_records(
         path=artifact_root / "crypto_paper_fills.json",
         current=current_fills,
         id_key="fill_id",
         sort_keys=("filled_at", "fill_id"),
     )
-    merged_exits = _merge_cumulative_records(
+    merged_exits, exit_warnings = _merge_cumulative_records(
         path=artifact_root / "crypto_paper_exit_events.json",
         current=current_exits,
         id_key="exit_id",
@@ -773,6 +776,7 @@ def _write_execution_artifacts(*, artifact_root: Path, result: CryptoPaperExecut
     }
     for filename, payload in payloads.items():
         (artifact_root / filename).write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+    return _dedupe(list(order_warnings) + list(fill_warnings) + list(exit_warnings))
 
 
 def _merge_cumulative_records(
@@ -781,14 +785,18 @@ def _merge_cumulative_records(
     current: list[dict[str, Any]],
     id_key: str,
     sort_keys: tuple[str, ...],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Merge current-run records with persisted cumulative records.
 
-    - Items with a stable id (``id_key``) are deduplicated by id; current-run
-      values take precedence on collision so corrections in the latest run win.
+    - If a stable ``id_key`` exists and the content is identical to a record
+      already accumulated under that id, the duplicate is dropped.
+    - If a stable ``id_key`` collides but the content differs, BOTH records
+      are preserved and a warning is emitted. This avoids silently losing
+      historical fills/orders/exits when run-local IDs collide across runs.
     - Items without an id are deduplicated by canonical JSON content so reruns
       do not duplicate identical no-id rows.
-    - Output is deterministically sorted by ``sort_keys``.
+    - Output is deterministically sorted by ``sort_keys`` with a JSON-content
+      tiebreaker so equal sort tuples produce a stable order.
     - Existing data is preserved when the current run produced zero items.
     - Malformed/empty existing files are treated as empty (no crash).
     """
@@ -804,9 +812,16 @@ def _merge_cumulative_records(
         except Exception:
             existing = []
 
-    by_id: dict[str, dict[str, Any]] = {}
+    by_id_records: dict[str, list[dict[str, Any]]] = {}
     no_id_records: list[dict[str, Any]] = []
     seen_no_id_keys: set[str] = set()
+    warnings: list[str] = []
+
+    def _content_key(item: dict[str, Any]) -> str:
+        try:
+            return json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            return repr(item)
 
     for source in (existing, current):
         for item in source:
@@ -814,24 +829,34 @@ def _merge_cumulative_records(
                 continue
             identifier = item.get(id_key)
             if isinstance(identifier, str) and identifier:
-                by_id[identifier] = item
+                bucket = by_id_records.setdefault(identifier, [])
+                item_key = _content_key(item)
+                duplicate = any(_content_key(existing_item) == item_key for existing_item in bucket)
+                if duplicate:
+                    continue
+                bucket.append(item)
+                if len(bucket) > 1:
+                    warnings.append(
+                        f"id_collision_with_diff_content:{id_key}={identifier}"
+                    )
                 continue
-            try:
-                content_key = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
-            except Exception:
-                content_key = repr(item)
+            content_key = _content_key(item)
             if content_key in seen_no_id_keys:
                 continue
             seen_no_id_keys.add(content_key)
             no_id_records.append(item)
 
-    merged = list(by_id.values()) + no_id_records
+    merged: list[dict[str, Any]] = []
+    for bucket in by_id_records.values():
+        merged.extend(bucket)
+    merged.extend(no_id_records)
 
     def _sort_key(record: dict[str, Any]) -> tuple:
-        return tuple(("" if record.get(key) is None else str(record.get(key))) for key in sort_keys)
+        primary = tuple(("" if record.get(key) is None else str(record.get(key))) for key in sort_keys)
+        return primary + (_content_key(record),)
 
     merged.sort(key=_sort_key)
-    return merged
+    return merged, _dedupe(warnings)
 
 
 def _empty_recommendations(context: EngineContext) -> RecommendationOutput:
