@@ -1,0 +1,835 @@
+"""Semantic reporting layer for crypto paper-forward artifacts.
+
+Reads the canonical paper-forward artifacts produced by
+``src.execution.crypto_paper_forward`` and turns them into a small set of
+human-readable semantic events plus a one-page summary.
+
+Paper-only / manual-review only. This module:
+
+- never executes any trade;
+- never contacts a broker, exchange or live API;
+- never modifies the canonical artifacts it reads;
+- never invents fills, orders, exits or P&L numbers;
+- attaches ``paper_only=True`` and ``not_auto_executed=True`` to every event.
+
+Public API:
+
+- :func:`build_semantic_layer` — read artifacts and (optionally) write
+  ``crypto_semantic_summary.json``, ``crypto_semantic_events.json`` and
+  ``crypto_latest_action.md`` under ``<artifacts_dir>/semantic/``.
+- :data:`SEMANTIC_EVENT_TYPES` and :data:`SEMANTIC_SEVERITIES` — public
+  constants used by the Telegram notifier and dashboard.
+- :data:`ALERTABLE_EVENT_TYPES` — the default set of event types eligible
+  for alerts (NO_ACTION is intentionally excluded).
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+SEMANTIC_EVENT_TYPES: tuple[str, ...] = (
+    "BUY_SIGNAL",
+    "BUY_FILLED_PAPER",
+    "TAKE_PROFIT",
+    "STOP_LOSS",
+    "POSITION_OPEN",
+    "ORDER_REJECTED",
+    "DAILY_SUMMARY",
+    "WARNING",
+    "ERROR",
+    "NO_ACTION",
+)
+
+SEMANTIC_SEVERITIES: tuple[str, ...] = ("INFO", "ACTION", "WARNING", "CRITICAL")
+
+_SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_SEVERITIES)}
+
+_DEFAULT_SEVERITY: dict[str, str] = {
+    "BUY_SIGNAL": "INFO",
+    "BUY_FILLED_PAPER": "ACTION",
+    "TAKE_PROFIT": "ACTION",
+    "STOP_LOSS": "ACTION",
+    "POSITION_OPEN": "INFO",
+    "ORDER_REJECTED": "WARNING",
+    "DAILY_SUMMARY": "INFO",
+    "WARNING": "WARNING",
+    "ERROR": "CRITICAL",
+    "NO_ACTION": "INFO",
+}
+
+ALERTABLE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "BUY_FILLED_PAPER",
+        "TAKE_PROFIT",
+        "STOP_LOSS",
+        "ORDER_REJECTED",
+        "ERROR",
+        "DAILY_SUMMARY",
+    }
+)
+
+PAPER_DISCLAIMER = "Paper-only / manual-review only. Not auto-executed."
+
+_SUMMARY_FILENAME = "crypto_semantic_summary.json"
+_EVENTS_FILENAME = "crypto_semantic_events.json"
+_LATEST_ACTION_FILENAME = "crypto_latest_action.md"
+
+
+def build_semantic_layer(
+    *,
+    artifacts_dir: str | Path,
+    output_dir: str | Path | None = None,
+    write: bool = True,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Read crypto paper artifacts and build semantic events + summary.
+
+    Args:
+        artifacts_dir: Root crypto paper artifacts directory (e.g.
+            ``artifacts/crypto_paper``).
+        output_dir: Where to write the three semantic artifacts. Defaults to
+            ``<artifacts_dir>/semantic/``. Ignored when ``write`` is False.
+        write: When True, persist the three semantic artifacts to disk.
+        now: Optional clock override for ``created_at`` timestamps. Defaults
+            to ``datetime.now(timezone.utc)``.
+
+    Returns:
+        ``{"summary": dict, "events": list[dict], "latest_action_md": str,
+        "warnings": list[str], "output_paths": dict[str, str]}``.
+    """
+
+    root = Path(artifacts_dir)
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    moment_iso = moment.isoformat()
+
+    snapshot = _load_json(root / "crypto_paper_snapshot.json", default={})
+    positions = _load_json(root / "crypto_paper_positions.json", default=[])
+    fills = _load_json(root / "crypto_paper_fills.json", default=[])
+    orders = _load_json(root / "crypto_paper_orders.json", default=[])
+    exit_events = _load_json(root / "crypto_paper_exit_events.json", default=[])
+    metrics = _load_json(root / "evaluation" / "crypto_paper_strategy_metrics.json", default={})
+    forward_result = _load_json(root / "paper_forward" / "crypto_paper_forward_result.json", default={})
+    equity_curve = _load_json(root / "history" / "crypto_paper_equity_curve.json", default=[])
+    manual_tickets = _load_json(root / "paper_forward" / "crypto_manual_trade_tickets.json", default=[])
+
+    layer_warnings: list[str] = []
+    if not isinstance(snapshot, dict):
+        layer_warnings.append("snapshot_artifact_unreadable")
+        snapshot = {}
+    if not isinstance(positions, list):
+        layer_warnings.append("positions_artifact_unreadable")
+        positions = []
+    if not isinstance(fills, list):
+        layer_warnings.append("fills_artifact_unreadable")
+        fills = []
+    if not isinstance(orders, list):
+        layer_warnings.append("orders_artifact_unreadable")
+        orders = []
+    if not isinstance(exit_events, list):
+        layer_warnings.append("exit_events_artifact_unreadable")
+        exit_events = []
+    if not isinstance(metrics, dict):
+        layer_warnings.append("metrics_artifact_unreadable")
+        metrics = {}
+    if not isinstance(forward_result, dict):
+        layer_warnings.append("forward_result_artifact_unreadable")
+        forward_result = {}
+    if not isinstance(equity_curve, list):
+        layer_warnings.append("equity_curve_artifact_unreadable")
+        equity_curve = []
+    if not isinstance(manual_tickets, list):
+        layer_warnings.append("manual_tickets_artifact_unreadable")
+        manual_tickets = []
+
+    if not snapshot and not positions and not fills and not orders and not exit_events:
+        layer_warnings.append(
+            "no_paper_artifacts_found:expected files under "
+            f"{root.as_posix()} (snapshot/positions/fills/orders/exit_events)"
+        )
+
+    metric_warnings = list(metrics.get("warnings") or []) if isinstance(metrics, dict) else []
+    forward_warnings = list(forward_result.get("warnings") or []) if isinstance(forward_result, dict) else []
+
+    closed_trades_count = int(metrics.get("closed_trades_count") or 0) if isinstance(metrics, dict) else 0
+    if 0 < closed_trades_count < 30:
+        layer_warnings.append(
+            f"small_sample_size:closed_trades={closed_trades_count}_below_min_30"
+        )
+
+    events: list[dict[str, Any]] = []
+    sources: list[str] = []
+
+    sources.extend(
+        _emit_buy_signal_events(orders=orders, created_at=moment_iso, events=events)
+    )
+    sources.extend(
+        _emit_buy_filled_events(fills=fills, created_at=moment_iso, events=events)
+    )
+    sources.extend(
+        _emit_exit_events(exit_events=exit_events, created_at=moment_iso, events=events)
+    )
+    sources.extend(
+        _emit_position_open_events(positions=positions, created_at=moment_iso, events=events)
+    )
+    sources.extend(
+        _emit_rejected_order_events(orders=orders, created_at=moment_iso, events=events)
+    )
+    sources.extend(
+        _emit_warning_events(
+            warnings=metric_warnings + forward_warnings + layer_warnings,
+            created_at=moment_iso,
+            events=events,
+        )
+    )
+    sources.extend(
+        _emit_error_events(forward_result=forward_result, created_at=moment_iso, events=events)
+    )
+
+    if not _has_actionable_event(events):
+        events.append(_build_no_action_event(created_at=moment_iso))
+
+    events.sort(
+        key=lambda item: (
+            -_SEVERITY_RANK.get(str(item.get("severity")), 0),
+            str(item.get("created_at") or ""),
+            str(item.get("event_id") or ""),
+        ),
+        reverse=False,
+    )
+    events.sort(
+        key=lambda item: (
+            _SEVERITY_RANK.get(str(item.get("severity")), 0),
+            str(item.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+
+    summary = _build_summary(
+        snapshot=snapshot,
+        metrics=metrics,
+        forward_result=forward_result,
+        equity_curve=equity_curve,
+        manual_tickets=manual_tickets,
+        events=events,
+        layer_warnings=layer_warnings,
+        generated_at=moment_iso,
+        artifacts_dir=root,
+    )
+
+    latest_action_md = _build_latest_action_markdown(summary=summary, events=events)
+
+    output_paths: dict[str, str] = {}
+    if write:
+        target = Path(output_dir) if output_dir is not None else (root / "semantic")
+        target.mkdir(parents=True, exist_ok=True)
+        summary_path = target / _SUMMARY_FILENAME
+        events_path = target / _EVENTS_FILENAME
+        latest_action_path = target / _LATEST_ACTION_FILENAME
+        summary_path.write_text(
+            json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        events_path.write_text(
+            json.dumps(events, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        latest_action_path.write_text(latest_action_md, encoding="utf-8")
+        output_paths = {
+            "summary": str(summary_path),
+            "events": str(events_path),
+            "latest_action": str(latest_action_path),
+        }
+
+    return {
+        "summary": summary,
+        "events": events,
+        "latest_action_md": latest_action_md,
+        "warnings": layer_warnings,
+        "output_paths": output_paths,
+    }
+
+
+def _emit_buy_signal_events(
+    *,
+    orders: list[dict[str, Any]],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("side") or "").upper() != "BUY":
+            continue
+        order_id = str(order.get("order_id") or "")
+        order_created = str(order.get("created_at") or "")
+        events.append(
+            _build_event(
+                event_id=f"sig:{order_id}:{order_created}",
+                event_type="BUY_SIGNAL",
+                symbol=str(order.get("symbol") or ""),
+                action="REVIEW",
+                human_title=f"Crypto BUY signal {order.get('symbol')}",
+                human_message=(
+                    f"Strategy emitted BUY signal for {order.get('symbol')} at reference "
+                    f"{_format_price(order.get('reference_price'))}. "
+                    f"Status={order.get('status')}. {PAPER_DISCLAIMER}"
+                ),
+                manual_action="No action required. Signal recorded for manual review.",
+                created_at=created_at,
+                source_artifacts=["crypto_paper_orders.json"],
+                metadata={
+                    "order_id": order_id,
+                    "status": order.get("status"),
+                    "reference_price": order.get("reference_price"),
+                    "requested_notional": order.get("requested_notional"),
+                    "stop_loss": (order.get("metadata") or {}).get("stop_loss"),
+                    "take_profit": (order.get("metadata") or {}).get("take_profit"),
+                    "occurred_at": order_created,
+                },
+            )
+        )
+        sources.append("crypto_paper_orders.json")
+    return sources
+
+
+def _emit_buy_filled_events(
+    *,
+    fills: list[dict[str, Any]],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        if str(fill.get("side") or "").upper() != "BUY":
+            continue
+        fill_id = str(fill.get("fill_id") or "")
+        filled_at = str(fill.get("filled_at") or "")
+        events.append(
+            _build_event(
+                event_id=f"buy:{fill_id}:{filled_at}",
+                event_type="BUY_FILLED_PAPER",
+                symbol=str(fill.get("symbol") or ""),
+                action="REVIEW_BUY",
+                human_title=f"Paper BUY filled {fill.get('symbol')}",
+                human_message=(
+                    f"Paper BUY filled {fill.get('quantity')} @ "
+                    f"{_format_price(fill.get('fill_price'))} "
+                    f"(notional {_format_price(fill.get('gross_notional'))}). "
+                    f"Stop {_format_price((fill.get('metadata') or {}).get('stop_loss'))} "
+                    f"/ Take {_format_price((fill.get('metadata') or {}).get('take_profit'))}. "
+                    f"{PAPER_DISCLAIMER}"
+                ),
+                manual_action=(
+                    "Paper buy executed. Decide whether to mirror in your real account; "
+                    "no auto-execution will occur."
+                ),
+                created_at=created_at,
+                source_artifacts=["crypto_paper_fills.json"],
+                metadata={
+                    "fill_id": fill_id,
+                    "order_id": fill.get("order_id"),
+                    "quantity": fill.get("quantity"),
+                    "fill_price": fill.get("fill_price"),
+                    "gross_notional": fill.get("gross_notional"),
+                    "fee": fill.get("fee"),
+                    "stop_loss": (fill.get("metadata") or {}).get("stop_loss"),
+                    "take_profit": (fill.get("metadata") or {}).get("take_profit"),
+                    "occurred_at": filled_at,
+                },
+            )
+        )
+        sources.append("crypto_paper_fills.json")
+    return sources
+
+
+def _emit_exit_events(
+    *,
+    exit_events: list[dict[str, Any]],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    for exit_event in exit_events:
+        if not isinstance(exit_event, dict):
+            continue
+        reason = str(exit_event.get("exit_reason") or "").upper()
+        if reason not in ("TAKE_PROFIT", "STOP_LOSS"):
+            continue
+        exit_id = str(exit_event.get("exit_id") or "")
+        exited_at = str(exit_event.get("exited_at") or "")
+        title = "Paper TAKE-PROFIT exit" if reason == "TAKE_PROFIT" else "Paper STOP-LOSS exit"
+        manual = (
+            "Paper take-profit closed. Consider closing your live position if you mirrored the entry."
+            if reason == "TAKE_PROFIT"
+            else "Paper stop-loss closed. Consider closing your live position if you mirrored the entry."
+        )
+        events.append(
+            _build_event(
+                event_id=f"{reason.lower()}:{exit_id}:{exited_at}",
+                event_type=reason,
+                symbol=str(exit_event.get("symbol") or ""),
+                action="REVIEW_EXIT",
+                human_title=f"{title}: {exit_event.get('symbol')}",
+                human_message=(
+                    f"{title} for {exit_event.get('symbol')} at "
+                    f"{_format_price(exit_event.get('fill_price'))} "
+                    f"(trigger {_format_price(exit_event.get('trigger_price'))}). "
+                    f"Realized P&L {_format_price(exit_event.get('realized_pnl'))}. "
+                    f"{PAPER_DISCLAIMER}"
+                ),
+                manual_action=manual,
+                created_at=created_at,
+                source_artifacts=["crypto_paper_exit_events.json"],
+                metadata={
+                    "exit_id": exit_id,
+                    "exit_quantity": exit_event.get("exit_quantity"),
+                    "trigger_price": exit_event.get("trigger_price"),
+                    "fill_price": exit_event.get("fill_price"),
+                    "realized_pnl": exit_event.get("realized_pnl"),
+                    "fee": exit_event.get("fee"),
+                    "source": exit_event.get("source"),
+                    "stop_loss": (exit_event.get("metadata") or {}).get("stop_loss"),
+                    "take_profit": (exit_event.get("metadata") or {}).get("take_profit"),
+                    "occurred_at": exited_at,
+                },
+            )
+        )
+        sources.append("crypto_paper_exit_events.json")
+    return sources
+
+
+def _emit_position_open_events(
+    *,
+    positions: list[dict[str, Any]],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        try:
+            quantity = float(position.get("quantity") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if quantity <= 0.0:
+            continue
+        symbol = str(position.get("symbol") or "")
+        updated_at = str(position.get("updated_at") or "")
+        events.append(
+            _build_event(
+                event_id=f"pos:{symbol}:{updated_at}",
+                event_type="POSITION_OPEN",
+                symbol=symbol,
+                action="MONITOR",
+                human_title=f"Open paper position {symbol}",
+                human_message=(
+                    f"Open paper position {symbol} qty={quantity} avg "
+                    f"{_format_price(position.get('avg_entry_price'))} last "
+                    f"{_format_price(position.get('last_price'))} "
+                    f"unrealized {_format_price(position.get('unrealized_pnl'))}. "
+                    f"Stop {_format_price((position.get('metadata') or {}).get('stop_loss'))} "
+                    f"/ Take {_format_price((position.get('metadata') or {}).get('take_profit'))}. "
+                    f"{PAPER_DISCLAIMER}"
+                ),
+                manual_action="Monitor stop/take-profit levels. No action required while inside the band.",
+                created_at=created_at,
+                source_artifacts=["crypto_paper_positions.json"],
+                metadata={
+                    "quantity": quantity,
+                    "avg_entry_price": position.get("avg_entry_price"),
+                    "last_price": position.get("last_price"),
+                    "unrealized_pnl": position.get("unrealized_pnl"),
+                    "stop_loss": (position.get("metadata") or {}).get("stop_loss"),
+                    "take_profit": (position.get("metadata") or {}).get("take_profit"),
+                    "occurred_at": updated_at,
+                },
+            )
+        )
+        sources.append("crypto_paper_positions.json")
+    return sources
+
+
+def _emit_rejected_order_events(
+    *,
+    orders: list[dict[str, Any]],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("status") or "").upper() != "REJECTED":
+            continue
+        order_id = str(order.get("order_id") or "")
+        order_created = str(order.get("created_at") or "")
+        reason = order.get("reason") or "unspecified"
+        events.append(
+            _build_event(
+                event_id=f"rej:{order_id}:{order_created}",
+                event_type="ORDER_REJECTED",
+                symbol=str(order.get("symbol") or ""),
+                action="REVIEW_REJECTION",
+                human_title=f"Paper order rejected {order.get('symbol')}",
+                human_message=(
+                    f"Paper order rejected for {order.get('symbol')} reason={reason} "
+                    f"requested_notional={_format_price(order.get('requested_notional'))} "
+                    f"reference_price={_format_price(order.get('reference_price'))}. "
+                    f"{PAPER_DISCLAIMER}"
+                ),
+                manual_action=(
+                    "Inspect rejection reason. No live action required; "
+                    "fix configuration if reason is recurring."
+                ),
+                created_at=created_at,
+                source_artifacts=["crypto_paper_orders.json"],
+                metadata={
+                    "order_id": order_id,
+                    "reason": reason,
+                    "reference_price": order.get("reference_price"),
+                    "requested_notional": order.get("requested_notional"),
+                    "occurred_at": order_created,
+                },
+            )
+        )
+        sources.append("crypto_paper_orders.json")
+    return sources
+
+
+def _emit_warning_events(
+    *,
+    warnings: Iterable[str],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    seen: set[str] = set()
+    for warning in warnings:
+        if not warning:
+            continue
+        text = str(warning)
+        if text in seen:
+            continue
+        seen.add(text)
+        events.append(
+            _build_event(
+                event_id=f"warn:{text}",
+                event_type="WARNING",
+                symbol="",
+                action="INVESTIGATE",
+                human_title="Paper-forward warning",
+                human_message=f"{text}. {PAPER_DISCLAIMER}",
+                manual_action="Investigate; no live action required.",
+                created_at=created_at,
+                source_artifacts=[
+                    "evaluation/crypto_paper_strategy_metrics.json",
+                    "paper_forward/crypto_paper_forward_result.json",
+                ],
+                metadata={"raw_warning": text},
+            )
+        )
+        sources.append("crypto_paper_strategy_metrics.json")
+    return sources
+
+
+def _emit_error_events(
+    *,
+    forward_result: dict[str, Any],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    if not isinstance(forward_result, dict):
+        return sources
+    if str(forward_result.get("status") or "").upper() == "FAILED":
+        events.append(
+            _build_event(
+                event_id=f"err:forward_status:{forward_result.get('status')}",
+                event_type="ERROR",
+                symbol="",
+                action="INVESTIGATE",
+                human_title="Crypto paper-forward run FAILED",
+                human_message=(
+                    "Last paper-forward run reported FAILED status. "
+                    f"Validation errors: {forward_result.get('validation_errors') or []}. "
+                    f"{PAPER_DISCLAIMER}"
+                ),
+                manual_action="Investigate validation errors before retrying.",
+                created_at=created_at,
+                source_artifacts=["paper_forward/crypto_paper_forward_result.json"],
+                metadata={
+                    "status": forward_result.get("status"),
+                    "validation_errors": forward_result.get("validation_errors"),
+                },
+            )
+        )
+        sources.append("crypto_paper_forward_result.json")
+    step_status = forward_result.get("step_status") or {}
+    if isinstance(step_status, dict):
+        for step, status in sorted(step_status.items()):
+            if str(status or "").upper() == "FAILED":
+                events.append(
+                    _build_event(
+                        event_id=f"err:step:{step}",
+                        event_type="ERROR",
+                        symbol="",
+                        action="INVESTIGATE",
+                        human_title=f"Paper-forward step FAILED: {step}",
+                        human_message=(
+                            f"Step '{step}' reported FAILED in last paper-forward run. "
+                            f"{PAPER_DISCLAIMER}"
+                        ),
+                        manual_action="Investigate step logs; no live action required.",
+                        created_at=created_at,
+                        source_artifacts=["paper_forward/crypto_paper_forward_result.json"],
+                        metadata={"step": step, "status": status},
+                    )
+                )
+                sources.append("crypto_paper_forward_result.json")
+    return sources
+
+
+def _has_actionable_event(events: list[dict[str, Any]]) -> bool:
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        if event_type in (
+            "BUY_FILLED_PAPER",
+            "TAKE_PROFIT",
+            "STOP_LOSS",
+            "POSITION_OPEN",
+            "ORDER_REJECTED",
+            "ERROR",
+            "BUY_SIGNAL",
+        ):
+            return True
+    return False
+
+
+def _build_no_action_event(*, created_at: str) -> dict[str, Any]:
+    return _build_event(
+        event_id="noop:latest",
+        event_type="NO_ACTION",
+        symbol="",
+        action="NONE",
+        human_title="No action required",
+        human_message=(
+            "No fresh fills, exits, rejections or warnings detected in the latest "
+            f"paper-forward run. {PAPER_DISCLAIMER}"
+        ),
+        manual_action="No action required.",
+        created_at=created_at,
+        source_artifacts=[],
+        metadata={},
+    )
+
+
+def _build_event(
+    *,
+    event_id: str,
+    event_type: str,
+    symbol: str,
+    action: str,
+    human_title: str,
+    human_message: str,
+    manual_action: str,
+    created_at: str,
+    source_artifacts: list[str],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    if event_type not in SEMANTIC_EVENT_TYPES:
+        raise ValueError(f"Unknown semantic event_type: {event_type!r}")
+    severity = _DEFAULT_SEVERITY[event_type]
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "severity": severity,
+        "symbol": symbol,
+        "action": action,
+        "human_title": human_title,
+        "human_message": human_message,
+        "manual_action": manual_action,
+        "paper_only": True,
+        "not_auto_executed": True,
+        "created_at": created_at,
+        "source_artifacts": list(source_artifacts),
+        "metadata": dict(metadata),
+    }
+
+
+def _build_summary(
+    *,
+    snapshot: dict[str, Any],
+    metrics: dict[str, Any],
+    forward_result: dict[str, Any],
+    equity_curve: list[dict[str, Any]],
+    manual_tickets: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    layer_warnings: list[str],
+    generated_at: str,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    starting_equity = _starting_equity_from_curve(equity_curve)
+    current_equity = _safe_float(snapshot.get("equity"))
+    total_return_pct: float | None = None
+    if starting_equity and current_equity is not None and starting_equity != 0:
+        total_return_pct = ((current_equity - starting_equity) / starting_equity) * 100.0
+    counts_by_type: dict[str, int] = {name: 0 for name in SEMANTIC_EVENT_TYPES}
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        counts_by_type[event_type] = counts_by_type.get(event_type, 0) + 1
+    latest_event = events[0] if events else None
+    summary = {
+        "generated_at": generated_at,
+        "paper_only": True,
+        "not_auto_executed": True,
+        "live_trading": False,
+        "disclaimer": PAPER_DISCLAIMER,
+        "artifacts_dir": str(artifacts_dir),
+        "snapshot": {
+            "as_of": snapshot.get("as_of"),
+            "equity": current_equity,
+            "cash": _safe_float(snapshot.get("cash")),
+            "positions_value": _safe_float(snapshot.get("positions_value")),
+            "realized_pnl": _safe_float(snapshot.get("realized_pnl")),
+            "unrealized_pnl": _safe_float(snapshot.get("unrealized_pnl")),
+            "fees_paid": _safe_float(snapshot.get("fees_paid")),
+            "open_positions_count": len(snapshot.get("positions") or []),
+        },
+        "performance": {
+            "starting_equity": starting_equity,
+            "total_return_pct": total_return_pct,
+            "closed_trades_count": _safe_int(metrics.get("closed_trades_count")),
+            "open_trades_count": _safe_int(metrics.get("open_trades_count")),
+            "win_rate": _safe_float(metrics.get("win_rate")),
+            "expectancy": _safe_float(metrics.get("expectancy")),
+            "profit_factor": _safe_float(metrics.get("profit_factor")),
+            "net_profit": _safe_float(metrics.get("net_profit")),
+            "total_fees": _safe_float(metrics.get("total_fees")),
+            "total_slippage": _safe_float(metrics.get("total_slippage")),
+            "stop_loss_count": _safe_int(metrics.get("stop_loss_count")),
+            "take_profit_count": _safe_int(metrics.get("take_profit_count")),
+        },
+        "rejected_orders_count": counts_by_type.get("ORDER_REJECTED", 0),
+        "manual_tickets_count": len(manual_tickets),
+        "events_count_by_type": counts_by_type,
+        "events_total": len(events),
+        "latest_event": latest_event,
+        "warnings": list(layer_warnings) + list(metrics.get("warnings") or []) + list(forward_result.get("warnings") or []),
+        "forward_run_status": forward_result.get("status"),
+    }
+    return summary
+
+
+def _build_latest_action_markdown(*, summary: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    lines.append("# Crypto Paper Latest Action")
+    lines.append("")
+    lines.append(f"**Status:** {PAPER_DISCLAIMER}")
+    lines.append("")
+    snapshot = summary.get("snapshot") or {}
+    performance = summary.get("performance") or {}
+    lines.append("## Snapshot")
+    lines.append(f"- As of: {snapshot.get('as_of') or 'n/a'}")
+    lines.append(f"- Equity: {_format_price(snapshot.get('equity'))}")
+    lines.append(f"- Cash: {_format_price(snapshot.get('cash'))}")
+    lines.append(f"- Realized P&L: {_format_price(snapshot.get('realized_pnl'))}")
+    lines.append(f"- Unrealized P&L: {_format_price(snapshot.get('unrealized_pnl'))}")
+    lines.append(f"- Open positions: {snapshot.get('open_positions_count', 0)}")
+    lines.append("")
+    lines.append("## Performance")
+    lines.append(f"- Closed trades: {performance.get('closed_trades_count')}")
+    lines.append(f"- Win rate: {_format_pct(performance.get('win_rate'))}")
+    lines.append(f"- Expectancy: {_format_price(performance.get('expectancy'))}")
+    lines.append(f"- Net profit: {_format_price(performance.get('net_profit'))}")
+    lines.append(f"- Take-profits: {performance.get('take_profit_count')}")
+    lines.append(f"- Stop-losses: {performance.get('stop_loss_count')}")
+    lines.append("")
+    latest_event = summary.get("latest_event")
+    lines.append("## Latest event")
+    if latest_event:
+        lines.append(f"- Type: {latest_event.get('event_type')}")
+        lines.append(f"- Severity: {latest_event.get('severity')}")
+        if latest_event.get("symbol"):
+            lines.append(f"- Symbol: {latest_event.get('symbol')}")
+        lines.append(f"- Title: {latest_event.get('human_title')}")
+        lines.append(f"- Message: {latest_event.get('human_message')}")
+        lines.append(f"- Manual action: {latest_event.get('manual_action')}")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+    warnings = summary.get("warnings") or []
+    if warnings:
+        lines.append("## Warnings")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+    lines.append("## Disclaimers")
+    lines.append("- Paper-only. No live execution occurred.")
+    lines.append("- Fees and slippage are simulated.")
+    lines.append("- Manual review required before mirroring in any live account.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _starting_equity_from_curve(equity_curve: list[dict[str, Any]]) -> float | None:
+    for point in equity_curve:
+        if not isinstance(point, dict):
+            continue
+        value = _safe_float(point.get("equity"))
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_price(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed:,.6f}".rstrip("0").rstrip(".")
+
+
+def _format_pct(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed * 100.0:.2f}%"
+
+
+def _load_json(path: Path, *, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return default
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
