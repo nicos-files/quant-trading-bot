@@ -370,5 +370,191 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         self.assertEqual(len(sender.calls), 1)
 
 
+class NotifyCryptoPaperTelegramBootstrapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_three_alertable_events(self) -> None:
+        fill = {
+            "fill_id": "crypto-paper-fill-20260428T150008-0001",
+            "order_id": "crypto-paper-order-20260428T150008-0001",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": 0.000328,
+            "fill_price": 76026.5,
+            "gross_notional": 25.0,
+            "fee": 0.025,
+            "filled_at": "2026-04-28T15:00:08",
+            "metadata": {"stop_loss": 74468.7, "take_profit": 76748.4},
+        }
+        exit_event = {
+            "exit_id": "crypto-exit-BTCUSDT-20260503T174500-0001",
+            "symbol": "BTCUSDT",
+            "exit_reason": "TAKE_PROFIT",
+            "exit_quantity": 0.001,
+            "trigger_price": 77131.478,
+            "fill_price": 77092.91,
+            "realized_pnl": 0.717,
+            "fee": 0.075,
+            "exited_at": "2026-05-03T17:45:00",
+            "source": "stop_take_quote_fallback",
+            "metadata": {"stop_loss": 74840.0, "take_profit": 77131.478},
+        }
+        rejected_order = {
+            "order_id": "crypto-paper-order-20260430T230009-0001",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "REJECTED",
+            "reason": "risk:cash_insufficient",
+            "reference_price": 76323.24,
+            "requested_notional": 25.0,
+            "created_at": "2026-04-30T23:00:09",
+            "metadata": {},
+        }
+        (self.artifacts_dir / "crypto_paper_fills.json").write_text(
+            json.dumps([fill]), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_exit_events.json").write_text(
+            json.dumps([exit_event]), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_orders.json").write_text(
+            json.dumps([rejected_order]), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_snapshot.json").write_text(
+            json.dumps({"equity": 100.0, "positions": []}), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_positions.json").write_text(
+            "[]", encoding="utf-8"
+        )
+
+    def test_bootstrap_writes_state_with_alertable_event_ids(self) -> None:
+        self._seed_three_alertable_events()
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env={},  # no enable flag, no token, no chat
+            sender=sender,
+            bootstrap_dedupe=True,
+            min_severity="ACTION",
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["bootstrap_dedupe"])
+        self.assertGreaterEqual(result["marked_count"], 3)
+        self.assertEqual(sender.calls, [])
+
+        state_path = Path(result["state_path"])
+        self.assertTrue(state_path.exists())
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(payload.get("paper_only"))
+        self.assertTrue(payload.get("bootstrap_dedupe"))
+        ids = set(payload.get("sent_event_ids") or [])
+        # Expected alertable events: BUY_FILLED_PAPER, TAKE_PROFIT, ORDER_REJECTED.
+        self.assertGreaterEqual(len(ids), 3)
+
+    def test_bootstrap_does_not_call_network(self) -> None:
+        self._seed_three_alertable_events()
+
+        def _no_network(*args, **kwargs):  # noqa: ANN001
+            raise AssertionError("bootstrap must not perform network IO")
+
+        with patch("socket.socket", _no_network):
+            result = notify_crypto_paper_telegram(
+                artifacts_dir=self.artifacts_dir,
+                env={},
+                bootstrap_dedupe=True,
+                min_severity="ACTION",
+                now=self.now,
+            )
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(result["marked_count"], 3)
+
+    def test_bootstrap_does_not_require_token_or_chat_id(self) -> None:
+        self._seed_three_alertable_events()
+        # Empty env: no enable flag, no TELEGRAM_BOT_TOKEN, no TELEGRAM_CHAT_ID.
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env={},
+            bootstrap_dedupe=True,
+            min_severity="ACTION",
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["chat_id_masked"])
+        self.assertIsNone(result.get("reason"))
+
+    def test_after_bootstrap_normal_notify_skips_old_events(self) -> None:
+        self._seed_three_alertable_events()
+        bootstrap_result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env={},
+            bootstrap_dedupe=True,
+            min_severity="ACTION",
+            now=self.now,
+        )
+        self.assertTrue(bootstrap_result["ok"])
+
+        sender = _RecordingSender()
+        followup = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            min_severity="ACTION",
+            now=self.now,
+        )
+        self.assertTrue(followup["ok"])
+        self.assertEqual(sender.calls, [])
+        self.assertEqual(len(followup["sent"]), 0)
+        self.assertGreaterEqual(len(followup["skipped"]), 3)
+        for skip in followup["skipped"]:
+            self.assertEqual(skip["reason"], "already_sent")
+
+    def test_force_resends_after_bootstrap(self) -> None:
+        self._seed_three_alertable_events()
+        notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env={},
+            bootstrap_dedupe=True,
+            min_severity="ACTION",
+            now=self.now,
+        )
+        sender = _RecordingSender()
+        forced = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            min_severity="ACTION",
+            force=True,
+            now=self.now,
+        )
+        self.assertTrue(forced["ok"])
+        self.assertGreaterEqual(len(forced["sent"]), 3)
+        self.assertGreaterEqual(len(sender.calls), 3)
+
+    def test_bootstrap_does_not_send_or_print_token(self) -> None:
+        self._seed_three_alertable_events()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env={DEFAULT_BOT_TOKEN_ENV: BOT_TOKEN, DEFAULT_CHAT_ID_ENV: CHAT_ID},
+            bootstrap_dedupe=True,
+            min_severity="ACTION",
+            now=self.now,
+        )
+        encoded = json.dumps({k: v for k, v in result.items() if k != "messages"})
+        self.assertNotIn(BOT_TOKEN, encoded)
+        self.assertNotIn(CHAT_ID, encoded)
+        state_path = Path(result["state_path"])
+        self.assertNotIn(BOT_TOKEN, state_path.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,9 +31,23 @@ from pathlib import Path
 from typing import Any
 
 
-CANONICAL_SUBDIRS: tuple[str, ...] = ("paper_forward", "daily_close", "history", "evaluation")
+CANONICAL_SUBDIRS: tuple[str, ...] = (
+    "paper_forward",
+    "daily_close",
+    "history",
+    "evaluation",
+    "semantic",
+    "dashboard",
+)
 CANONICAL_ROOT_FILE_PREFIX: str = "crypto_paper_"
 CANONICAL_ROOT_FILE_SUFFIX: str = ".json"
+
+_TELEGRAM_ENABLE_FLAG: str = "ENABLE_CRYPTO_TELEGRAM_ALERTS"
+_TELEGRAM_TOKEN_ENV: str = "TELEGRAM_BOT_TOKEN"
+_TELEGRAM_CHAT_ID_ENV: str = "TELEGRAM_CHAT_ID"
+_DASHBOARD_LOG_NAME: str = "dashboard.log"
+_NOTIFY_LOG_NAME: str = "notify.log"
+_POST_RUN_TIMEOUT_SEC: int = 120
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifacts-dir", default="artifacts/crypto_paper")
     parser.add_argument("--archive-root", default="artifacts/crypto_paper/archive")
     parser.add_argument("--stamp", default=None)
+    parser.add_argument(
+        "--skip-post-run",
+        action="store_true",
+        help=(
+            "Skip the post-run dashboard build and Telegram notifier dispatch. "
+            "Used by tests; not recommended for daily operations."
+        ),
+    )
     return parser
 
 
@@ -106,6 +128,49 @@ def build_run_command(*, candidate_config: str, artifacts_dir: str) -> list[str]
     ]
 
 
+def build_dashboard_command(*, artifacts_dir: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "src.tools.build_crypto_paper_dashboard",
+        "--artifacts-dir",
+        artifacts_dir,
+        "--rebuild-semantic",
+    ]
+
+
+def build_notifier_command(*, artifacts_dir: str, dry_run: bool) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.tools.notify_crypto_paper_telegram",
+        "--artifacts-dir",
+        artifacts_dir,
+        "--daily-summary",
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def should_send_real_telegram(env: dict[str, str]) -> bool:
+    """Return True only if the env unambiguously authorises a real Telegram send.
+
+    Real send requires *all three* of:
+    - ``ENABLE_CRYPTO_TELEGRAM_ALERTS=1``
+    - non-empty ``TELEGRAM_BOT_TOKEN``
+    - non-empty ``TELEGRAM_CHAT_ID``
+
+    Otherwise the wrapper falls back to dry-run, which never contacts the
+    network and never requires credentials.
+    """
+
+    enabled = str(env.get(_TELEGRAM_ENABLE_FLAG) or "").strip()
+    token = str(env.get(_TELEGRAM_TOKEN_ENV) or "").strip()
+    chat = str(env.get(_TELEGRAM_CHAT_ID_ENV) or "").strip()
+    return enabled == "1" and bool(token) and bool(chat)
+
+
 def run_paper_forward_subprocess(
     *,
     candidate_config: str,
@@ -122,6 +187,39 @@ def run_paper_forward_subprocess(
     )
 
 
+def run_dashboard_subprocess(
+    *,
+    artifacts_dir: str,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess:
+    cmd = build_dashboard_command(artifacts_dir=artifacts_dir)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=_POST_RUN_TIMEOUT_SEC,
+    )
+
+
+def run_notifier_subprocess(
+    *,
+    artifacts_dir: str,
+    env: dict[str, str],
+    dry_run: bool,
+) -> subprocess.CompletedProcess:
+    cmd = build_notifier_command(artifacts_dir=artifacts_dir, dry_run=dry_run)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=_POST_RUN_TIMEOUT_SEC,
+    )
+
+
 def write_run_log(*, archive_dir: Path, completed: subprocess.CompletedProcess) -> Path:
     log_path = archive_dir / "run.log"
     parts = [
@@ -132,6 +230,66 @@ def write_run_log(*, archive_dir: Path, completed: subprocess.CompletedProcess) 
     ]
     log_path.write_text("\n".join(parts), encoding="utf-8")
     return log_path
+
+
+def _write_subprocess_log(
+    *,
+    archive_dir: Path,
+    name: str,
+    summary: dict[str, Any],
+) -> Path:
+    log_path = archive_dir / name
+    parts = [
+        f"# command",
+        " ".join(str(part) for part in summary.get("cmd") or []),
+        f"# exit_code: {summary.get('exit_code')}",
+        f"# error: {summary.get('error') or ''}",
+        "# stdout",
+        summary.get("stdout") or "",
+        "# stderr",
+        summary.get("stderr") or "",
+    ]
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(parts), encoding="utf-8")
+    return log_path
+
+
+def _safe_post_run_step(
+    *,
+    runner,
+    cmd_builder,
+    label: str,
+    artifacts_dir: str,
+    env: dict[str, str],
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Invoke a post-run subprocess defensively. Never raises.
+
+    The returned dict is suitable for embedding in run metadata and writing as
+    a sidecar log file. Failures are recorded in ``error`` / ``exit_code``
+    without propagating to the caller.
+    """
+
+    summary: dict[str, Any] = {
+        "label": label,
+        "ok": False,
+        "exit_code": None,
+        "error": None,
+        "stdout": "",
+        "stderr": "",
+        "cmd": cmd_builder(artifacts_dir=artifacts_dir) if cmd_builder is not None else [],
+    }
+    if extra:
+        summary.update(extra)
+    try:
+        completed = runner()
+        summary["exit_code"] = int(getattr(completed, "returncode", 1))
+        summary["stdout"] = getattr(completed, "stdout", "") or ""
+        summary["stderr"] = getattr(completed, "stderr", "") or ""
+        summary["ok"] = summary["exit_code"] == 0
+    except Exception as exc:  # pragma: no cover - defensive
+        summary["error"] = repr(exc)
+    return summary
 
 
 def write_run_metadata(
@@ -167,10 +325,76 @@ def main(argv: list[str] | None = None) -> int:
     )
     finished_at = datetime.now(timezone.utc).isoformat()
 
+    # --- Post-run reporting (never fails the main run) ----------------------
+    # Build the dashboard and dispatch the notifier (dry-run by default)
+    # before archiving, so the archived snapshot includes the freshly built
+    # dashboard/, semantic/ and the post-run logs.
+    dashboard_summary: dict[str, Any] = {
+        "label": "dashboard",
+        "ok": False,
+        "skipped": True,
+        "reason": "skipped_by_flag",
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "cmd": [],
+        "error": None,
+    }
+    notify_summary: dict[str, Any] = {
+        "label": "notify",
+        "ok": False,
+        "skipped": True,
+        "reason": "skipped_by_flag",
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "cmd": [],
+        "error": None,
+        "dry_run": True,
+        "telegram_real_send": False,
+    }
+
+    if not args.skip_post_run:
+        dashboard_summary = _safe_post_run_step(
+            label="dashboard",
+            runner=lambda: run_dashboard_subprocess(
+                artifacts_dir=str(artifacts_dir), env=env
+            ),
+            cmd_builder=build_dashboard_command,
+            artifacts_dir=str(artifacts_dir),
+            env=env,
+        )
+
+        real_send = should_send_real_telegram(env)
+        dry_run = not real_send
+        notify_summary = _safe_post_run_step(
+            label="notify",
+            runner=lambda: run_notifier_subprocess(
+                artifacts_dir=str(artifacts_dir), env=env, dry_run=dry_run
+            ),
+            cmd_builder=lambda artifacts_dir: build_notifier_command(
+                artifacts_dir=artifacts_dir, dry_run=dry_run
+            ),
+            artifacts_dir=str(artifacts_dir),
+            env=env,
+            extra={
+                "dry_run": dry_run,
+                "telegram_real_send": real_send,
+            },
+        )
+
+    # --- Archive ------------------------------------------------------------
     archive_dir.mkdir(parents=True, exist_ok=True)
     copied = archive_run(artifacts_dir=artifacts_dir, archive_dir=archive_dir)
 
     log_path = write_run_log(archive_dir=archive_dir, completed=completed)
+    dashboard_log_path = _write_subprocess_log(
+        archive_dir=archive_dir, name=_DASHBOARD_LOG_NAME, summary=dashboard_summary
+    )
+    notify_log_path = _write_subprocess_log(
+        archive_dir=archive_dir, name=_NOTIFY_LOG_NAME, summary=notify_summary
+    )
+
     metadata = {
         "run_id": stamp,
         "started_at": started_at,
@@ -184,6 +408,14 @@ def main(argv: list[str] | None = None) -> int:
         "git_commit": get_git_commit(),
         "paper_only": True,
         "live_trading": False,
+        "post_run": {
+            "dashboard": {
+                k: v for k, v in dashboard_summary.items() if k not in ("stdout", "stderr")
+            },
+            "notify": {
+                k: v for k, v in notify_summary.items() if k not in ("stdout", "stderr")
+            },
+        },
     }
     metadata_path = write_run_metadata(archive_dir=archive_dir, metadata=metadata)
 
@@ -192,6 +424,16 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(f"[ARCHIVE] {archive_dir}\n")
     sys.stdout.write(f"[ARCHIVE-METADATA] {metadata_path}\n")
     sys.stdout.write(f"[ARCHIVE-LOG] {log_path}\n")
+    sys.stdout.write(
+        f"[POST-RUN] dashboard ok={dashboard_summary.get('ok')} "
+        f"exit={dashboard_summary.get('exit_code')} log={dashboard_log_path}\n"
+    )
+    sys.stdout.write(
+        f"[POST-RUN] notify ok={notify_summary.get('ok')} "
+        f"dry_run={notify_summary.get('dry_run')} "
+        f"real_send={notify_summary.get('telegram_real_send')} "
+        f"exit={notify_summary.get('exit_code')} log={notify_log_path}\n"
+    )
     return int(completed.returncode)
 
 

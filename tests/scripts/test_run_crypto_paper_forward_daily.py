@@ -77,25 +77,27 @@ class RunCryptoPaperForwardDailyWrapperTests(unittest.TestCase):
         stdout: str = "TOOL-STDOUT",
         stderr: str = "TOOL-STDERR",
         stamp: str = "2026-01-02/030405",
+        skip_post_run: bool = True,
     ):
         artifacts_dir = tmp / "artifacts" / "crypto_paper"
         archive_root = tmp / "artifacts" / "crypto_paper" / "archive"
         candidate = _write_candidate(tmp)
         _seed_canonical_artifacts(artifacts_dir)
         fake = _FakeCompleted(returncode=returncode, stdout=stdout, stderr=stderr)
+        argv = [
+            "--candidate-config",
+            str(candidate),
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--archive-root",
+            str(archive_root),
+            "--stamp",
+            stamp,
+        ]
+        if skip_post_run:
+            argv.append("--skip-post-run")
         with patch.object(wrapper, "run_paper_forward_subprocess", return_value=fake) as mock_run:
-            exit_code = wrapper.main(
-                [
-                    "--candidate-config",
-                    str(candidate),
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    "--archive-root",
-                    str(archive_root),
-                    "--stamp",
-                    stamp,
-                ]
-            )
+            exit_code = wrapper.main(argv)
         archive_dir = archive_root / stamp
         return exit_code, archive_dir, artifacts_dir, candidate, mock_run
 
@@ -232,6 +234,245 @@ class RunCryptoPaperForwardDailyWrapperTests(unittest.TestCase):
         self.assertIn("cfg.json", cmd)
         self.assertIn("--artifacts-dir", cmd)
         self.assertIn("adir", cmd)
+
+
+class RunCryptoPaperForwardDailyPostRunIntegrationTests(unittest.TestCase):
+    """Verify post-run reporting (dashboard build + Telegram dispatch) is wired."""
+
+    def _invoke_with_post_run(
+        self,
+        tmp: Path,
+        *,
+        wrapper_env_extra: dict[str, str] | None = None,
+        main_returncode: int = 0,
+        dashboard_returncode: int = 0,
+        notify_returncode: int = 0,
+        dashboard_raises: BaseException | None = None,
+        notify_raises: BaseException | None = None,
+        stamp: str = "2026-05-03/180000",
+    ):
+        artifacts_dir = tmp / "artifacts" / "crypto_paper"
+        archive_root = tmp / "artifacts" / "crypto_paper" / "archive"
+        candidate = _write_candidate(tmp)
+        _seed_canonical_artifacts(artifacts_dir)
+        main_fake = _FakeCompleted(returncode=main_returncode, stdout="MAIN-OUT", stderr="")
+        dashboard_fake = _FakeCompleted(returncode=dashboard_returncode, stdout="DASH-OUT", stderr="")
+        notify_fake = _FakeCompleted(returncode=notify_returncode, stdout="NOTIFY-OUT", stderr="")
+
+        def _dashboard(*args, **kwargs):  # noqa: ANN001
+            if dashboard_raises is not None:
+                raise dashboard_raises
+            return dashboard_fake
+
+        def _notifier(*args, **kwargs):  # noqa: ANN001
+            if notify_raises is not None:
+                raise notify_raises
+            return notify_fake
+
+        env_overrides = wrapper_env_extra or {}
+
+        with patch.object(wrapper, "run_paper_forward_subprocess", return_value=main_fake) as mock_main, \
+             patch.object(wrapper, "run_dashboard_subprocess", side_effect=_dashboard) as mock_dash, \
+             patch.object(wrapper, "run_notifier_subprocess", side_effect=_notifier) as mock_notify, \
+             patch.dict("os.environ", env_overrides, clear=False):
+            exit_code = wrapper.main(
+                [
+                    "--candidate-config",
+                    str(candidate),
+                    "--artifacts-dir",
+                    str(artifacts_dir),
+                    "--archive-root",
+                    str(archive_root),
+                    "--stamp",
+                    stamp,
+                ]
+            )
+        archive_dir = archive_root / stamp
+        return {
+            "exit_code": exit_code,
+            "archive_dir": archive_dir,
+            "artifacts_dir": artifacts_dir,
+            "mock_main": mock_main,
+            "mock_dashboard": mock_dash,
+            "mock_notify": mock_notify,
+        }
+
+    def test_dashboard_subprocess_is_invoked_after_main(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(Path(tmp))
+            self.assertEqual(result["exit_code"], 0)
+            self.assertEqual(result["mock_dashboard"].call_count, 1)
+            kwargs = result["mock_dashboard"].call_args.kwargs
+            self.assertEqual(kwargs.get("artifacts_dir"), str(result["artifacts_dir"]))
+
+    def test_notifier_runs_in_dry_run_when_enable_flag_missing(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp),
+                wrapper_env_extra={"ENABLE_CRYPTO_TELEGRAM_ALERTS": "", "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""},
+            )
+            self.assertEqual(result["mock_notify"].call_count, 1)
+            kwargs = result["mock_notify"].call_args.kwargs
+            self.assertTrue(kwargs.get("dry_run"))
+
+    def test_notifier_runs_in_dry_run_when_credentials_missing_even_with_enable_flag(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp),
+                wrapper_env_extra={
+                    "ENABLE_CRYPTO_TELEGRAM_ALERTS": "1",
+                    "TELEGRAM_BOT_TOKEN": "",
+                    "TELEGRAM_CHAT_ID": "",
+                },
+            )
+            kwargs = result["mock_notify"].call_args.kwargs
+            self.assertTrue(kwargs.get("dry_run"))
+
+    def test_notifier_runs_real_send_when_enable_flag_and_credentials_set(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp),
+                wrapper_env_extra={
+                    "ENABLE_CRYPTO_TELEGRAM_ALERTS": "1",
+                    "TELEGRAM_BOT_TOKEN": "token-not-used-by-mock",
+                    "TELEGRAM_CHAT_ID": "987654321",
+                },
+            )
+            kwargs = result["mock_notify"].call_args.kwargs
+            self.assertFalse(kwargs.get("dry_run"))
+
+    def test_post_run_failure_does_not_change_main_exit_code(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp),
+                main_returncode=0,
+                dashboard_raises=RuntimeError("simulated dashboard crash"),
+                notify_raises=RuntimeError("simulated notifier crash"),
+            )
+            self.assertEqual(result["exit_code"], 0)
+
+    def test_post_run_failure_with_main_failure_preserves_main_exit_code(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp),
+                main_returncode=7,
+                dashboard_raises=RuntimeError("boom"),
+                notify_raises=RuntimeError("boom"),
+            )
+            self.assertEqual(result["exit_code"], 7)
+
+    def test_dashboard_log_and_notify_log_are_archived(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(Path(tmp))
+            self.assertTrue((result["archive_dir"] / "dashboard.log").is_file())
+            self.assertTrue((result["archive_dir"] / "notify.log").is_file())
+            self.assertIn(
+                "DASH-OUT",
+                (result["archive_dir"] / "dashboard.log").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "NOTIFY-OUT",
+                (result["archive_dir"] / "notify.log").read_text(encoding="utf-8"),
+            )
+
+    def test_dashboard_and_semantic_directories_are_archived_when_present(self):
+        with TemporaryDirectory() as tmp:
+            artifacts_dir = Path(tmp) / "artifacts" / "crypto_paper"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            # The wrapper's seeding helper does not create dashboard/semantic;
+            # simulate them being produced by the (mocked) post-run subprocesses.
+
+            def _dashboard(*args, **kwargs):  # noqa: ANN001
+                (artifacts_dir / "dashboard").mkdir(parents=True, exist_ok=True)
+                (artifacts_dir / "dashboard" / "index.html").write_text(
+                    "<html>paper-only</html>", encoding="utf-8"
+                )
+                (artifacts_dir / "semantic").mkdir(parents=True, exist_ok=True)
+                (artifacts_dir / "semantic" / "crypto_semantic_summary.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+                return _FakeCompleted(returncode=0, stdout="OK", stderr="")
+
+            archive_root = Path(tmp) / "artifacts" / "crypto_paper" / "archive"
+            stamp = "2026-05-03/180001"
+            candidate = _write_candidate(Path(tmp))
+            _seed_canonical_artifacts(artifacts_dir)
+            main_fake = _FakeCompleted(returncode=0, stdout="MAIN", stderr="")
+            notify_fake = _FakeCompleted(returncode=0, stdout="NOTIFY", stderr="")
+
+            with patch.object(wrapper, "run_paper_forward_subprocess", return_value=main_fake), \
+                 patch.object(wrapper, "run_dashboard_subprocess", side_effect=_dashboard), \
+                 patch.object(wrapper, "run_notifier_subprocess", return_value=notify_fake):
+                wrapper.main(
+                    [
+                        "--candidate-config", str(candidate),
+                        "--artifacts-dir", str(artifacts_dir),
+                        "--archive-root", str(archive_root),
+                        "--stamp", stamp,
+                    ]
+                )
+            archive_dir = archive_root / stamp
+            self.assertTrue((archive_dir / "dashboard" / "index.html").is_file())
+            self.assertTrue((archive_dir / "semantic" / "crypto_semantic_summary.json").is_file())
+            metadata = json.loads(
+                (archive_dir / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("dashboard", metadata["copied"])
+            self.assertIn("semantic", metadata["copied"])
+            self.assertIn("dashboard", metadata["post_run"])
+            self.assertIn("notify", metadata["post_run"])
+            self.assertTrue(metadata["post_run"]["dashboard"]["ok"])
+            self.assertTrue(metadata["post_run"]["notify"]["ok"])
+
+    def test_default_run_does_not_send_real_telegram_without_enable_flag(self):
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp),
+                wrapper_env_extra={"ENABLE_CRYPTO_TELEGRAM_ALERTS": "", "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""},
+            )
+            metadata = json.loads(
+                (result["archive_dir"] / "run_metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(metadata["post_run"]["notify"]["telegram_real_send"])
+            self.assertTrue(metadata["post_run"]["notify"]["dry_run"])
+
+    def test_should_send_real_telegram_helper(self):
+        self.assertFalse(wrapper.should_send_real_telegram({}))
+        self.assertFalse(wrapper.should_send_real_telegram({"ENABLE_CRYPTO_TELEGRAM_ALERTS": "1"}))
+        self.assertFalse(
+            wrapper.should_send_real_telegram(
+                {"ENABLE_CRYPTO_TELEGRAM_ALERTS": "1", "TELEGRAM_BOT_TOKEN": "x"}
+            )
+        )
+        self.assertFalse(
+            wrapper.should_send_real_telegram(
+                {
+                    "ENABLE_CRYPTO_TELEGRAM_ALERTS": "0",
+                    "TELEGRAM_BOT_TOKEN": "x",
+                    "TELEGRAM_CHAT_ID": "y",
+                }
+            )
+        )
+        self.assertTrue(
+            wrapper.should_send_real_telegram(
+                {
+                    "ENABLE_CRYPTO_TELEGRAM_ALERTS": "1",
+                    "TELEGRAM_BOT_TOKEN": "x",
+                    "TELEGRAM_CHAT_ID": "y",
+                }
+            )
+        )
+
+    def test_build_notifier_command_includes_dry_run_flag_when_dry(self):
+        cmd = wrapper.build_notifier_command(artifacts_dir="adir", dry_run=True)
+        self.assertIn("--dry-run", cmd)
+        self.assertIn("--daily-summary", cmd)
+        self.assertEqual(cmd[2], "src.tools.notify_crypto_paper_telegram")
+
+    def test_build_notifier_command_omits_dry_run_when_real(self):
+        cmd = wrapper.build_notifier_command(artifacts_dir="adir", dry_run=False)
+        self.assertNotIn("--dry-run", cmd)
+        self.assertIn("--daily-summary", cmd)
 
 
 if __name__ == "__main__":

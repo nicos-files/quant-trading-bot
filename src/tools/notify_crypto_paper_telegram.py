@@ -95,6 +95,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resend events even if their event_id is already in the dedupe state.",
     )
+    parser.add_argument(
+        "--bootstrap-dedupe",
+        "--mark-existing-sent",
+        dest="bootstrap_dedupe",
+        action="store_true",
+        help=(
+            "Read current semantic events and mark every alertable event_id "
+            "as already sent in the dedupe state. Does not contact Telegram. "
+            "Does not require TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. Useful "
+            "the first time the notifier is wired up against a populated "
+            "artifacts directory, to avoid replaying historical alerts."
+        ),
+    )
     return parser
 
 
@@ -107,6 +120,7 @@ def notify_crypto_paper_telegram(
     min_severity: str = _DEFAULT_MIN_SEVERITY,
     force: bool = False,
     rebuild_semantic: bool = False,
+    bootstrap_dedupe: bool = False,
     env: dict[str, str] | None = None,
     sender: Any = None,
     now: datetime | None = None,
@@ -121,6 +135,11 @@ def notify_crypto_paper_telegram(
         min_severity: Minimum severity to alert on.
         force: When True, ignore dedupe state and resend all alertable events.
         rebuild_semantic: When True, rebuild the semantic layer first.
+        bootstrap_dedupe: When True, mark every current alertable event_id as
+            already sent without contacting Telegram and without requiring
+            ``TELEGRAM_BOT_TOKEN`` or ``TELEGRAM_CHAT_ID``. Mutually compatible
+            with ``min_severity``; mutually exclusive with sending. Always
+            persists the dedupe state.
         env: Optional environment-variable map for tests.
         sender: Optional callable replacing the Telegram sender for tests.
             Signature: ``sender(bot_token, chat_id, text) -> dict``.
@@ -128,27 +147,14 @@ def notify_crypto_paper_telegram(
 
     Returns:
         Dict with ``sent``, ``skipped``, ``messages`` (text only), ``state_path``,
-        ``dry_run``, ``paper_only``, and a token-redacted ``chat_id_masked``.
+        ``dry_run``, ``bootstrap_dedupe``, ``marked_count``, ``paper_only``,
+        ``live_trading``, and a token-redacted ``chat_id_masked``.
     """
 
     if min_severity not in _SEVERITY_RANK:
         raise ValueError(f"Invalid min_severity: {min_severity!r}")
 
     source_env = env if env is not None else os.environ
-    enabled = str(source_env.get(ENABLE_FLAG) or "").strip()
-    if enabled != "1":
-        return {
-            "ok": False,
-            "paper_only": True,
-            "live_trading": False,
-            "sent": [],
-            "skipped": [],
-            "messages": [],
-            "dry_run": bool(dry_run),
-            "reason": f"{ENABLE_FLAG}_not_enabled",
-            "chat_id_masked": None,
-            "state_path": None,
-        }
 
     artifacts_root = Path(artifacts_dir)
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -157,6 +163,25 @@ def notify_crypto_paper_telegram(
     resolved_state_path = (
         Path(state_path) if state_path is not None else semantic_dir / _STATE_FILENAME
     )
+
+    # The ENABLE_CRYPTO_TELEGRAM_ALERTS gate guards real network sends only.
+    # Dry-run and bootstrap-dedupe never contact Telegram, so they bypass it.
+    enabled = str(source_env.get(ENABLE_FLAG) or "").strip()
+    if enabled != "1" and not dry_run and not bootstrap_dedupe:
+        return {
+            "ok": False,
+            "paper_only": True,
+            "live_trading": False,
+            "sent": [],
+            "skipped": [],
+            "messages": [],
+            "dry_run": bool(dry_run),
+            "bootstrap_dedupe": bool(bootstrap_dedupe),
+            "marked_count": 0,
+            "reason": f"{ENABLE_FLAG}_not_enabled",
+            "chat_id_masked": None,
+            "state_path": None,
+        }
 
     semantic_layer = _load_or_build_semantic_layer(
         artifacts_root=artifacts_root,
@@ -181,6 +206,38 @@ def notify_crypto_paper_telegram(
     sent_payload: list[dict[str, Any]] = []
     skipped_payload: list[dict[str, Any]] = []
     messages: list[str] = []
+
+    if bootstrap_dedupe:
+        before = len(sent_ids)
+        for event in candidates:
+            event_id = str(event.get("event_id") or "")
+            if event_id and event_id not in sent_ids:
+                sent_ids.add(event_id)
+        marked_count = len(sent_ids) - before
+        _save_state(
+            resolved_state_path,
+            {
+                "sent_event_ids": sorted(sent_ids),
+                "last_updated_at": moment.isoformat(),
+                "paper_only": True,
+                "bootstrap_dedupe": True,
+            },
+        )
+        return {
+            "ok": True,
+            "paper_only": True,
+            "live_trading": False,
+            "sent": [],
+            "skipped": [],
+            "messages": [],
+            "dry_run": False,
+            "bootstrap_dedupe": True,
+            "marked_count": int(marked_count),
+            "considered_count": len(candidates),
+            "chat_id_masked": None,
+            "state_path": str(resolved_state_path),
+            "min_severity": min_severity,
+        }
 
     bot_token: str | None = None
     chat_id: str | None = None
@@ -280,6 +337,8 @@ def notify_crypto_paper_telegram(
         "skipped": skipped_payload,
         "messages": messages,
         "dry_run": bool(dry_run),
+        "bootstrap_dedupe": False,
+        "marked_count": 0,
         "chat_id_masked": chat_id_masked,
         "state_path": str(resolved_state_path),
         "min_severity": min_severity,
@@ -441,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         min_severity=str(args.min_severity),
         force=bool(args.force),
         rebuild_semantic=bool(args.rebuild_semantic),
+        bootstrap_dedupe=bool(args.bootstrap_dedupe),
     )
     sys.stdout.write(
         json.dumps(
@@ -449,6 +509,9 @@ def main(argv: list[str] | None = None) -> int:
                 "paper_only": result.get("paper_only"),
                 "live_trading": result.get("live_trading"),
                 "dry_run": result.get("dry_run"),
+                "bootstrap_dedupe": result.get("bootstrap_dedupe"),
+                "marked_count": result.get("marked_count"),
+                "considered_count": result.get("considered_count"),
                 "sent_count": len(result.get("sent") or []),
                 "skipped_count": len(result.get("skipped") or []),
                 "min_severity": result.get("min_severity"),
@@ -460,6 +523,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         + "\n"
     )
+    if args.bootstrap_dedupe:
+        sys.stdout.write(
+            f"[CRYPTO-TELEGRAM-BOOTSTRAP] marked {result.get('marked_count') or 0} "
+            f"event_ids as already-sent (considered {result.get('considered_count') or 0}, "
+            f"min_severity={result.get('min_severity')}). No Telegram contact made.\n"
+        )
     if args.dry_run:
         for message in result.get("messages") or []:
             sys.stdout.write("---\n")
