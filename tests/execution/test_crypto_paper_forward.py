@@ -144,6 +144,120 @@ class CryptoPaperForwardTests(unittest.TestCase):
             self.assertEqual(equity_artifact.read_text(encoding="utf-8"), "{}")
             self.assertEqual(execution_plan.read_text(encoding="utf-8"), "{}")
 
+    def _seed_open_position(self, artifacts_dir: Path) -> None:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        position = {
+            "symbol": "BTCUSDT",
+            "quantity": 0.0009831395632918993,
+            "avg_entry_price": 76286.21896658644,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "last_price": 76500.0,
+            "updated_at": "2026-04-25T10:00:00",
+            "metadata": {
+                "provider": "binance_spot",
+                "stop_loss": 74840.444,
+                "take_profit": 77131.478,
+            },
+        }
+        snapshot = {
+            "as_of": "2026-04-25T10:00:00",
+            "cash": 24.925,
+            "equity": 100.0,
+            "positions_value": 75.075,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "fees_paid": 0.075,
+            "positions": [position],
+            "metadata": {"quote_currency": "USDT"},
+        }
+        (artifacts_dir / "crypto_paper_positions.json").write_text(
+            json.dumps([position], sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        (artifacts_dir / "crypto_paper_snapshot.json").write_text(
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    def test_open_long_above_take_profit_closes_via_quote_fallback_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            self._seed_open_position(artifacts_dir)
+
+            # Bundle: no candle bar crosses TP (high stays at 76600), but the
+            # latest quote's last_price is well above TP. Candle path will not
+            # fire; quote fallback must close the position.
+            bundle = {
+                "candles": {
+                    "BTCUSDT": [
+                        {"timestamp": "2026-05-03T17:20:00Z", "open": 76500, "high": 76600, "low": 76400, "close": 76550, "volume": 1.0},
+                        {"timestamp": "2026-05-03T17:25:00Z", "open": 76550, "high": 76600, "low": 76450, "close": 76580, "volume": 1.0},
+                    ]
+                },
+                "quotes": {
+                    "BTCUSDT": {"last_price": 78734.06, "bid": 78700.0, "ask": 78750.0}
+                },
+            }
+            candidate_path, prices_path = self._write_candidate_and_prices(root, bundle=bundle)
+            result = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-05-03T17:30:00+00:00",
+            )
+
+            self.assertEqual(result["status"], "SUCCESS", msg=result.get("warnings"))
+            self.assertEqual(result["exits_count"], 1, msg=result)
+            self.assertGreater(result["realized_pnl"], 0.0)
+
+            exit_events = json.loads(
+                (artifacts_dir / "crypto_paper_exit_events.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(exit_events), 1)
+            self.assertEqual(exit_events[0]["exit_reason"], "TAKE_PROFIT")
+            self.assertEqual(exit_events[0]["source"], "stop_take_quote_fallback")
+
+            positions = json.loads(
+                (artifacts_dir / "crypto_paper_positions.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(positions, [], msg="expected position fully closed after TP exit")
+
+    def test_open_long_below_stop_loss_closes_via_quote_fallback_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            self._seed_open_position(artifacts_dir)
+
+            bundle = {
+                "candles": {
+                    "BTCUSDT": [
+                        {"timestamp": "2026-05-03T17:20:00Z", "open": 76200, "high": 76300, "low": 76100, "close": 76250, "volume": 1.0},
+                        {"timestamp": "2026-05-03T17:25:00Z", "open": 76250, "high": 76300, "low": 76150, "close": 76280, "volume": 1.0},
+                    ]
+                },
+                "quotes": {
+                    "BTCUSDT": {"last_price": 70000.0, "bid": 69990.0, "ask": 70010.0}
+                },
+            }
+            candidate_path, prices_path = self._write_candidate_and_prices(root, bundle=bundle)
+            result = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-05-03T17:30:00+00:00",
+            )
+
+            self.assertEqual(result["status"], "SUCCESS", msg=result.get("warnings"))
+            self.assertEqual(result["exits_count"], 1, msg=result)
+
+            exit_events = json.loads(
+                (artifacts_dir / "crypto_paper_exit_events.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(exit_events[0]["exit_reason"], "STOP_LOSS")
+            self.assertEqual(exit_events[0]["source"], "stop_take_quote_fallback")
+
     def test_partial_failure_produces_warnings_not_silent_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

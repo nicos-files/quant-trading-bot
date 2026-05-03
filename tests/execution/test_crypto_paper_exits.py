@@ -131,5 +131,194 @@ class CryptoPaperExitsTests(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+class CryptoPaperExitsQuoteFallbackTests(unittest.TestCase):
+    """Quote-based fallback when candle data is missing/incomplete or stale.
+
+    The on-disk bug we fixed: an open BTCUSDT long had ``last_price`` already
+    above ``take_profit`` but no exit was ever generated because the candle
+    path only saw bars with ``high < take_profit``. Quote fallback closes that
+    gap without enabling any live trading code path.
+    """
+
+    def setUp(self) -> None:
+        self.as_of = datetime(2026, 5, 3, 17, 30, 0)
+        self.config = CryptoPaperExecutionConfig(enable_exits=True)
+
+    def _position(
+        self,
+        *,
+        qty=0.001,
+        avg_entry_price=76286.21896658644,
+        last_price=78734.06,
+        stop_loss=74840.444,
+        take_profit=77131.478,
+        updated_at=None,
+    ):
+        return CryptoPaperPosition(
+            symbol="BTCUSDT",
+            quantity=qty,
+            avg_entry_price=avg_entry_price,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+            last_price=last_price,
+            updated_at=updated_at,
+            metadata={
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "avg_entry_price": avg_entry_price,
+            },
+        )
+
+    def test_long_above_take_profit_triggers_take_profit_via_quote_fallback(self):
+        position = self._position()
+        events = evaluate_crypto_exit_triggers(
+            positions=[position],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 78734.06, "bid": 78700.0, "ask": 78750.0}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "TAKE_PROFIT")
+        self.assertEqual(events[0].source, "stop_take_quote_fallback")
+        self.assertEqual(events[0].trigger_price, 77131.478)
+        self.assertEqual(events[0].metadata["fallback"], "quote")
+        self.assertEqual(events[0].exit_quantity, position.quantity)
+
+    def test_long_below_stop_loss_triggers_stop_loss_via_quote_fallback(self):
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=70000.0)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 70000.0, "bid": 69990.0, "ask": 70010.0}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "STOP_LOSS")
+        self.assertEqual(events[0].source, "stop_take_quote_fallback")
+        self.assertEqual(events[0].trigger_price, 74840.444)
+
+    def test_quote_fallback_uses_position_last_price_when_quote_missing(self):
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=78734.06)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "TAKE_PROFIT")
+        self.assertEqual(events[0].metadata["last_price"], 78734.06)
+
+    def test_quote_fallback_does_not_fire_when_within_band(self):
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=76500.0)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 76500.0, "bid": 76495.0, "ask": 76505.0}},
+        )
+        self.assertEqual(events, [])
+
+    def test_take_profit_fallback_prefers_bid_over_last_price(self):
+        # bid=77150 (>= TP 77131.478), last_price=77100 (< TP)
+        # Bid-based check should still trigger TP because the conservative
+        # sell-side price (bid) crossed the threshold.
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=77100.0)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 77100.0, "bid": 77150.0, "ask": 77160.0}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "TAKE_PROFIT")
+        self.assertEqual(events[0].metadata["bid"], 77150.0)
+
+    def test_candle_path_takes_precedence_over_quote_fallback(self):
+        # Both candle (high above TP) AND quote (last_price above TP) trigger TP,
+        # but the candle path runs first and its source is `stop_take_evaluator`.
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(updated_at=datetime(2026, 5, 3, 10, 0))],
+            candles_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "date": datetime(2026, 5, 3, 11, 0),
+                        "open": 76500,
+                        "high": 78000,
+                        "low": 76400,
+                        "close": 77500,
+                    }
+                ]
+            },
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 78734.06, "bid": 78700.0}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "TAKE_PROFIT")
+        self.assertEqual(events[0].source, "stop_take_evaluator")
+
+    def test_quote_fallback_same_tick_conflict_picks_stop_loss(self):
+        # last_price below SL (stop_hit) AND bid above TP (take_hit, simulated
+        # crossed market). Stop must win.
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=70000.0)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 70000.0, "bid": 78000.0}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "STOP_LOSS")
+        self.assertTrue(events[0].metadata["same_tick_conflict"])
+
+    def test_quote_fallback_with_only_stop_loss_configured(self):
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=70000.0, take_profit=None)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 70000.0}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "STOP_LOSS")
+
+    def test_quote_fallback_with_only_take_profit_configured(self):
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=78734.06, stop_loss=None)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+            latest_quotes={"BTCUSDT": {"last_price": 78734.06}},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].exit_reason, "TAKE_PROFIT")
+
+    def test_no_live_trading_code_path_in_exits_module(self):
+        import inspect
+
+        from src.execution import crypto_paper_exits as module
+
+        source = inspect.getsource(module).lower()
+        for needle in ("ccxt", "binance.client(", "live_trading=true", "broker_settings", "api_key", "api_secret"):
+            self.assertNotIn(
+                needle,
+                source,
+                f"crypto_paper_exits.py must not reference live trading: found {needle!r}",
+            )
+
+    def test_quote_fallback_signature_is_backward_compatible(self):
+        # Existing callers (without latest_quotes) must keep working. Use an
+        # in-band last_price so neither candle nor position-fallback triggers.
+        events = evaluate_crypto_exit_triggers(
+            positions=[self._position(last_price=76500.0)],
+            candles_by_symbol={},
+            as_of=self.as_of,
+            config=self.config,
+        )
+        self.assertEqual(events, [])
+
+
 if __name__ == "__main__":
     unittest.main()

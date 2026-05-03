@@ -511,3 +511,273 @@
 [ARCHIVE] artifacts/crypto_paper/archive/2026-04-30/233007
 [ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-04-30/233007/run_metadata.json
 [ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-04-30/233007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.006513
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/000007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/000007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/000007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.166460
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/003004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/003004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/003004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.085538
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/010007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/010007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/010007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.329838
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/020004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/020004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/020004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.272610
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/023007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/023007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/023007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.002935
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/113001
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/113001/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/113001/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.097247
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/120004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/120004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/120004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.400133
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/123004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/123004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/123004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.585219
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/130004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/130004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/130004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.855690
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/133004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/133004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/133004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.335286
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/140004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/140004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/140004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.865512
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/143004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/143004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/143004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.942453
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/150004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/150004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/150004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.155125
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/153007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/153007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/153007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.096373
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/160007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/160007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/160007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.932356
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/163008
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/163008/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/163008/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.818872
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/170007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/170007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/170007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.856506
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/173007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/173007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/173007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.173667
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/180007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/180007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/180007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.178190
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/183007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/183007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/183007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.048111
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/190007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/190007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/190007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.018036
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/193007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/193007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/193007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.993527
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-01/200007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-01/200007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-01/200007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.971082
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-02/030004
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-02/030004/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-02/030004/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.985652
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-02/033009
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-02/033009/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-02/033009/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.029863
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-02/040008
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-02/040008/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-02/040008/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 101.878391
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-02/043008
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-02/043008/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-02/043008/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.260754
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-03/163007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-03/163007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-03/163007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.227996
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-03/170007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-03/170007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-03/170007/run.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 102.331569
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-03/173007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-03/173007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-03/173007/run.log

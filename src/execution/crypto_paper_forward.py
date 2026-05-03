@@ -309,6 +309,7 @@ def run_crypto_paper_forward(
             strategy_config=dict(candidate_payload.get("strategy") or {}),
             as_of=effective_as_of,
             warnings=warnings,
+            latest_quotes=latest_quotes,
         )
         exit_result = active_executor.execute(
             recommendations=_empty_recommendations(context),
@@ -646,6 +647,7 @@ def _evaluate_forward_exits(
     strategy_config: dict[str, Any],
     as_of: datetime,
     warnings: list[str],
+    latest_quotes: dict[str, Any] | None = None,
 ) -> list[CryptoPaperExitEvent]:
     candles_by_symbol: dict[str, Any] = {}
     for symbol in list(ledger.positions.keys()):
@@ -662,6 +664,7 @@ def _evaluate_forward_exits(
         candles_by_symbol=candles_by_symbol,
         as_of=as_of,
         config=ledger.config,
+        latest_quotes=latest_quotes or {},
     )
 
 
