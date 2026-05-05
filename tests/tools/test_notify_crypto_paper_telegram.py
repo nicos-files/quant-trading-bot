@@ -897,5 +897,278 @@ class NotifyCryptoPaperTelegramUXTests(unittest.TestCase):
             self.assertNotIn(BOT_TOKEN, state_path.read_text(encoding="utf-8"))
 
 
+class NotifyCryptoPaperTelegramDailySummaryOnlyTests(unittest.TestCase):
+    """Validate --daily-summary-only behavior and the new audit/state contract."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 5, 12, 30, 7, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_buy_filled_paper(self) -> dict[str, Any]:
+        fill = {
+            "fill_id": "f1",
+            "order_id": "crypto-paper-order-20260505T123007-0001",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": 0.000327,
+            "fill_price": 76286.22,
+            "gross_notional": 25.0,
+            "fee": 0.075,
+            "filled_at": "2026-05-05T12:30:07",
+            "metadata": {"stop_loss": 74840.0, "take_profit": 77131.478},
+        }
+        (self.artifacts_dir / "crypto_paper_fills.json").write_text(
+            json.dumps([fill]), encoding="utf-8"
+        )
+        return fill
+
+    def _enabled(self) -> dict[str, str]:
+        return {
+            ENABLE_FLAG: "1",
+            DEFAULT_BOT_TOKEN_ENV: BOT_TOKEN,
+            DEFAULT_CHAT_ID_ENV: CHAT_ID,
+        }
+
+    # -- --daily-summary-only ----------------------------------------------
+
+    def test_daily_summary_only_sends_only_summary_and_does_not_mark_pending(self) -> None:
+        # Pending BUY_FILLED_PAPER must remain pending so the next 30-minute
+        # run still delivers it. The summary itself is sent.
+        self._seed_buy_filled_paper()
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def __call__(self, **kwargs: Any) -> dict[str, Any]:
+                self.calls.append(kwargs)
+                return {"ok": True, "result": {"message_id": 7777}}
+
+        sender = _Recorder()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=sender,
+            daily_summary_only=True,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        # Exactly ONE Telegram call, the daily summary.
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("Crypto Paper Summary", sender.calls[0]["text"])
+        # The pending BUY event must appear in skipped with the dedicated reason.
+        skipped_reasons = {s["reason"] for s in result["skipped"]}
+        self.assertIn("filtered:daily_summary_only", skipped_reasons)
+        # The summary appears in the sent audit; no BUY in sent audit.
+        sent_types = {s.get("event_type") for s in result["sent"]}
+        self.assertEqual(sent_types, {"DAILY_SUMMARY"})
+        # State must NOT mark the BUY event as already-sent.
+        state_path = Path(result["state_path"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        sent_ids = state.get("sent_event_ids") or []
+        self.assertFalse(any(_id.startswith("buy:") for _id in sent_ids))
+
+    def test_daily_summary_and_daily_summary_only_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            notify_crypto_paper_telegram(
+                artifacts_dir=self.artifacts_dir,
+                env=self._enabled(),
+                sender=_RecordingSender(),
+                daily_summary=True,
+                daily_summary_only=True,
+                now=self.now,
+            )
+
+    def test_normal_notify_sends_new_buy_filled_paper(self) -> None:
+        # Default mode (no --daily-summary, no --daily-summary-only) sends
+        # new BUY_FILLED_PAPER and DOES NOT send the daily summary.
+        self._seed_buy_filled_paper()
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def __call__(self, **kwargs: Any) -> dict[str, Any]:
+                self.calls.append(kwargs)
+                return {"ok": True, "result": {"message_id": 100 + len(self.calls)}}
+
+        sender = _Recorder()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=sender,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        # 1 alert (the BUY) and zero summary messages.
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("PAPER BUY", sender.calls[0]["text"])
+        for call in sender.calls:
+            self.assertNotIn("Crypto Paper Summary", call["text"])
+        # The BUY id is now in sent_event_ids.
+        sent_event_ids_audit = result["sent_event_ids"]
+        self.assertEqual(len(sent_event_ids_audit), 1)
+        self.assertEqual(sent_event_ids_audit[0]["event_type"], "BUY_FILLED_PAPER")
+        self.assertEqual(sent_event_ids_audit[0]["delivery_mode"], "sent")
+        self.assertEqual(sent_event_ids_audit[0]["telegram_message_id"], 101)
+
+    # -- only-mark-after-ok=true contract ----------------------------------
+
+    def test_send_failure_does_not_mark_event_as_sent(self) -> None:
+        self._seed_buy_filled_paper()
+
+        def _failing(**kwargs: Any) -> dict[str, Any]:
+            raise TelegramSendError("Telegram send failed: HTTP 500 boom")
+
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=_failing,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        # Event must NOT be in the persisted dedupe state.
+        state = json.loads(
+            Path(result["state_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state.get("sent_event_ids") or [], [])
+        # Event must appear in skipped with a send_failed reason.
+        skipped_reasons = {s["reason"] for s in result["skipped"]}
+        self.assertIn("send_failed", skipped_reasons)
+        # Audit list must reflect the failure too.
+        skipped_event_ids = {s["reason"] for s in result["skipped_event_ids"]}
+        self.assertIn("send_failed", skipped_event_ids)
+
+    def test_non_ok_response_does_not_mark_event_as_sent(self) -> None:
+        # A custom sender returning a dict whose ok is False must be treated
+        # exactly like a transport failure: do not add to sent_event_ids.
+        self._seed_buy_filled_paper()
+
+        def _ok_false(**kwargs: Any) -> dict[str, Any]:
+            return {"ok": False, "description": "Bad chat id"}
+
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=_ok_false,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        state = json.loads(
+            Path(result["state_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state.get("sent_event_ids") or [], [])
+
+    def test_telegram_message_id_is_recorded_in_state_when_ok(self) -> None:
+        self._seed_buy_filled_paper()
+
+        def _sender(**kwargs: Any) -> dict[str, Any]:
+            return {"ok": True, "result": {"message_id": 42}}
+
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=_sender,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        state = json.loads(
+            Path(result["state_path"]).read_text(encoding="utf-8")
+        )
+        sent_events = state.get("sent_events") or []
+        self.assertEqual(len(sent_events), 1)
+        entry = sent_events[0]
+        self.assertEqual(entry["delivery_mode"], "sent")
+        self.assertEqual(entry["event_type"], "BUY_FILLED_PAPER")
+        self.assertEqual(entry["symbol"], "BTCUSDT")
+        self.assertEqual(entry["telegram_message_id"], 42)
+        self.assertIn("sent_at", entry)
+
+    # -- bootstrap delivery_mode -------------------------------------------
+
+    def test_bootstrap_dedupe_marks_delivery_mode_bootstrap(self) -> None:
+        self._seed_buy_filled_paper()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env={ENABLE_FLAG: "1"},  # bootstrap does not need credentials
+            bootstrap_dedupe=True,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["bootstrap_dedupe"])
+        state = json.loads(
+            Path(result["state_path"]).read_text(encoding="utf-8")
+        )
+        sent_events = state.get("sent_events") or []
+        self.assertGreaterEqual(len(sent_events), 1)
+        modes = {e.get("delivery_mode") for e in sent_events}
+        self.assertEqual(modes, {"bootstrap"})
+        # Sanity: bootstrap entries do NOT carry a telegram_message_id.
+        for entry in sent_events:
+            self.assertNotIn("telegram_message_id", entry)
+
+    # -- skipped reasons / audit -------------------------------------------
+
+    def test_already_sent_dedupe_still_prevents_duplicate_send(self) -> None:
+        # First run sends; second run with the same artifacts must skip.
+        self._seed_buy_filled_paper()
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def __call__(self, **kwargs: Any) -> dict[str, Any]:
+                self.calls.append(kwargs)
+                return {"ok": True, "result": {"message_id": 1}}
+
+        sender = _Recorder()
+        first = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=sender,
+            now=self.now,
+        )
+        self.assertEqual(len(first["sent"]), 1)
+        # Second invocation -> sender must not be called again; skip reason
+        # must be already_sent.
+        sender_after = _Recorder()
+        second = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=sender_after,
+            now=self.now,
+        )
+        self.assertTrue(second["ok"])
+        self.assertEqual(sender_after.calls, [])
+        self.assertEqual(len(second["sent"]), 0)
+        skipped_reasons = {s["reason"] for s in second["skipped"]}
+        self.assertIn("already_sent", skipped_reasons)
+
+    def test_audit_includes_below_min_severity_reason(self) -> None:
+        # Min severity above what the seeded events emit -> all candidates
+        # are filtered as below_min_severity (and visible in audit).
+        self._seed_buy_filled_paper()
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=self._enabled(),
+            sender=sender,
+            min_severity="CRITICAL",
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(sender.calls, [])
+        skipped_reasons = {s["reason"] for s in result["skipped_event_ids"]}
+        self.assertIn("below_min_severity", skipped_reasons)
+
+
 if __name__ == "__main__":
     unittest.main()

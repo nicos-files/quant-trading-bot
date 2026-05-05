@@ -69,6 +69,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Used by tests; not recommended for daily operations."
         ),
     )
+    parser.add_argument(
+        "--daily-summary-only",
+        dest="daily_summary_only",
+        action="store_true",
+        help=(
+            "Forward ``--daily-summary-only`` to the Telegram notifier. "
+            "Recommended for the once-per-day cron entry: it sends only the "
+            "daily portfolio summary and never marks BUY/TAKE/STOP events as "
+            "sent. Without this flag (the default for the 30-minute cron), "
+            "the notifier sends only new actionable events and never sends "
+            "the daily summary."
+        ),
+    )
     return parser
 
 
@@ -139,15 +152,37 @@ def build_dashboard_command(*, artifacts_dir: str) -> list[str]:
     ]
 
 
-def build_notifier_command(*, artifacts_dir: str, dry_run: bool) -> list[str]:
+def build_notifier_command(
+    *,
+    artifacts_dir: str,
+    dry_run: bool,
+    daily_summary_only: bool = False,
+) -> list[str]:
+    """Build the argv for the Telegram notifier subprocess.
+
+    By default (``daily_summary_only=False``) the command sends only new
+    actionable events and never sends the daily summary; this is the correct
+    invocation for the 30-minute cron and avoids re-sending the summary on
+    every run.
+
+    With ``daily_summary_only=True`` the command appends ``--daily-summary-only``
+    to the notifier; this is the correct invocation for the once-per-day cron
+    and never marks BUY/TAKE/STOP events as sent.
+
+    The legacy ``--daily-summary`` flag (summary plus pending alerts) is
+    intentionally not emitted here; callers that need it can run the notifier
+    directly.
+    """
+
     cmd = [
         sys.executable,
         "-m",
         "src.tools.notify_crypto_paper_telegram",
         "--artifacts-dir",
         artifacts_dir,
-        "--daily-summary",
     ]
+    if daily_summary_only:
+        cmd.append("--daily-summary-only")
     if dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -208,8 +243,13 @@ def run_notifier_subprocess(
     artifacts_dir: str,
     env: dict[str, str],
     dry_run: bool,
+    daily_summary_only: bool = False,
 ) -> subprocess.CompletedProcess:
-    cmd = build_notifier_command(artifacts_dir=artifacts_dir, dry_run=dry_run)
+    cmd = build_notifier_command(
+        artifacts_dir=artifacts_dir,
+        dry_run=dry_run,
+        daily_summary_only=daily_summary_only,
+    )
     return subprocess.run(
         cmd,
         capture_output=True,
@@ -244,14 +284,52 @@ def _write_subprocess_log(
         " ".join(str(part) for part in summary.get("cmd") or []),
         f"# exit_code: {summary.get('exit_code')}",
         f"# error: {summary.get('error') or ''}",
-        "# stdout",
-        summary.get("stdout") or "",
-        "# stderr",
-        summary.get("stderr") or "",
     ]
+    if "sent_event_ids" in summary or "skipped_event_ids" in summary:
+        parts.extend(
+            [
+                f"# sent_count: {summary.get('sent_count')}",
+                f"# skipped_count: {summary.get('skipped_count')}",
+                f"# sent_event_ids: {json.dumps(summary.get('sent_event_ids') or [], ensure_ascii=False)}",
+                f"# skipped_event_ids: {json.dumps(summary.get('skipped_event_ids') or [], ensure_ascii=False)}",
+            ]
+        )
+    parts.extend(
+        [
+            "# stdout",
+            summary.get("stdout") or "",
+            "# stderr",
+            summary.get("stderr") or "",
+        ]
+    )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("\n".join(parts), encoding="utf-8")
     return log_path
+
+
+def _parse_notifier_audit(stdout: str) -> dict[str, Any] | None:
+    """Best-effort parse of the notifier's single-line JSON audit on stdout.
+
+    Returns ``None`` when the stdout cannot be parsed; the caller treats this
+    as a missing audit (notifier crashed or wrote unexpected output) and the
+    notify.log still contains the raw stdout/stderr for diagnosis.
+    """
+
+    if not stdout:
+        return None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or not line.endswith("}"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and (
+            "sent_event_ids" in parsed or "skipped_event_ids" in parsed
+        ):
+            return parsed
+    return None
 
 
 def _safe_post_run_step(
@@ -367,21 +445,38 @@ def main(argv: list[str] | None = None) -> int:
 
         real_send = should_send_real_telegram(env)
         dry_run = not real_send
+        daily_summary_only = bool(args.daily_summary_only)
         notify_summary = _safe_post_run_step(
             label="notify",
             runner=lambda: run_notifier_subprocess(
-                artifacts_dir=str(artifacts_dir), env=env, dry_run=dry_run
+                artifacts_dir=str(artifacts_dir),
+                env=env,
+                dry_run=dry_run,
+                daily_summary_only=daily_summary_only,
             ),
             cmd_builder=lambda artifacts_dir: build_notifier_command(
-                artifacts_dir=artifacts_dir, dry_run=dry_run
+                artifacts_dir=artifacts_dir,
+                dry_run=dry_run,
+                daily_summary_only=daily_summary_only,
             ),
             artifacts_dir=str(artifacts_dir),
             env=env,
             extra={
                 "dry_run": dry_run,
                 "telegram_real_send": real_send,
+                "daily_summary_only": daily_summary_only,
             },
         )
+        # Surface notifier audit fields (event ids + reasons) into the wrapper
+        # summary so the archived notify.log and run_metadata.json record what
+        # was actually delivered. Parse defensively: notifier prints a single
+        # JSON line on stdout.
+        notify_audit = _parse_notifier_audit(notify_summary.get("stdout") or "")
+        if notify_audit is not None:
+            notify_summary["sent_event_ids"] = notify_audit.get("sent_event_ids") or []
+            notify_summary["skipped_event_ids"] = notify_audit.get("skipped_event_ids") or []
+            notify_summary["sent_count"] = notify_audit.get("sent_count")
+            notify_summary["skipped_count"] = notify_audit.get("skipped_count")
 
     # --- Archive ------------------------------------------------------------
     archive_dir.mkdir(parents=True, exist_ok=True)

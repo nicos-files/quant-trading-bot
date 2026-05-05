@@ -249,6 +249,8 @@ class RunCryptoPaperForwardDailyPostRunIntegrationTests(unittest.TestCase):
         notify_returncode: int = 0,
         dashboard_raises: BaseException | None = None,
         notify_raises: BaseException | None = None,
+        notify_stdout: str = "NOTIFY-OUT",
+        extra_argv: list[str] | None = None,
         stamp: str = "2026-05-03/180000",
     ):
         artifacts_dir = tmp / "artifacts" / "crypto_paper"
@@ -257,7 +259,7 @@ class RunCryptoPaperForwardDailyPostRunIntegrationTests(unittest.TestCase):
         _seed_canonical_artifacts(artifacts_dir)
         main_fake = _FakeCompleted(returncode=main_returncode, stdout="MAIN-OUT", stderr="")
         dashboard_fake = _FakeCompleted(returncode=dashboard_returncode, stdout="DASH-OUT", stderr="")
-        notify_fake = _FakeCompleted(returncode=notify_returncode, stdout="NOTIFY-OUT", stderr="")
+        notify_fake = _FakeCompleted(returncode=notify_returncode, stdout=notify_stdout, stderr="")
 
         def _dashboard(*args, **kwargs):  # noqa: ANN001
             if dashboard_raises is not None:
@@ -270,23 +272,24 @@ class RunCryptoPaperForwardDailyPostRunIntegrationTests(unittest.TestCase):
             return notify_fake
 
         env_overrides = wrapper_env_extra or {}
+        argv = [
+            "--candidate-config",
+            str(candidate),
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--archive-root",
+            str(archive_root),
+            "--stamp",
+            stamp,
+        ]
+        if extra_argv:
+            argv.extend(extra_argv)
 
         with patch.object(wrapper, "run_paper_forward_subprocess", return_value=main_fake) as mock_main, \
              patch.object(wrapper, "run_dashboard_subprocess", side_effect=_dashboard) as mock_dash, \
              patch.object(wrapper, "run_notifier_subprocess", side_effect=_notifier) as mock_notify, \
              patch.dict("os.environ", env_overrides, clear=False):
-            exit_code = wrapper.main(
-                [
-                    "--candidate-config",
-                    str(candidate),
-                    "--artifacts-dir",
-                    str(artifacts_dir),
-                    "--archive-root",
-                    str(archive_root),
-                    "--stamp",
-                    stamp,
-                ]
-            )
+            exit_code = wrapper.main(argv)
         archive_dir = archive_root / stamp
         return {
             "exit_code": exit_code,
@@ -466,13 +469,89 @@ class RunCryptoPaperForwardDailyPostRunIntegrationTests(unittest.TestCase):
     def test_build_notifier_command_includes_dry_run_flag_when_dry(self):
         cmd = wrapper.build_notifier_command(artifacts_dir="adir", dry_run=True)
         self.assertIn("--dry-run", cmd)
-        self.assertIn("--daily-summary", cmd)
         self.assertEqual(cmd[2], "src.tools.notify_crypto_paper_telegram")
 
     def test_build_notifier_command_omits_dry_run_when_real(self):
         cmd = wrapper.build_notifier_command(artifacts_dir="adir", dry_run=False)
         self.assertNotIn("--dry-run", cmd)
-        self.assertIn("--daily-summary", cmd)
+
+    def test_build_notifier_command_default_omits_daily_summary(self):
+        # The 30-minute cron must NOT pass --daily-summary by default; that
+        # used to suppress new actionable BUY/TAKE/STOP alerts whenever the
+        # summary message had already been delivered earlier in the day.
+        cmd = wrapper.build_notifier_command(artifacts_dir="adir", dry_run=False)
+        self.assertNotIn("--daily-summary", cmd)
+        self.assertNotIn("--daily-summary-only", cmd)
+
+    def test_build_notifier_command_with_daily_summary_only_appends_flag(self):
+        cmd = wrapper.build_notifier_command(
+            artifacts_dir="adir", dry_run=False, daily_summary_only=True
+        )
+        self.assertIn("--daily-summary-only", cmd)
+        self.assertNotIn("--daily-summary", cmd)
+
+    def test_wrapper_default_does_not_pass_daily_summary_to_notifier(self):
+        # 30-minute cron path: wrapper invoked without --daily-summary-only.
+        # The notifier subprocess must NOT receive --daily-summary nor
+        # --daily-summary-only, so it sends only new actionable events.
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(Path(tmp))
+            self.assertEqual(result["exit_code"], 0)
+            kwargs = result["mock_notify"].call_args.kwargs
+            self.assertFalse(kwargs.get("daily_summary_only"))
+
+    def test_wrapper_daily_summary_only_flag_forwards_to_notifier(self):
+        # Daily cron path: wrapper invoked with --daily-summary-only must
+        # forward that flag to the notifier subprocess.
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp), extra_argv=["--daily-summary-only"]
+            )
+            self.assertEqual(result["exit_code"], 0)
+            kwargs = result["mock_notify"].call_args.kwargs
+            self.assertTrue(kwargs.get("daily_summary_only"))
+
+    def test_notify_log_includes_sent_and_skipped_event_ids_when_audit_present(self):
+        # Simulate the notifier emitting its single-line JSON audit: the
+        # wrapper must surface sent_event_ids and skipped_event_ids into
+        # notify.log so the operator can audit each run.
+        audit = {
+            "ok": True,
+            "sent_count": 1,
+            "skipped_count": 2,
+            "sent_event_ids": [
+                {
+                    "event_id": "buy:f1:2026-05-05T12:30:07",
+                    "event_type": "BUY_FILLED_PAPER",
+                    "symbol": "BTCUSDT",
+                    "delivery_mode": "sent",
+                    "telegram_message_id": 4242,
+                }
+            ],
+            "skipped_event_ids": [
+                {
+                    "event_id": "rejected:o:1",
+                    "reason": "noisy_order_rejected",
+                },
+                {
+                    "event_id": "tp:e:earlier",
+                    "reason": "already_sent",
+                },
+            ],
+        }
+        with TemporaryDirectory() as tmp:
+            result = self._invoke_with_post_run(
+                Path(tmp), notify_stdout=json.dumps(audit) + "\n"
+            )
+            notify_log = (result["archive_dir"] / "notify.log").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("# sent_count: 1", notify_log)
+            self.assertIn("# skipped_count: 2", notify_log)
+            self.assertIn("buy:f1:2026-05-05T12:30:07", notify_log)
+            self.assertIn("noisy_order_rejected", notify_log)
+            self.assertIn("already_sent", notify_log)
+            self.assertIn("BUY_FILLED_PAPER", notify_log)
 
 
 if __name__ == "__main__":

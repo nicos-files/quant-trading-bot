@@ -1,0 +1,8 @@
+# command
+/home/naguilar/projects/quant-trading-bot/.venv/bin/python -m src.tools.notify_crypto_paper_telegram --artifacts-dir artifacts/crypto_paper --daily-summary
+# exit_code: 0
+# error: 
+# stdout
+{"bootstrap_dedupe": false, "chat_id_masked": "******0977", "considered_count": null, "dry_run": false, "live_trading": false, "marked_count": 0, "min_severity": "ACTION", "ok": true, "paper_only": true, "reason": null, "sent_count": 1, "skipped_count": 5, "state_path": "artifacts/crypto_paper/semantic/telegram_alert_state.json"}
+
+# stderr

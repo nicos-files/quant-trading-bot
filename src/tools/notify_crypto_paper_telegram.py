@@ -103,10 +103,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print messages without contacting Telegram. Skips dedupe writes.",
     )
-    parser.add_argument(
+    summary_group = parser.add_mutually_exclusive_group()
+    summary_group.add_argument(
         "--daily-summary",
         action="store_true",
-        help="Also send a one-line daily portfolio summary.",
+        help=(
+            "Send the daily portfolio summary in addition to any pending "
+            "alertable events. Kept for backward compatibility; for cron "
+            "use, prefer ``--daily-summary-only`` for the once-per-day run."
+        ),
+    )
+    summary_group.add_argument(
+        "--daily-summary-only",
+        dest="daily_summary_only",
+        action="store_true",
+        help=(
+            "Send ONLY the daily portfolio summary; do not send any per-event "
+            "alerts and do not mark BUY_FILLED_PAPER/TAKE_PROFIT/STOP_LOSS "
+            "event_ids as already sent. Recommended for the once-per-day cron "
+            "entry: it lets the 30-minute cron continue to deliver new "
+            "actionable events without being shadowed by the daily summary run."
+        ),
     )
     parser.add_argument(
         "--min-severity",
@@ -152,6 +169,7 @@ def notify_crypto_paper_telegram(
     state_path: str | Path | None = None,
     dry_run: bool = False,
     daily_summary: bool = False,
+    daily_summary_only: bool = False,
     min_severity: str = _DEFAULT_MIN_SEVERITY,
     force: bool = False,
     rebuild_semantic: bool = False,
@@ -189,6 +207,10 @@ def notify_crypto_paper_telegram(
 
     if min_severity not in _SEVERITY_RANK:
         raise ValueError(f"Invalid min_severity: {min_severity!r}")
+    if daily_summary and daily_summary_only:
+        raise ValueError(
+            "daily_summary and daily_summary_only are mutually exclusive"
+        )
 
     source_env = env if env is not None else os.environ
 
@@ -228,16 +250,25 @@ def notify_crypto_paper_telegram(
 
     threshold = _SEVERITY_RANK[min_severity]
     candidates: list[dict[str, Any]] = []
+    pre_filtered: list[dict[str, Any]] = []  # observability for skipped reasons.
     for event in events:
         event_type = str(event.get("event_type") or "")
         severity = str(event.get("severity") or "INFO")
+        event_id = str(event.get("event_id") or "")
         if event_type not in ALERTABLE_EVENT_TYPES:
+            # Non-alertable events (e.g. NO_ACTION, INFO) are not surfaced in
+            # skipped to avoid drowning the audit log; they were never
+            # candidates for sending in the first place.
             continue
         if _SEVERITY_RANK.get(severity, -1) < threshold:
+            pre_filtered.append({"event_id": event_id, "reason": "below_min_severity"})
             continue
         if event_type == "ORDER_REJECTED" and not include_order_rejected:
-            reason = str((event.get("metadata") or {}).get("reason") or "").lower()
-            if any(noise in reason for noise in _NOISY_REJECTION_REASON_SUBSTRINGS):
+            reason_text = str((event.get("metadata") or {}).get("reason") or "").lower()
+            if any(noise in reason_text for noise in _NOISY_REJECTION_REASON_SUBSTRINGS):
+                pre_filtered.append(
+                    {"event_id": event_id, "reason": "noisy_order_rejected"}
+                )
                 continue
         candidates.append(event)
 
@@ -247,18 +278,36 @@ def notify_crypto_paper_telegram(
     skipped_payload: list[dict[str, Any]] = []
     messages: list[str] = []
 
+    sent_events_meta: list[dict[str, Any]] = list(state.get("sent_events") or [])
+
     if bootstrap_dedupe:
         before = len(sent_ids)
+        bootstrap_now_iso = moment.isoformat()
+        existing_meta_ids = {str(e.get("event_id") or "") for e in sent_events_meta}
         for event in candidates:
             event_id = str(event.get("event_id") or "")
-            if event_id and event_id not in sent_ids:
+            if not event_id:
+                continue
+            if event_id not in sent_ids:
                 sent_ids.add(event_id)
+            if event_id not in existing_meta_ids:
+                sent_events_meta.append(
+                    {
+                        "event_id": event_id,
+                        "event_type": str(event.get("event_type") or ""),
+                        "symbol": str(event.get("symbol") or ""),
+                        "sent_at": bootstrap_now_iso,
+                        "delivery_mode": "bootstrap",
+                    }
+                )
+                existing_meta_ids.add(event_id)
         marked_count = len(sent_ids) - before
         _save_state(
             resolved_state_path,
             {
                 "sent_event_ids": sorted(sent_ids),
-                "last_updated_at": moment.isoformat(),
+                "sent_events": sent_events_meta,
+                "last_updated_at": bootstrap_now_iso,
                 "paper_only": True,
                 "bootstrap_dedupe": True,
             },
@@ -269,6 +318,8 @@ def notify_crypto_paper_telegram(
             "live_trading": False,
             "sent": [],
             "skipped": [],
+            "sent_event_ids": [],
+            "skipped_event_ids": [],
             "messages": [],
             "dry_run": False,
             "bootstrap_dedupe": True,
@@ -279,10 +330,29 @@ def notify_crypto_paper_telegram(
             "min_severity": min_severity,
         }
 
+    # Carry pre-filter skipped entries (severity / noisy rejected) into the
+    # public skipped audit so callers can see why each event_id was dropped.
+    skipped_payload.extend(pre_filtered)
+
+    # ``daily_summary_only`` short-circuits the per-event send loop entirely:
+    # every candidate is recorded as ``filtered:daily_summary_only`` in the
+    # skipped audit and is NOT added to ``sent_event_ids``. This guarantees
+    # the daily cron run cannot shadow pending BUY/TAKE/STOP alerts.
+    will_send_summary = bool(daily_summary or daily_summary_only)
+    iter_candidates = [] if daily_summary_only else candidates
+    if daily_summary_only:
+        for event in candidates:
+            skipped_payload.append(
+                {
+                    "event_id": str(event.get("event_id") or ""),
+                    "reason": "filtered:daily_summary_only",
+                }
+            )
+
     bot_token: str | None = None
     chat_id: str | None = None
     chat_id_masked: str | None = None
-    if not dry_run and (candidates or daily_summary):
+    if not dry_run and (iter_candidates or will_send_summary):
         try:
             bot_token, chat_id = resolve_credentials(env=source_env)
         except TelegramConfigError as exc:
@@ -291,7 +361,12 @@ def notify_crypto_paper_telegram(
                 "paper_only": True,
                 "live_trading": False,
                 "sent": [],
-                "skipped": [],
+                "skipped": skipped_payload,
+                "sent_event_ids": [],
+                "skipped_event_ids": [
+                    {"event_id": s["event_id"], "reason": s["reason"]}
+                    for s in skipped_payload
+                ],
                 "messages": [],
                 "dry_run": False,
                 "reason": str(exc),
@@ -302,87 +377,204 @@ def notify_crypto_paper_telegram(
 
     transport = sender if sender is not None else _default_sender
 
-    for event in candidates:
+    failure_reason: str | None = None
+    moment_iso = moment.isoformat()
+
+    def _record_sent(
+        *,
+        event_id: str,
+        event_type: str,
+        symbol: str,
+        delivery_mode: str,
+        telegram_message_id: Any = None,
+    ) -> None:
+        """Append a sent_events metadata entry and update the dedupe set.
+
+        Only invoked AFTER Telegram has returned ok=true (or in dry-run /
+        bootstrap modes that explicitly never contact the network).
+        """
+        entry: dict[str, Any] = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "symbol": symbol,
+            "sent_at": moment_iso,
+            "delivery_mode": delivery_mode,
+        }
+        if telegram_message_id is not None:
+            entry["telegram_message_id"] = telegram_message_id
+        sent_events_meta.append(entry)
+        if delivery_mode == "sent":
+            sent_ids.add(event_id)
+
+    for event in iter_candidates:
         event_id = str(event.get("event_id") or "")
+        event_type = str(event.get("event_type") or "")
+        symbol = str(event.get("symbol") or "")
         if not force and event_id in sent_ids:
             skipped_payload.append({"event_id": event_id, "reason": "already_sent"})
             continue
         text = format_event_message(event)
         messages.append(text)
         if dry_run:
-            sent_payload.append({"event_id": event_id, "dry_run": True})
+            sent_payload.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "symbol": symbol,
+                    "delivery_mode": "dry_run_skipped",
+                }
+            )
             continue
         try:
-            transport(bot_token=bot_token or "", chat_id=chat_id or "", text=text)
+            response = transport(
+                bot_token=bot_token or "", chat_id=chat_id or "", text=text
+            )
         except TelegramSendError as exc:
-            return {
-                "ok": False,
-                "paper_only": True,
-                "live_trading": False,
-                "sent": sent_payload,
-                "skipped": skipped_payload,
-                "messages": messages,
-                "dry_run": False,
-                "reason": redact_token(str(exc), bot_token or ""),
-                "chat_id_masked": chat_id_masked,
-                "state_path": str(resolved_state_path),
+            failure_reason = redact_token(str(exc), bot_token or "")
+            skipped_payload.append(
+                {"event_id": event_id, "reason": f"send_failed"}
+            )
+            break
+        # Defensive: only mark sent when the API explicitly returns ok=true.
+        # send_telegram_message already raises on ok=false, but a custom
+        # sender (tests or future implementations) might return a dict whose
+        # ok is missing or false. Refuse to mark in that case.
+        if not isinstance(response, dict) or not response.get("ok"):
+            failure_reason = "send_failed:non_ok_response"
+            skipped_payload.append(
+                {"event_id": event_id, "reason": "send_failed"}
+            )
+            break
+        message_id = (response.get("result") or {}).get("message_id")
+        sent_payload.append(
+            {
+                "event_id": event_id,
+                "event_type": event_type,
+                "symbol": symbol,
+                "delivery_mode": "sent",
+                "telegram_message_id": message_id,
             }
-        sent_payload.append({"event_id": event_id})
-        sent_ids.add(event_id)
+        )
+        _record_sent(
+            event_id=event_id,
+            event_type=event_type,
+            symbol=symbol,
+            delivery_mode="sent",
+            telegram_message_id=message_id,
+        )
 
-    if daily_summary:
+    if will_send_summary and failure_reason is None:
         summary_payload = semantic_layer.get("summary") or {}
         text = format_daily_summary(summary_payload, moment)
         summary_event_id = f"{_DAILY_SUMMARY_PREFIX}{moment.strftime('%Y-%m-%d')}"
         if not force and summary_event_id in sent_ids:
-            skipped_payload.append({"event_id": summary_event_id, "reason": "already_sent"})
+            skipped_payload.append(
+                {"event_id": summary_event_id, "reason": "already_sent"}
+            )
         else:
             messages.append(text)
             if dry_run:
-                sent_payload.append({"event_id": summary_event_id, "dry_run": True})
+                sent_payload.append(
+                    {
+                        "event_id": summary_event_id,
+                        "event_type": "DAILY_SUMMARY",
+                        "symbol": "",
+                        "delivery_mode": "dry_run_skipped",
+                    }
+                )
             else:
                 try:
-                    transport(bot_token=bot_token or "", chat_id=chat_id or "", text=text)
+                    response = transport(
+                        bot_token=bot_token or "",
+                        chat_id=chat_id or "",
+                        text=text,
+                    )
                 except TelegramSendError as exc:
-                    return {
-                        "ok": False,
-                        "paper_only": True,
-                        "live_trading": False,
-                        "sent": sent_payload,
-                        "skipped": skipped_payload,
-                        "messages": messages,
-                        "dry_run": False,
-                        "reason": redact_token(str(exc), bot_token or ""),
-                        "chat_id_masked": chat_id_masked,
-                        "state_path": str(resolved_state_path),
-                    }
-                sent_payload.append({"event_id": summary_event_id})
-                sent_ids.add(summary_event_id)
+                    failure_reason = redact_token(str(exc), bot_token or "")
+                    skipped_payload.append(
+                        {
+                            "event_id": summary_event_id,
+                            "reason": "send_failed",
+                        }
+                    )
+                else:
+                    if not isinstance(response, dict) or not response.get("ok"):
+                        failure_reason = "send_failed:non_ok_response"
+                        skipped_payload.append(
+                            {
+                                "event_id": summary_event_id,
+                                "reason": "send_failed",
+                            }
+                        )
+                    else:
+                        message_id = (response.get("result") or {}).get("message_id")
+                        sent_payload.append(
+                            {
+                                "event_id": summary_event_id,
+                                "event_type": "DAILY_SUMMARY",
+                                "symbol": "",
+                                "delivery_mode": "sent",
+                                "telegram_message_id": message_id,
+                            }
+                        )
+                        _record_sent(
+                            event_id=summary_event_id,
+                            event_type="DAILY_SUMMARY",
+                            symbol="",
+                            delivery_mode="sent",
+                            telegram_message_id=message_id,
+                        )
 
+    # Persist whatever was actually delivered. In dry-run we do not write
+    # state at all (matches the historic contract). In real-send mode we
+    # always persist the partial state, even when a later send failed: that
+    # way already-delivered events are correctly recorded as sent.
     if not dry_run:
         _save_state(
             resolved_state_path,
             {
                 "sent_event_ids": sorted(sent_ids),
-                "last_updated_at": moment.isoformat(),
+                "sent_events": sent_events_meta,
+                "last_updated_at": moment_iso,
                 "paper_only": True,
             },
         )
 
-    return {
-        "ok": True,
+    skipped_event_ids = [
+        {"event_id": s["event_id"], "reason": s["reason"]}
+        for s in skipped_payload
+    ]
+    sent_event_ids_audit = [
+        {
+            "event_id": s["event_id"],
+            "event_type": s.get("event_type"),
+            "symbol": s.get("symbol"),
+            "delivery_mode": s.get("delivery_mode"),
+            "telegram_message_id": s.get("telegram_message_id"),
+        }
+        for s in sent_payload
+    ]
+
+    result: dict[str, Any] = {
+        "ok": failure_reason is None,
         "paper_only": True,
         "live_trading": False,
         "sent": sent_payload,
         "skipped": skipped_payload,
+        "sent_event_ids": sent_event_ids_audit,
+        "skipped_event_ids": skipped_event_ids,
         "messages": messages,
         "dry_run": bool(dry_run),
+        "daily_summary_only": bool(daily_summary_only),
         "bootstrap_dedupe": False,
         "marked_count": 0,
         "chat_id_masked": chat_id_masked,
         "state_path": str(resolved_state_path),
         "min_severity": min_severity,
     }
+    if failure_reason is not None:
+        result["reason"] = failure_reason
+    return result
 
 
 def format_event_message(event: dict[str, Any]) -> str:
@@ -736,6 +928,7 @@ def main(argv: list[str] | None = None) -> int:
         state_path=args.state_path,
         dry_run=bool(args.dry_run),
         daily_summary=bool(args.daily_summary),
+        daily_summary_only=bool(args.daily_summary_only),
         min_severity=str(args.min_severity),
         force=bool(args.force),
         rebuild_semantic=bool(args.rebuild_semantic),
@@ -749,11 +942,14 @@ def main(argv: list[str] | None = None) -> int:
                 "paper_only": result.get("paper_only"),
                 "live_trading": result.get("live_trading"),
                 "dry_run": result.get("dry_run"),
+                "daily_summary_only": result.get("daily_summary_only"),
                 "bootstrap_dedupe": result.get("bootstrap_dedupe"),
                 "marked_count": result.get("marked_count"),
                 "considered_count": result.get("considered_count"),
                 "sent_count": len(result.get("sent") or []),
                 "skipped_count": len(result.get("skipped") or []),
+                "sent_event_ids": result.get("sent_event_ids") or [],
+                "skipped_event_ids": result.get("skipped_event_ids") or [],
                 "min_severity": result.get("min_severity"),
                 "chat_id_masked": result.get("chat_id_masked"),
                 "state_path": result.get("state_path"),
