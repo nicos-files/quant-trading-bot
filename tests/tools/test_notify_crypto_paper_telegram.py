@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,8 +43,10 @@ class _RecordingSender:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def __call__(self, *, bot_token, chat_id, text):
-        self.calls.append({"bot_token": bot_token, "chat_id": chat_id, "text": text})
+    def __call__(self, *, bot_token, chat_id, text, **extra):
+        call = {"bot_token": bot_token, "chat_id": chat_id, "text": text}
+        call.update(extra)
+        self.calls.append(call)
         return {"ok": True}
 
 
@@ -115,7 +118,7 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertEqual(sender.calls, [])
         self.assertEqual(len(result["messages"]), 1)
-        self.assertIn("TAKE_PROFIT", result["messages"][0])
+        self.assertIn("TAKE PROFIT", result["messages"][0])
 
     def test_missing_token_or_chat_fails_cleanly(self) -> None:
         self._seed_take_profit_exit()
@@ -173,7 +176,7 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertEqual(len(sender.calls), 1)
-        self.assertIn("TAKE_PROFIT", sender.calls[0]["text"])
+        self.assertIn("TAKE PROFIT", sender.calls[0]["text"])
         for call in sender.calls:
             self.assertNotIn("BUY_SIGNAL", call["text"])
 
@@ -309,7 +312,7 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         # 1 take-profit alert + 1 daily summary
         self.assertEqual(len(sender.calls), 2)
         summary_text = sender.calls[-1]["text"]
-        self.assertIn("DAILY_SUMMARY", summary_text)
+        self.assertIn("Crypto Paper Summary", summary_text)
         self.assertIn("Paper-only", summary_text)
 
     def test_send_failure_is_token_redacted(self) -> None:
@@ -340,16 +343,28 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
                 "trigger_price": 77131.478,
                 "fill_price": 77092.91,
                 "realized_pnl": 0.717,
+                "entry_average_price": 76286.22,
+                "return_pct": 0.0086,
                 "stop_loss": 74840.0,
                 "take_profit": 77131.478,
+                "quote_asset": "USDT",
             },
         }
         text = format_event_message(event)
-        self.assertIn("[ACTION] TAKE_PROFIT BTCUSDT", text)
-        self.assertIn("trigger=", text)
-        self.assertIn("realized_pnl=", text)
-        self.assertIn("Action: Review.", text)
+        # Concise HTML action card with Spanish labels.
+        self.assertIn("<b>TAKE PROFIT \u2014 BTCUSDT</b>", text)
+        self.assertIn("<b>Entry promedio:</b>", text)
+        self.assertIn("<b>Exit paper:</b>", text)
+        self.assertIn("<b>P&amp;L realizado:</b>", text)
+        self.assertIn("<b>Return:</b>", text)
+        self.assertIn("<b>Acci\u00F3n manual:</b>", text)
         self.assertIn("Paper-only", text)
+        self.assertIn("No orden real enviada", text)
+        # No raw event_type underscore form.
+        self.assertNotIn("TAKE_PROFIT", text)
+        # No raw JSON dump.
+        self.assertNotIn("{", text)
+        self.assertNotIn("}", text)
 
     def test_uses_mocked_http_only(self) -> None:
         # End-to-end network safety: block sockets and rely on injected sender.
@@ -414,7 +429,9 @@ class NotifyCryptoPaperTelegramBootstrapTests(unittest.TestCase):
             "symbol": "BTCUSDT",
             "side": "BUY",
             "status": "REJECTED",
-            "reason": "risk:cash_insufficient",
+            # Non-noisy reason so the default cash_insufficient filter does
+            # not drop this row in tests that exercise dedupe behavior.
+            "reason": "risk:exposure_limit",
             "reference_price": 76323.24,
             "requested_notional": 25.0,
             "created_at": "2026-04-30T23:00:09",
@@ -554,6 +571,330 @@ class NotifyCryptoPaperTelegramBootstrapTests(unittest.TestCase):
         self.assertNotIn(CHAT_ID, encoded)
         state_path = Path(result["state_path"])
         self.assertNotIn(BOT_TOKEN, state_path.read_text(encoding="utf-8"))
+
+
+class NotifyCryptoPaperTelegramUXTests(unittest.TestCase):
+    """Format/UX/filter behavior tests for the action-card notifier output."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_buy_filled_card_uses_concise_html_action_format(self) -> None:
+        event = {
+            "event_id": "buy:1",
+            "event_type": "BUY_FILLED_PAPER",
+            "severity": "ACTION",
+            "symbol": "BTCUSDT",
+            "human_title": "Paper BUY filled BTCUSDT",
+            "manual_action": "...",
+            "metadata": {
+                "fill_price": 76026.524265,
+                "gross_notional": 25.0,
+                "stop_loss": 74840.444,
+                "take_profit": 77131.478,
+                "quote_asset": "USDT",
+            },
+        }
+        text = format_event_message(event)
+        self.assertIn("\U0001F7E2", text)  # green circle emoji
+        self.assertIn("<b>PAPER BUY \u2014 BTCUSDT</b>", text)
+        self.assertIn("<b>Acci\u00F3n manual:</b>", text)
+        self.assertIn("Revisar compra manual. No ejecutar autom\u00E1tico.", text)
+        self.assertIn("<b>Precio ref:</b> 76,026.52", text)
+        self.assertIn("<b>Monto paper:</b> 25.00 USDT", text)
+        self.assertIn("<b>Stop loss:</b> 74,840.44", text)
+        self.assertIn("<b>Take profit:</b> 77,131.48", text)
+        self.assertIn("<b>Estado:</b>", text)
+        self.assertIn("Paper-only \u00B7 Manual-review", text)
+        # Concise: no JSON, no severity tag, no event_type underscore.
+        self.assertNotIn("BUY_FILLED_PAPER", text)
+        self.assertNotIn("[ACTION]", text)
+        self.assertNotIn("{", text)
+        self.assertNotIn("}", text)
+
+    def test_take_profit_card_uses_concise_html_action_format(self) -> None:
+        event = {
+            "event_id": "tp:1",
+            "event_type": "TAKE_PROFIT",
+            "severity": "ACTION",
+            "symbol": "BTCUSDT",
+            "human_title": "Paper TAKE-PROFIT exit: BTCUSDT",
+            "manual_action": "...",
+            "metadata": {
+                "trigger_price": 77131.478,
+                "fill_price": 77092.91,
+                "realized_pnl": 0.64,
+                "entry_average_price": 76286.22,
+                "return_pct": 0.0086,
+                "quote_asset": "USDT",
+            },
+        }
+        text = format_event_message(event)
+        self.assertIn("\u2705", text)  # white check mark
+        self.assertIn("<b>TAKE PROFIT \u2014 BTCUSDT</b>", text)
+        self.assertIn("Si copiaste este trade, revisar toma de ganancia.", text)
+        self.assertIn("<b>Entry promedio:</b> 76,286.22", text)
+        self.assertIn("<b>Exit paper:</b> 77,092.91", text)
+        self.assertIn("<b>P&amp;L realizado:</b> +0.64 USDT", text)
+        self.assertIn("<b>Return:</b> +0.86%", text)
+        self.assertIn("Paper-only \u00B7 No orden real enviada", text)
+        self.assertNotIn("TAKE_PROFIT", text)
+
+    def test_stop_loss_card_uses_concise_html_action_format(self) -> None:
+        event = {
+            "event_id": "sl:1",
+            "event_type": "STOP_LOSS",
+            "severity": "ACTION",
+            "symbol": "ETHUSDT",
+            "human_title": "Paper STOP-LOSS exit: ETHUSDT",
+            "manual_action": "...",
+            "metadata": {
+                "trigger_price": 3000.0,
+                "fill_price": 2987.5,
+                "realized_pnl": -1.25,
+                "entry_average_price": 3050.0,
+                "return_pct": -0.0205,
+                "quote_asset": "USDT",
+            },
+        }
+        text = format_event_message(event)
+        self.assertIn("\U0001F534", text)  # red circle
+        self.assertIn("<b>STOP LOSS \u2014 ETHUSDT</b>", text)
+        self.assertIn("Si copiaste este trade, revisar cierre o reducci\u00F3n.", text)
+        self.assertIn("<b>Entry promedio:</b> 3,050.00", text)
+        self.assertIn("<b>Exit paper:</b> 2,987.50", text)
+        # Negative PnL must use minus and absolute value.
+        self.assertIn("<b>P&amp;L realizado:</b> \u22121.25 USDT", text)
+        self.assertIn("<b>Return:</b> \u22122.05%", text)
+        self.assertIn("Paper-only \u00B7 No orden real enviada", text)
+        self.assertNotIn("STOP_LOSS", text)
+
+    def test_daily_summary_uses_concise_summary_card(self) -> None:
+        from src.tools.notify_crypto_paper_telegram import format_daily_summary
+
+        summary = {
+            "snapshot": {
+                "equity": 100.642,
+                "cash": 100.642,
+                "realized_pnl": 0.64,
+                "unrealized_pnl": 0.0,
+            },
+            "performance": {
+                "closed_trades_count": 3,
+                "win_rate": 1.0,
+                "take_profit_count": 3,
+                "stop_loss_count": 0,
+                "total_fees": 0.15,
+            },
+            "rejected_orders_count": 8,
+            "warnings": ["small_sample_size:closed_trades=3_below_min_30"],
+        }
+        text = format_daily_summary(summary, self.now)
+        self.assertIn("\U0001F4CA", text)  # bar chart emoji
+        self.assertIn("<b>Crypto Paper Summary</b>", text)
+        self.assertIn("<b>Equity:</b> 100.64 USDT", text)
+        self.assertIn("<b>P&amp;L realizado:</b> +0.64 USDT", text)
+        self.assertIn("<b>Trades cerrados:</b> 3", text)
+        self.assertIn("<b>Win rate:</b> 100%", text)
+        self.assertIn("<b>Take profits:</b> 3", text)
+        self.assertIn("<b>Stop losses:</b> 0", text)
+        self.assertIn("<b>Fees:</b> 0.15 USDT", text)
+        self.assertIn("\u00D3rdenes rechazadas:</b> 8", text)
+        self.assertIn("Muestra chica: menos de 30 trades cerrados.", text)
+        self.assertIn("Paper-only \u00B7 Manual-review", text)
+        self.assertNotIn("DAILY_SUMMARY", text)
+        self.assertNotIn("{", text)
+
+    def test_html_is_escaped_safely(self) -> None:
+        # Hostile content in symbol and reason must not break HTML rendering.
+        event = {
+            "event_id": "x",
+            "event_type": "ORDER_REJECTED",
+            "severity": "WARNING",
+            "symbol": "<script>alert(1)</script>",
+            "metadata": {"reason": "bad & evil <tag>"},
+        }
+        text = format_event_message(event)
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("bad &amp; evil &lt;tag&gt;", text)
+
+    def _seed_rejected_only(self, *, reason: str) -> None:
+        order = {
+            "order_id": f"crypto-paper-order-{reason}",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "REJECTED",
+            "reason": reason,
+            "reference_price": 76000.0,
+            "requested_notional": 25.0,
+            "created_at": "2026-04-30T23:00:09",
+            "metadata": {},
+        }
+        (self.artifacts_dir / "crypto_paper_orders.json").write_text(
+            json.dumps([order]), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_snapshot.json").write_text(
+            json.dumps({"equity": 100.0, "positions": []}), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_positions.json").write_text(
+            "[]", encoding="utf-8"
+        )
+
+    def test_order_rejected_cash_insufficient_is_filtered_by_default(self) -> None:
+        self._seed_rejected_only(reason="risk:cash_insufficient")
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            min_severity="WARNING",
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(sender.calls, [])
+        self.assertEqual(len(result["sent"]), 0)
+
+    def test_order_rejected_other_reasons_are_sent_by_default(self) -> None:
+        self._seed_rejected_only(reason="risk:exposure_limit")
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            min_severity="WARNING",
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("ORDEN RECHAZADA", sender.calls[0]["text"])
+        self.assertIn("risk:exposure_limit", sender.calls[0]["text"])
+
+    def test_include_order_rejected_sends_cash_insufficient_too(self) -> None:
+        self._seed_rejected_only(reason="risk:cash_insufficient")
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            min_severity="WARNING",
+            include_order_rejected=True,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("ORDEN RECHAZADA", sender.calls[0]["text"])
+        self.assertIn("risk:cash_insufficient", sender.calls[0]["text"])
+
+    def test_default_sender_passes_html_parse_mode(self) -> None:
+        # The default sender wraps send_telegram_message with parse_mode=HTML.
+        captured: dict[str, Any] = {}
+
+        def _capture_opener(req, timeout=None):  # noqa: ANN001
+            captured["url"] = req.full_url
+            captured["data"] = req.data
+
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def read(self):
+                    return b'{"ok": true}'
+
+            return _Resp()
+
+        # Import inside test to avoid leaking module state if patched elsewhere.
+        from src.notifications.telegram_notifier import send_telegram_message
+
+        send_telegram_message(
+            bot_token=BOT_TOKEN,
+            chat_id=CHAT_ID,
+            text="<b>hi</b>",
+            parse_mode="HTML",
+            opener=_capture_opener,
+        )
+        payload = json.loads(captured["data"].decode("utf-8"))
+        self.assertEqual(payload.get("parse_mode"), "HTML")
+        self.assertEqual(payload.get("chat_id"), CHAT_ID)
+        self.assertEqual(payload.get("text"), "<b>hi</b>")
+
+    def test_messages_do_not_include_raw_metadata_json(self) -> None:
+        # A complete dry-run against a TAKE_PROFIT seed yields a card without
+        # any JSON metadata leaking into the chat text.
+        fill = {
+            "fill_id": "f1",
+            "order_id": "o1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": 0.001,
+            "fill_price": 76286.22,
+            "gross_notional": 76.28622,
+            "fee": 0.075,
+            "filled_at": "2026-05-03T15:00:00",
+            "metadata": {"stop_loss": 74840.0, "take_profit": 77131.478},
+        }
+        exit_event = {
+            "exit_id": "e1",
+            "symbol": "BTCUSDT",
+            "exit_reason": "TAKE_PROFIT",
+            "exit_quantity": 0.001,
+            "trigger_price": 77131.478,
+            "fill_price": 77092.91,
+            "realized_pnl": 0.64,
+            "fee": 0.075,
+            "exited_at": "2026-05-03T17:45:00",
+            "metadata": {"stop_loss": 74840.0, "take_profit": 77131.478},
+        }
+        (self.artifacts_dir / "crypto_paper_fills.json").write_text(
+            json.dumps([fill]), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_exit_events.json").write_text(
+            json.dumps([exit_event]), encoding="utf-8"
+        )
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        for call in sender.calls:
+            text = call["text"]
+            self.assertNotIn('"event_id"', text)
+            self.assertNotIn('"metadata"', text)
+            self.assertNotIn("{", text)
+            self.assertNotIn("}", text)
+
+    def test_token_is_never_logged_in_messages_or_state(self) -> None:
+        self._seed_rejected_only(reason="risk:exposure_limit")
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            min_severity="WARNING",
+            now=self.now,
+        )
+        encoded = json.dumps({k: v for k, v in result.items() if k != "messages"})
+        self.assertNotIn(BOT_TOKEN, encoded)
+        for call in sender.calls:
+            self.assertNotIn(BOT_TOKEN, call["text"])
+        state_path = Path(result["state_path"])
+        if state_path.exists():
+            self.assertNotIn(BOT_TOKEN, state_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

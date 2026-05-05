@@ -163,6 +163,49 @@ class TelegramNotifierTests(unittest.TestCase):
         with self.assertRaises(TelegramConfigError):
             send_telegram_message(bot_token=self.BOT_TOKEN, chat_id="", text="hi")
 
+    def test_send_with_html_parse_mode_includes_field_in_payload(self) -> None:
+        captured: dict = {}
+
+        def fake_opener(req, timeout):  # noqa: ANN001
+            captured["data"] = req.data
+            return _FakeResponse(json.dumps({"ok": True, "result": {}}).encode("utf-8"))
+
+        send_telegram_message(
+            bot_token=self.BOT_TOKEN,
+            chat_id=self.CHAT_ID,
+            text="<b>hi</b>",
+            parse_mode="HTML",
+            opener=fake_opener,
+        )
+        body = json.loads(captured["data"].decode("utf-8"))
+        self.assertEqual(body["parse_mode"], "HTML")
+        self.assertEqual(body["text"], "<b>hi</b>")
+
+    def test_send_without_parse_mode_omits_field(self) -> None:
+        captured: dict = {}
+
+        def fake_opener(req, timeout):  # noqa: ANN001
+            captured["data"] = req.data
+            return _FakeResponse(json.dumps({"ok": True, "result": {}}).encode("utf-8"))
+
+        send_telegram_message(
+            bot_token=self.BOT_TOKEN,
+            chat_id=self.CHAT_ID,
+            text="plain",
+            opener=fake_opener,
+        )
+        body = json.loads(captured["data"].decode("utf-8"))
+        self.assertNotIn("parse_mode", body)
+
+    def test_invalid_parse_mode_raises_config_error(self) -> None:
+        with self.assertRaises(TelegramConfigError):
+            send_telegram_message(
+                bot_token=self.BOT_TOKEN,
+                chat_id=self.CHAT_ID,
+                text="hi",
+                parse_mode="HTMLX",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

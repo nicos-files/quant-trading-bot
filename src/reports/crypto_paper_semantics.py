@@ -169,7 +169,12 @@ def build_semantic_layer(
         _emit_buy_filled_events(fills=fills, created_at=moment_iso, events=events)
     )
     sources.extend(
-        _emit_exit_events(exit_events=exit_events, created_at=moment_iso, events=events)
+        _emit_exit_events(
+            exit_events=exit_events,
+            fills=fills,
+            created_at=moment_iso,
+            events=events,
+        )
     )
     sources.extend(
         _emit_position_open_events(positions=positions, created_at=moment_iso, events=events)
@@ -310,13 +315,14 @@ def _emit_buy_filled_events(
             continue
         fill_id = str(fill.get("fill_id") or "")
         filled_at = str(fill.get("filled_at") or "")
+        symbol = str(fill.get("symbol") or "")
         events.append(
             _build_event(
                 event_id=f"buy:{fill_id}:{filled_at}",
                 event_type="BUY_FILLED_PAPER",
-                symbol=str(fill.get("symbol") or ""),
+                symbol=symbol,
                 action="REVIEW_BUY",
-                human_title=f"Paper BUY filled {fill.get('symbol')}",
+                human_title=f"Paper BUY filled {symbol}",
                 human_message=(
                     f"Paper BUY filled {fill.get('quantity')} @ "
                     f"{_format_price(fill.get('fill_price'))} "
@@ -340,6 +346,7 @@ def _emit_buy_filled_events(
                     "fee": fill.get("fee"),
                     "stop_loss": (fill.get("metadata") or {}).get("stop_loss"),
                     "take_profit": (fill.get("metadata") or {}).get("take_profit"),
+                    "quote_asset": _quote_asset_from_symbol(symbol),
                     "occurred_at": filled_at,
                 },
             )
@@ -351,6 +358,7 @@ def _emit_buy_filled_events(
 def _emit_exit_events(
     *,
     exit_events: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
     created_at: str,
     events: list[dict[str, Any]],
 ) -> list[str]:
@@ -363,21 +371,29 @@ def _emit_exit_events(
             continue
         exit_id = str(exit_event.get("exit_id") or "")
         exited_at = str(exit_event.get("exited_at") or "")
+        symbol = str(exit_event.get("symbol") or "")
         title = "Paper TAKE-PROFIT exit" if reason == "TAKE_PROFIT" else "Paper STOP-LOSS exit"
         manual = (
             "Paper take-profit closed. Consider closing your live position if you mirrored the entry."
             if reason == "TAKE_PROFIT"
             else "Paper stop-loss closed. Consider closing your live position if you mirrored the entry."
         )
+        entry_average_price = _avg_buy_entry_price(
+            fills=fills, symbol=symbol, before_iso=exited_at
+        )
+        return_pct = _return_pct(
+            entry_price=entry_average_price,
+            exit_price=exit_event.get("fill_price"),
+        )
         events.append(
             _build_event(
                 event_id=f"{reason.lower()}:{exit_id}:{exited_at}",
                 event_type=reason,
-                symbol=str(exit_event.get("symbol") or ""),
+                symbol=symbol,
                 action="REVIEW_EXIT",
-                human_title=f"{title}: {exit_event.get('symbol')}",
+                human_title=f"{title}: {symbol}",
                 human_message=(
-                    f"{title} for {exit_event.get('symbol')} at "
+                    f"{title} for {symbol} at "
                     f"{_format_price(exit_event.get('fill_price'))} "
                     f"(trigger {_format_price(exit_event.get('trigger_price'))}). "
                     f"Realized P&L {_format_price(exit_event.get('realized_pnl'))}. "
@@ -396,6 +412,9 @@ def _emit_exit_events(
                     "source": exit_event.get("source"),
                     "stop_loss": (exit_event.get("metadata") or {}).get("stop_loss"),
                     "take_profit": (exit_event.get("metadata") or {}).get("take_profit"),
+                    "entry_average_price": entry_average_price,
+                    "return_pct": return_pct,
+                    "quote_asset": _quote_asset_from_symbol(symbol),
                     "occurred_at": exited_at,
                 },
             )
@@ -811,6 +830,75 @@ def _format_price(value: Any) -> str:
     if parsed is None:
         return "n/a"
     return f"{parsed:,.6f}".rstrip("0").rstrip(".")
+
+
+_QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
+    "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USD", "EUR", "BTC", "ETH", "BNB",
+)
+
+
+def _quote_asset_from_symbol(symbol: str) -> str | None:
+    """Best-effort quote-asset extraction for Binance-style spot symbols.
+
+    Returns ``None`` when the symbol does not match any known suffix; callers
+    must therefore tolerate ``None`` and fall back to a generic label.
+    """
+
+    text = str(symbol or "").upper().strip()
+    if not text:
+        return None
+    for suffix in _QUOTE_ASSET_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            return suffix
+    return None
+
+
+def _avg_buy_entry_price(
+    *,
+    fills: list[dict[str, Any]],
+    symbol: str,
+    before_iso: str,
+) -> float | None:
+    """Quantity-weighted average BUY fill price for ``symbol`` up to ``before_iso``.
+
+    Returns ``None`` when no BUY fill is found. Never invents a number.
+    Strict-less-than-or-equal comparison so a same-timestamp BUY fill is
+    included (paper-forward emits BUY fills before exits).
+    """
+
+    if not symbol or not isinstance(fills, list):
+        return None
+    target_symbol = str(symbol).upper()
+    cutoff = str(before_iso or "")
+    total_qty = 0.0
+    total_value = 0.0
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        if str(fill.get("side") or "").upper() != "BUY":
+            continue
+        if str(fill.get("symbol") or "").upper() != target_symbol:
+            continue
+        filled_at = str(fill.get("filled_at") or "")
+        if cutoff and filled_at and filled_at > cutoff:
+            continue
+        qty = _safe_float(fill.get("quantity"))
+        price = _safe_float(fill.get("fill_price"))
+        if qty is None or price is None or qty <= 0.0:
+            continue
+        total_qty += qty
+        total_value += qty * price
+    if total_qty <= 0.0:
+        return None
+    return total_value / total_qty
+
+
+def _return_pct(*, entry_price: Any, exit_price: Any) -> float | None:
+    entry = _safe_float(entry_price)
+    exit_ = _safe_float(exit_price)
+    if entry is None or exit_ is None or entry == 0.0:
+        return None
+    return (exit_ - entry) / entry
 
 
 def _format_pct(value: Any) -> str:

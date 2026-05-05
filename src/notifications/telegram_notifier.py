@@ -86,11 +86,15 @@ def redact_token(text: str, token: str) -> str:
     return safe
 
 
+_ALLOWED_PARSE_MODES = frozenset({"HTML", "Markdown", "MarkdownV2"})
+
+
 def send_telegram_message(
     *,
     bot_token: str,
     chat_id: str,
     text: str,
+    parse_mode: str | None = None,
     timeout_sec: float = 20.0,
     api_base: str = _TELEGRAM_API_BASE,
     opener: Any = None,
@@ -100,7 +104,11 @@ def send_telegram_message(
     Args:
         bot_token: Bot token. Never logged.
         chat_id: Destination chat id (string or int as string).
-        text: Message body. Plain text, no parse-mode.
+        text: Message body.
+        parse_mode: Optional Telegram parse_mode. One of ``"HTML"``,
+            ``"Markdown"``, ``"MarkdownV2"`` or ``None`` (plain text). When
+            ``"HTML"`` is used the caller is responsible for HTML-escaping
+            user-provided substrings.
         timeout_sec: Network timeout.
         api_base: Override the API base URL (used by tests).
         opener: Optional callable replacing ``urllib.request.urlopen`` for
@@ -111,7 +119,8 @@ def send_telegram_message(
         Parsed JSON response from Telegram. Always contains ``ok`` boolean.
 
     Raises:
-        TelegramConfigError: when token or chat id is empty.
+        TelegramConfigError: when token or chat id is empty, or when
+            ``parse_mode`` is not one of the allowed values.
         TelegramSendError: on transport or API errors. Token redacted.
     """
 
@@ -119,9 +128,16 @@ def send_telegram_message(
         raise TelegramConfigError("send_telegram_message requires a non-empty bot_token")
     if not chat_id or not str(chat_id).strip():
         raise TelegramConfigError("send_telegram_message requires a non-empty chat_id")
+    if parse_mode is not None and parse_mode not in _ALLOWED_PARSE_MODES:
+        raise TelegramConfigError(
+            f"Invalid parse_mode {parse_mode!r}. Allowed: {sorted(_ALLOWED_PARSE_MODES)} or None."
+        )
 
     url = f"{api_base.rstrip('/')}/bot{bot_token}/sendMessage"
-    payload = json.dumps({"chat_id": str(chat_id), "text": str(text)}).encode("utf-8")
+    payload_data: dict[str, Any] = {"chat_id": str(chat_id), "text": str(text)}
+    if parse_mode is not None:
+        payload_data["parse_mode"] = parse_mode
+    payload = json.dumps(payload_data).encode("utf-8")
     req = request.Request(
         url,
         data=payload,

@@ -18,6 +18,7 @@ mirrors signals into a live account, and never contacts a broker.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -47,6 +48,29 @@ _DEFAULT_MIN_SEVERITY = "ACTION"
 _SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_SEVERITIES)}
 _STATE_FILENAME = "telegram_alert_state.json"
 _DAILY_SUMMARY_PREFIX = "daily-summary:"
+
+# Default Telegram parse_mode for outbound alert messages.
+_DEFAULT_PARSE_MODE = "HTML"
+
+# Reasons that mark an ORDER_REJECTED as routine paper-only noise. By default
+# the notifier suppresses these to keep the user's chat actionable; they are
+# still counted in the daily summary's rejected_orders metric.
+_NOISY_REJECTION_REASON_SUBSTRINGS: tuple[str, ...] = (
+    "cash_insufficient",
+)
+
+_EMOJI_BY_EVENT_TYPE: dict[str, str] = {
+    "BUY_FILLED_PAPER": "\U0001F7E2",  # green circle
+    "TAKE_PROFIT": "\u2705",            # white heavy check mark
+    "STOP_LOSS": "\U0001F534",          # red circle
+    "ORDER_REJECTED": "\u26A0\uFE0F",   # warning sign
+    "WARNING": "\u26A0\uFE0F",          # warning sign
+    "ERROR": "\U0001F6A8",              # rotating police light
+    "DAILY_SUMMARY": "\U0001F4CA",      # bar chart
+}
+
+_SPANISH_DISCLAIMER_PAPER_MANUAL = "Paper-only \u00B7 Manual-review"
+_SPANISH_DISCLAIMER_PAPER_NO_REAL = "Paper-only \u00B7 No orden real enviada"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,6 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
             "artifacts directory, to avoid replaying historical alerts."
         ),
     )
+    parser.add_argument(
+        "--include-order-rejected",
+        dest="include_order_rejected",
+        action="store_true",
+        help=(
+            "Send all ORDER_REJECTED events. By default, rejected orders "
+            "whose reason matches a routine pattern (e.g. cash_insufficient) "
+            "are suppressed to reduce noise; they are still counted in the "
+            "daily summary's rejected_orders metric."
+        ),
+    )
     return parser
 
 
@@ -121,6 +156,7 @@ def notify_crypto_paper_telegram(
     force: bool = False,
     rebuild_semantic: bool = False,
     bootstrap_dedupe: bool = False,
+    include_order_rejected: bool = False,
     env: dict[str, str] | None = None,
     sender: Any = None,
     now: datetime | None = None,
@@ -199,6 +235,10 @@ def notify_crypto_paper_telegram(
             continue
         if _SEVERITY_RANK.get(severity, -1) < threshold:
             continue
+        if event_type == "ORDER_REJECTED" and not include_order_rejected:
+            reason = str((event.get("metadata") or {}).get("reason") or "").lower()
+            if any(noise in reason for noise in _NOISY_REJECTION_REASON_SUBSTRINGS):
+                continue
         candidates.append(event)
 
     state = _load_state(resolved_state_path)
@@ -346,92 +386,291 @@ def notify_crypto_paper_telegram(
 
 
 def format_event_message(event: dict[str, Any]) -> str:
+    """Render an event as a concise HTML action card for Telegram.
+
+    The output is suitable for ``parse_mode="HTML"``. All user-derived
+    substrings (symbol, reason) are HTML-escaped. The card is intentionally
+    short and mobile-friendly. No raw JSON, no severity tag, no event_type
+    suffixed with underscores.
+    """
+
     event_type = str(event.get("event_type") or "")
     symbol = str(event.get("symbol") or "")
     metadata = event.get("metadata") or {}
-    severity = str(event.get("severity") or "INFO")
-    lines: list[str] = []
-    head = f"[{severity}] {event_type}"
-    if symbol:
-        head += f" {symbol}"
-    lines.append(head)
-    lines.append(str(event.get("human_title") or event_type))
+    quote = _quote_label(metadata.get("quote_asset"))
 
     if event_type == "BUY_FILLED_PAPER":
-        lines.append(
-            f"qty={_fmt(metadata.get('quantity'))} fill_price={_fmt(metadata.get('fill_price'))} "
-            f"notional={_fmt(metadata.get('gross_notional'))}"
+        return _format_buy_filled_card(symbol=symbol, metadata=metadata, quote=quote)
+    if event_type == "TAKE_PROFIT":
+        return _format_exit_card(
+            symbol=symbol,
+            metadata=metadata,
+            quote=quote,
+            emoji=_EMOJI_BY_EVENT_TYPE["TAKE_PROFIT"],
+            title="TAKE PROFIT",
+            manual_action_es="Si copiaste este trade, revisar toma de ganancia.",
         )
-        sl = metadata.get("stop_loss")
-        tp = metadata.get("take_profit")
-        if sl is not None or tp is not None:
-            lines.append(f"stop={_fmt(sl)} take={_fmt(tp)}")
-    elif event_type in ("TAKE_PROFIT", "STOP_LOSS"):
-        lines.append(
-            f"trigger={_fmt(metadata.get('trigger_price'))} "
-            f"fill={_fmt(metadata.get('fill_price'))} "
-            f"realized_pnl={_fmt(metadata.get('realized_pnl'))}"
+    if event_type == "STOP_LOSS":
+        return _format_exit_card(
+            symbol=symbol,
+            metadata=metadata,
+            quote=quote,
+            emoji=_EMOJI_BY_EVENT_TYPE["STOP_LOSS"],
+            title="STOP LOSS",
+            manual_action_es="Si copiaste este trade, revisar cierre o reducci\u00F3n.",
         )
-        sl = metadata.get("stop_loss")
-        tp = metadata.get("take_profit")
-        if sl is not None or tp is not None:
-            lines.append(f"stop={_fmt(sl)} take={_fmt(tp)}")
-    elif event_type == "ORDER_REJECTED":
-        lines.append(
-            f"reason={metadata.get('reason') or 'unspecified'} "
-            f"notional={_fmt(metadata.get('requested_notional'))}"
-        )
-    elif event_type == "ERROR":
-        # ERROR messages stay short; metadata is captured in the human_message.
-        msg = str(event.get("human_message") or "")
-        if msg:
-            lines.append(msg[:300])
-
-    manual = str(event.get("manual_action") or "").strip()
-    if manual:
-        lines.append(f"Action: {manual}")
-    lines.append(PAPER_DISCLAIMER)
-    return "\n".join(lines)
+    if event_type == "ORDER_REJECTED":
+        return _format_order_rejected_card(symbol=symbol, metadata=metadata)
+    if event_type == "ERROR":
+        return _format_error_card(event=event)
+    if event_type == "WARNING":
+        return _format_warning_card(event=event)
+    # Fallback: minimal card from the human title + manual action.
+    return _format_generic_card(event=event)
 
 
 def format_daily_summary(summary: dict[str, Any], moment: datetime) -> str:
+    """Render the daily portfolio summary as a concise HTML card."""
+
     snapshot = summary.get("snapshot") or {}
     performance = summary.get("performance") or {}
+    quote = _quote_label((snapshot.get("quote_asset") if isinstance(snapshot, dict) else None) or "USDT")
+    rejected_count = summary.get("rejected_orders_count")
+
+    lines: list[str] = []
+    lines.append(f"{_EMOJI_BY_EVENT_TYPE['DAILY_SUMMARY']} <b>Crypto Paper Summary</b>")
+    lines.append("")
+    lines.append(f"<b>Equity:</b> {_fmt_amount(snapshot.get('equity'))} {quote}")
+    lines.append(
+        f"<b>P&amp;L realizado:</b> {_fmt_signed_amount(snapshot.get('realized_pnl'))} {quote}"
+    )
+    lines.append(f"<b>Trades cerrados:</b> {_fmt_int(performance.get('closed_trades_count'))}")
+    lines.append(f"<b>Win rate:</b> {_fmt_pct_int(performance.get('win_rate'))}")
+    lines.append(f"<b>Take profits:</b> {_fmt_int(performance.get('take_profit_count'))}")
+    lines.append(f"<b>Stop losses:</b> {_fmt_int(performance.get('stop_loss_count'))}")
+    lines.append(f"<b>Fees:</b> {_fmt_amount(performance.get('total_fees'))} {quote}")
+    if rejected_count is not None and int(rejected_count or 0) > 0:
+        lines.append(f"<b>\u00D3rdenes rechazadas:</b> {_fmt_int(rejected_count)}")
+
+    small_sample = _small_sample_warning(summary)
+    if small_sample:
+        lines.append("")
+        lines.append(
+            f"{_EMOJI_BY_EVENT_TYPE['WARNING']} "
+            f"Muestra chica: menos de 30 trades cerrados."
+        )
+    lines.append("")
+    lines.append(f"<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    return "\n".join(lines)
+
+
+# --- Action-card renderers --------------------------------------------------
+
+
+def _format_buy_filled_card(
+    *, symbol: str, metadata: dict[str, Any], quote: str
+) -> str:
+    title = f"PAPER BUY \u2014 {html.escape(symbol)}"
+    fill_price = metadata.get("fill_price")
+    gross_notional = metadata.get("gross_notional")
+    sl = metadata.get("stop_loss")
+    tp = metadata.get("take_profit")
     lines = [
-        f"[INFO] DAILY_SUMMARY ({moment.strftime('%Y-%m-%d')})",
-        f"equity={_fmt(snapshot.get('equity'))} cash={_fmt(snapshot.get('cash'))} "
-        f"realized={_fmt(snapshot.get('realized_pnl'))} unrealized={_fmt(snapshot.get('unrealized_pnl'))}",
-        f"closed_trades={performance.get('closed_trades_count')} "
-        f"win_rate={_fmt_pct(performance.get('win_rate'))} "
-        f"take_profits={performance.get('take_profit_count')} "
-        f"stop_losses={performance.get('stop_loss_count')}",
-        PAPER_DISCLAIMER,
+        f"{_EMOJI_BY_EVENT_TYPE['BUY_FILLED_PAPER']} <b>{title}</b>",
+        "",
+        "<b>Acci\u00F3n manual:</b>",
+        "Revisar compra manual. No ejecutar autom\u00E1tico.",
+        "",
+        f"<b>Precio ref:</b> {_fmt_price(fill_price)}",
+        f"<b>Monto paper:</b> {_fmt_amount(gross_notional)} {quote}",
+    ]
+    if sl is not None:
+        lines.append(f"<b>Stop loss:</b> {_fmt_price(sl)}")
+    if tp is not None:
+        lines.append(f"<b>Take profit:</b> {_fmt_price(tp)}")
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    return "\n".join(lines)
+
+
+def _format_exit_card(
+    *,
+    symbol: str,
+    metadata: dict[str, Any],
+    quote: str,
+    emoji: str,
+    title: str,
+    manual_action_es: str,
+) -> str:
+    head = f"{title} \u2014 {html.escape(symbol)}"
+    entry = metadata.get("entry_average_price")
+    exit_price = metadata.get("fill_price")
+    realized = metadata.get("realized_pnl")
+    return_pct = metadata.get("return_pct")
+    lines = [
+        f"{emoji} <b>{head}</b>",
+        "",
+        "<b>Acci\u00F3n manual:</b>",
+        manual_action_es,
+        "",
+        f"<b>Entry promedio:</b> {_fmt_price(entry)}",
+        f"<b>Exit paper:</b> {_fmt_price(exit_price)}",
+        f"<b>P&amp;L realizado:</b> {_fmt_signed_amount(realized)} {quote}",
+    ]
+    if return_pct is not None:
+        lines.append(f"<b>Return:</b> {_fmt_signed_pct(return_pct)}")
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_PAPER_NO_REAL)
+    return "\n".join(lines)
+
+
+def _format_order_rejected_card(*, symbol: str, metadata: dict[str, Any]) -> str:
+    head = f"ORDEN RECHAZADA \u2014 {html.escape(symbol)}"
+    reason = str(metadata.get("reason") or "unspecified")
+    lines = [
+        f"{_EMOJI_BY_EVENT_TYPE['ORDER_REJECTED']} <b>{head}</b>",
+        "",
+        "<b>Motivo:</b>",
+        html.escape(reason),
+        "",
+        "<b>Acci\u00F3n manual:</b>",
+        "No copiar autom\u00E1ticamente. Revisar s\u00F3lo si se repite demasiado.",
+        "",
+        "<b>Estado:</b>",
+        "Paper-only",
     ]
     return "\n".join(lines)
 
 
-def _fmt(value: Any) -> str:
+def _format_error_card(*, event: dict[str, Any]) -> str:
+    title = str(event.get("human_title") or "ERROR")
+    manual = str(event.get("manual_action") or "Investigar logs.")
+    short_message = str(event.get("human_message") or "")[:240]
+    lines = [
+        f"{_EMOJI_BY_EVENT_TYPE['ERROR']} <b>{html.escape(title)}</b>",
+        "",
+        "<b>Acci\u00F3n manual:</b>",
+        html.escape(manual),
+    ]
+    if short_message:
+        lines.extend(["", html.escape(short_message)])
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    return "\n".join(lines)
+
+
+def _format_warning_card(*, event: dict[str, Any]) -> str:
+    title = str(event.get("human_title") or "Warning")
+    metadata = event.get("metadata") or {}
+    raw = str(metadata.get("raw_warning") or event.get("human_message") or "")[:240]
+    lines = [
+        f"{_EMOJI_BY_EVENT_TYPE['WARNING']} <b>{html.escape(title)}</b>",
+        "",
+        html.escape(raw),
+        "",
+        "<b>Estado:</b>",
+        _SPANISH_DISCLAIMER_PAPER_MANUAL,
+    ]
+    return "\n".join(lines)
+
+
+def _format_generic_card(*, event: dict[str, Any]) -> str:
+    title = str(event.get("human_title") or event.get("event_type") or "Event")
+    manual = str(event.get("manual_action") or "").strip()
+    lines = [f"<b>{html.escape(title)}</b>"]
+    if manual:
+        lines.append("")
+        lines.append("<b>Acci\u00F3n manual:</b>")
+        lines.append(html.escape(manual))
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    return "\n".join(lines)
+
+
+# --- Formatting helpers -----------------------------------------------------
+
+
+def _quote_label(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    return text or "USDT"
+
+
+def _small_sample_warning(summary: dict[str, Any]) -> bool:
+    warnings = summary.get("warnings") or []
+    for warning in warnings:
+        text = str(warning or "")
+        if text.startswith("small_sample_size:"):
+            return True
+    return False
+
+
+def _fmt_price(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed:,.2f}"
+
+
+def _fmt_amount(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed:,.2f}"
+
+
+def _fmt_signed_amount(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    sign = "+" if parsed >= 0 else "\u2212"  # minus sign for negatives
+    return f"{sign}{abs(parsed):,.2f}"
+
+
+def _fmt_signed_pct(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    sign = "+" if parsed >= 0 else "\u2212"
+    return f"{sign}{abs(parsed) * 100.0:.2f}%"
+
+
+def _fmt_pct_int(value: Any) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "n/a"
+    return f"{round(parsed * 100.0)}%"
+
+
+def _fmt_int(value: Any) -> str:
     if value is None:
         return "n/a"
     try:
-        parsed = float(value)
+        return str(int(value))
     except (TypeError, ValueError):
         return str(value)
-    return f"{parsed:,.6f}".rstrip("0").rstrip(".")
 
 
-def _fmt_pct(value: Any) -> str:
+def _safe_float(value: Any) -> float | None:
     if value is None:
-        return "n/a"
+        return None
     try:
-        parsed = float(value)
+        return float(value)
     except (TypeError, ValueError):
-        return str(value)
-    return f"{parsed * 100.0:.2f}%"
+        return None
 
 
 def _default_sender(*, bot_token: str, chat_id: str, text: str) -> dict[str, Any]:
-    return send_telegram_message(bot_token=bot_token, chat_id=chat_id, text=text)
+    return send_telegram_message(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        text=text,
+        parse_mode=_DEFAULT_PARSE_MODE,
+    )
 
 
 def _load_or_build_semantic_layer(
@@ -501,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
         force=bool(args.force),
         rebuild_semantic=bool(args.rebuild_semantic),
         bootstrap_dedupe=bool(args.bootstrap_dedupe),
+        include_order_rejected=bool(args.include_order_rejected),
     )
     sys.stdout.write(
         json.dumps(

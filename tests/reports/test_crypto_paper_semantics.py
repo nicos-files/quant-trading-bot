@@ -278,5 +278,181 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
         self.assertIsNone(performance["win_rate"])
 
 
+class CryptoPaperSemanticsExitEnrichmentTests(unittest.TestCase):
+    """Verify exit events expose entry_average_price, return_pct, quote_asset."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, relative_path: str, payload) -> None:
+        path = self.artifacts_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_take_profit_metadata_includes_entry_avg_and_return_pct(self) -> None:
+        # Three BUY fills at different prices, then a TAKE_PROFIT exit. The
+        # weighted-average entry is the qty-weighted mean of the three fills.
+        self._write(
+            "crypto_paper_fills.json",
+            [
+                {
+                    "fill_id": "f1",
+                    "order_id": "o1",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 1.0,
+                    "fill_price": 76000.0,
+                    "gross_notional": 76000.0,
+                    "fee": 0.0,
+                    "filled_at": "2026-05-01T10:00:00",
+                    "metadata": {},
+                },
+                {
+                    "fill_id": "f2",
+                    "order_id": "o2",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 2.0,
+                    "fill_price": 76600.0,
+                    "gross_notional": 153200.0,
+                    "fee": 0.0,
+                    "filled_at": "2026-05-02T10:00:00",
+                    "metadata": {},
+                },
+                # A future BUY fill that must be ignored when computing the
+                # exit's entry average.
+                {
+                    "fill_id": "f3-future",
+                    "order_id": "o3",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 1.0,
+                    "fill_price": 90000.0,
+                    "gross_notional": 90000.0,
+                    "fee": 0.0,
+                    "filled_at": "2026-05-04T10:00:00",
+                    "metadata": {},
+                },
+            ],
+        )
+        self._write(
+            "crypto_paper_exit_events.json",
+            [
+                {
+                    "exit_id": "e1",
+                    "symbol": "BTCUSDT",
+                    "exit_reason": "TAKE_PROFIT",
+                    "exit_quantity": 3.0,
+                    "trigger_price": 77131.478,
+                    "fill_price": 77092.91,
+                    "realized_pnl": 1078.94,
+                    "fee": 0.5,
+                    "exited_at": "2026-05-03T17:45:00",
+                    "metadata": {"stop_loss": 74840.0, "take_profit": 77131.478},
+                }
+            ],
+        )
+        result = build_semantic_layer(
+            artifacts_dir=self.artifacts_dir,
+            output_dir=self.artifacts_dir / "semantic",
+            write=False,
+            now=self.now,
+        )
+        events = [e for e in result["events"] if e["event_type"] == "TAKE_PROFIT"]
+        self.assertEqual(len(events), 1)
+        meta = events[0]["metadata"]
+        # qty-weighted: (1*76000 + 2*76600) / 3 == 76400
+        self.assertAlmostEqual(meta["entry_average_price"], 76400.0, places=2)
+        self.assertAlmostEqual(
+            meta["return_pct"], (77092.91 - 76400.0) / 76400.0, places=6
+        )
+        self.assertEqual(meta["quote_asset"], "USDT")
+
+    def test_exit_without_prior_fills_keeps_entry_none(self) -> None:
+        # No BUY fills before the exit -> entry_average_price must be None.
+        self._write(
+            "crypto_paper_fills.json",
+            [
+                {
+                    "fill_id": "f1",
+                    "order_id": "o1",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 1.0,
+                    "fill_price": 76000.0,
+                    "gross_notional": 76000.0,
+                    "fee": 0.0,
+                    "filled_at": "2026-05-04T10:00:00",
+                    "metadata": {},
+                },
+            ],
+        )
+        self._write(
+            "crypto_paper_exit_events.json",
+            [
+                {
+                    "exit_id": "e1",
+                    "symbol": "BTCUSDT",
+                    "exit_reason": "STOP_LOSS",
+                    "exit_quantity": 1.0,
+                    "trigger_price": 70000.0,
+                    "fill_price": 69500.0,
+                    "realized_pnl": -1500.0,
+                    "fee": 0.5,
+                    "exited_at": "2026-05-03T17:45:00",
+                    "metadata": {},
+                }
+            ],
+        )
+        result = build_semantic_layer(
+            artifacts_dir=self.artifacts_dir,
+            output_dir=self.artifacts_dir / "semantic",
+            write=False,
+            now=self.now,
+        )
+        events = [e for e in result["events"] if e["event_type"] == "STOP_LOSS"]
+        self.assertEqual(len(events), 1)
+        meta = events[0]["metadata"]
+        self.assertIsNone(meta["entry_average_price"])
+        self.assertIsNone(meta["return_pct"])
+
+    def test_buy_filled_metadata_includes_quote_asset(self) -> None:
+        self._write(
+            "crypto_paper_fills.json",
+            [
+                {
+                    "fill_id": "f1",
+                    "order_id": "o1",
+                    "symbol": "ETHUSDT",
+                    "side": "BUY",
+                    "quantity": 0.01,
+                    "fill_price": 3000.0,
+                    "gross_notional": 30.0,
+                    "fee": 0.0,
+                    "filled_at": "2026-05-01T10:00:00",
+                    "metadata": {},
+                }
+            ],
+        )
+        result = build_semantic_layer(
+            artifacts_dir=self.artifacts_dir,
+            output_dir=self.artifacts_dir / "semantic",
+            write=False,
+            now=self.now,
+        )
+        events = [e for e in result["events"] if e["event_type"] == "BUY_FILLED_PAPER"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["metadata"]["quote_asset"], "USDT")
+
+
 if __name__ == "__main__":
     unittest.main()

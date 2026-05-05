@@ -26,4 +26,5 @@ __pycache__/
 requirements-dev.txt
 
 venv
-/driver
+/driver.env.crypto_paper
+.env.crypto_paper
