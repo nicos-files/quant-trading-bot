@@ -36,13 +36,18 @@ from src.notifications.telegram_notifier import (
 )
 from src.reports.crypto_paper_semantics import (
     ALERTABLE_EVENT_TYPES,
+    DEFAULT_CRYPTO_LOCAL_TZ,
     PAPER_DISCLAIMER,
     SEMANTIC_SEVERITIES,
+    SIGNAL_ONLY_EVENT_TYPE,
     build_semantic_layer,
+    local_display_for_iso,
 )
 
 
 ENABLE_FLAG = "ENABLE_CRYPTO_TELEGRAM_ALERTS"
+ENABLE_SIGNAL_ONLY_FLAG = "ENABLE_CRYPTO_SIGNAL_ONLY_ALERTS"
+LOCAL_TZ_ENV = "CRYPTO_LOCAL_TZ"
 
 _DEFAULT_MIN_SEVERITY = "ACTION"
 _SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_SEVERITIES)}
@@ -61,6 +66,7 @@ _NOISY_REJECTION_REASON_SUBSTRINGS: tuple[str, ...] = (
 
 _EMOJI_BY_EVENT_TYPE: dict[str, str] = {
     "BUY_FILLED_PAPER": "\U0001F7E2",  # green circle
+    "SIGNAL_ONLY": "\U0001F7E1",        # yellow circle (visually distinct from PAPER BUY)
     "TAKE_PROFIT": "\u2705",            # white heavy check mark
     "STOP_LOSS": "\U0001F534",          # red circle
     "ORDER_REJECTED": "\u26A0\uFE0F",   # warning sign
@@ -68,6 +74,8 @@ _EMOJI_BY_EVENT_TYPE: dict[str, str] = {
     "ERROR": "\U0001F6A8",              # rotating police light
     "DAILY_SUMMARY": "\U0001F4CA",      # bar chart
 }
+
+_SPANISH_DISCLAIMER_SIGNAL_ONLY = "Signal-only \u00B7 Manual-review"
 
 _SPANISH_DISCLAIMER_PAPER_MANUAL = "Paper-only \u00B7 Manual-review"
 _SPANISH_DISCLAIMER_PAPER_NO_REAL = "Paper-only \u00B7 No orden real enviada"
@@ -160,6 +168,28 @@ def build_parser() -> argparse.ArgumentParser:
             "daily summary's rejected_orders metric."
         ),
     )
+    parser.add_argument(
+        "--include-signal-only",
+        dest="include_signal_only",
+        action="store_true",
+        help=(
+            "Send SIGNAL_ONLY events as concise yellow action cards. "
+            "SIGNAL_ONLY represents 'BUY opportunity detected, paper "
+            "execution did not open a position' (e.g. recommendations_count=1 "
+            "with fills_count=0). Off by default to avoid noise. The env "
+            f"{ENABLE_SIGNAL_ONLY_FLAG}=1 enables it without --include-signal-only."
+        ),
+    )
+    parser.add_argument(
+        "--local-tz",
+        dest="local_tz",
+        default=None,
+        help=(
+            "Local timezone used for the 'Hora local' line in alert cards. "
+            f"Defaults to env {LOCAL_TZ_ENV} or {DEFAULT_CRYPTO_LOCAL_TZ}. "
+            "UTC archive ids are not affected."
+        ),
+    )
     return parser
 
 
@@ -175,6 +205,8 @@ def notify_crypto_paper_telegram(
     rebuild_semantic: bool = False,
     bootstrap_dedupe: bool = False,
     include_order_rejected: bool = False,
+    include_signal_only: bool = False,
+    local_tz: str | None = None,
     env: dict[str, str] | None = None,
     sender: Any = None,
     now: datetime | None = None,
@@ -214,6 +246,18 @@ def notify_crypto_paper_telegram(
 
     source_env = env if env is not None else os.environ
 
+    # Resolve include_signal_only via CLI/explicit kwarg or env opt-in.
+    if not include_signal_only and str(
+        source_env.get(ENABLE_SIGNAL_ONLY_FLAG) or ""
+    ).strip() == "1":
+        include_signal_only = True
+
+    resolved_local_tz = (
+        str(local_tz).strip()
+        if local_tz
+        else str(source_env.get(LOCAL_TZ_ENV) or DEFAULT_CRYPTO_LOCAL_TZ)
+    )
+
     artifacts_root = Path(artifacts_dir)
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     semantic_dir = artifacts_root / "semantic"
@@ -249,18 +293,29 @@ def notify_crypto_paper_telegram(
     events = list(semantic_layer.get("events") or [])
 
     threshold = _SEVERITY_RANK[min_severity]
+    # SIGNAL_ONLY is only alertable when the user opts in. When opted in, we
+    # bypass the global min_severity threshold for this type so the default
+    # ACTION threshold does not silently drop INFO-severity SIGNAL_ONLY events.
+    effective_alertable_types: set[str] = set(ALERTABLE_EVENT_TYPES)
+    if include_signal_only:
+        effective_alertable_types.add(SIGNAL_ONLY_EVENT_TYPE)
     candidates: list[dict[str, Any]] = []
     pre_filtered: list[dict[str, Any]] = []  # observability for skipped reasons.
     for event in events:
         event_type = str(event.get("event_type") or "")
         severity = str(event.get("severity") or "INFO")
         event_id = str(event.get("event_id") or "")
-        if event_type not in ALERTABLE_EVENT_TYPES:
-            # Non-alertable events (e.g. NO_ACTION, INFO) are not surfaced in
-            # skipped to avoid drowning the audit log; they were never
-            # candidates for sending in the first place.
+        if event_type not in effective_alertable_types:
+            # Non-alertable events (e.g. NO_ACTION, BUY_SIGNAL, and SIGNAL_ONLY
+            # when --include-signal-only is off) are not surfaced in skipped
+            # to avoid drowning the audit log.
             continue
-        if _SEVERITY_RANK.get(severity, -1) < threshold:
+        # Per-type bypass: SIGNAL_ONLY events skip the min_severity gate when
+        # explicitly opted in. All other types still go through the gate.
+        if (
+            event_type != SIGNAL_ONLY_EVENT_TYPE
+            and _SEVERITY_RANK.get(severity, -1) < threshold
+        ):
             pre_filtered.append({"event_id": event_id, "reason": "below_min_severity"})
             continue
         if event_type == "ORDER_REJECTED" and not include_order_rejected:
@@ -413,7 +468,7 @@ def notify_crypto_paper_telegram(
         if not force and event_id in sent_ids:
             skipped_payload.append({"event_id": event_id, "reason": "already_sent"})
             continue
-        text = format_event_message(event)
+        text = format_event_message(event, local_tz=resolved_local_tz)
         messages.append(text)
         if dry_run:
             sent_payload.append(
@@ -465,7 +520,9 @@ def notify_crypto_paper_telegram(
 
     if will_send_summary and failure_reason is None:
         summary_payload = semantic_layer.get("summary") or {}
-        text = format_daily_summary(summary_payload, moment)
+        text = format_daily_summary(
+            summary_payload, moment, local_tz=resolved_local_tz
+        )
         summary_event_id = f"{_DAILY_SUMMARY_PREFIX}{moment.strftime('%Y-%m-%d')}"
         if not force and summary_event_id in sent_ids:
             skipped_payload.append(
@@ -567,6 +624,8 @@ def notify_crypto_paper_telegram(
         "dry_run": bool(dry_run),
         "daily_summary_only": bool(daily_summary_only),
         "bootstrap_dedupe": False,
+        "include_signal_only": bool(include_signal_only),
+        "local_tz": resolved_local_tz,
         "marked_count": 0,
         "chat_id_masked": chat_id_masked,
         "state_path": str(resolved_state_path),
@@ -577,22 +636,33 @@ def notify_crypto_paper_telegram(
     return result
 
 
-def format_event_message(event: dict[str, Any]) -> str:
+def format_event_message(
+    event: dict[str, Any], *, local_tz: str | None = None
+) -> str:
     """Render an event as a concise HTML action card for Telegram.
 
     The output is suitable for ``parse_mode="HTML"``. All user-derived
     substrings (symbol, reason) are HTML-escaped. The card is intentionally
     short and mobile-friendly. No raw JSON, no severity tag, no event_type
-    suffixed with underscores.
+    suffixed with underscores. When ``local_tz`` is provided, a 'Hora local'
+    / 'UTC' time line is appended; the underlying UTC archive id is unaffected.
     """
 
     event_type = str(event.get("event_type") or "")
     symbol = str(event.get("symbol") or "")
     metadata = event.get("metadata") or {}
     quote = _quote_label(metadata.get("quote_asset"))
+    tz_name = str(local_tz or DEFAULT_CRYPTO_LOCAL_TZ)
+    time_lines = _build_time_lines(event=event, tz_name=tz_name)
 
     if event_type == "BUY_FILLED_PAPER":
-        return _format_buy_filled_card(symbol=symbol, metadata=metadata, quote=quote)
+        return _format_buy_filled_card(
+            symbol=symbol, metadata=metadata, quote=quote, time_lines=time_lines
+        )
+    if event_type == "SIGNAL_ONLY":
+        return _format_signal_only_card(
+            symbol=symbol, metadata=metadata, quote=quote, time_lines=time_lines
+        )
     if event_type == "TAKE_PROFIT":
         return _format_exit_card(
             symbol=symbol,
@@ -601,6 +671,7 @@ def format_event_message(event: dict[str, Any]) -> str:
             emoji=_EMOJI_BY_EVENT_TYPE["TAKE_PROFIT"],
             title="TAKE PROFIT",
             manual_action_es="Si copiaste este trade, revisar toma de ganancia.",
+            time_lines=time_lines,
         )
     if event_type == "STOP_LOSS":
         return _format_exit_card(
@@ -610,24 +681,31 @@ def format_event_message(event: dict[str, Any]) -> str:
             emoji=_EMOJI_BY_EVENT_TYPE["STOP_LOSS"],
             title="STOP LOSS",
             manual_action_es="Si copiaste este trade, revisar cierre o reducci\u00F3n.",
+            time_lines=time_lines,
         )
     if event_type == "ORDER_REJECTED":
-        return _format_order_rejected_card(symbol=symbol, metadata=metadata)
+        return _format_order_rejected_card(
+            symbol=symbol, metadata=metadata, time_lines=time_lines
+        )
     if event_type == "ERROR":
-        return _format_error_card(event=event)
+        return _format_error_card(event=event, time_lines=time_lines)
     if event_type == "WARNING":
-        return _format_warning_card(event=event)
+        return _format_warning_card(event=event, time_lines=time_lines)
     # Fallback: minimal card from the human title + manual action.
-    return _format_generic_card(event=event)
+    return _format_generic_card(event=event, time_lines=time_lines)
 
 
-def format_daily_summary(summary: dict[str, Any], moment: datetime) -> str:
+def format_daily_summary(
+    summary: dict[str, Any], moment: datetime, *, local_tz: str | None = None
+) -> str:
     """Render the daily portfolio summary as a concise HTML card."""
 
     snapshot = summary.get("snapshot") or {}
     performance = summary.get("performance") or {}
     quote = _quote_label((snapshot.get("quote_asset") if isinstance(snapshot, dict) else None) or "USDT")
     rejected_count = summary.get("rejected_orders_count")
+    signal_only_count = summary.get("signal_only_count")
+    tz_name = str(local_tz or DEFAULT_CRYPTO_LOCAL_TZ)
 
     lines: list[str] = []
     lines.append(f"{_EMOJI_BY_EVENT_TYPE['DAILY_SUMMARY']} <b>Crypto Paper Summary</b>")
@@ -643,6 +721,10 @@ def format_daily_summary(summary: dict[str, Any], moment: datetime) -> str:
     lines.append(f"<b>Fees:</b> {_fmt_amount(performance.get('total_fees'))} {quote}")
     if rejected_count is not None and int(rejected_count or 0) > 0:
         lines.append(f"<b>\u00D3rdenes rechazadas:</b> {_fmt_int(rejected_count)}")
+    if signal_only_count is not None and int(signal_only_count or 0) > 0:
+        lines.append(
+            f"<b>Signals sin ejecutar:</b> {_fmt_int(signal_only_count)}"
+        )
 
     small_sample = _small_sample_warning(summary)
     if small_sample:
@@ -651,6 +733,14 @@ def format_daily_summary(summary: dict[str, Any], moment: datetime) -> str:
             f"{_EMOJI_BY_EVENT_TYPE['WARNING']} "
             f"Muestra chica: menos de 30 trades cerrados."
         )
+    # Local-time line (UTC archive ids unaffected).
+    local = local_display_for_iso(moment.isoformat(), tz_name=tz_name)
+    if local is not None:
+        lines.append("")
+        lines.append(
+            f"<b>Hora local:</b> {local['time_local']} {local['tz_label']}"
+        )
+        lines.append(f"<b>UTC:</b> {local['time_utc']}")
     lines.append("")
     lines.append(f"<b>Estado:</b>")
     lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
@@ -661,7 +751,11 @@ def format_daily_summary(summary: dict[str, Any], moment: datetime) -> str:
 
 
 def _format_buy_filled_card(
-    *, symbol: str, metadata: dict[str, Any], quote: str
+    *,
+    symbol: str,
+    metadata: dict[str, Any],
+    quote: str,
+    time_lines: list[str] | None = None,
 ) -> str:
     title = f"PAPER BUY \u2014 {html.escape(symbol)}"
     fill_price = metadata.get("fill_price")
@@ -681,9 +775,63 @@ def _format_buy_filled_card(
         lines.append(f"<b>Stop loss:</b> {_fmt_price(sl)}")
     if tp is not None:
         lines.append(f"<b>Take profit:</b> {_fmt_price(tp)}")
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
     lines.append("")
     lines.append("<b>Estado:</b>")
     lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    return "\n".join(lines)
+
+
+def _format_signal_only_card(
+    *,
+    symbol: str,
+    metadata: dict[str, Any],
+    quote: str,
+    time_lines: list[str] | None = None,
+) -> str:
+    """Render a SIGNAL_ONLY event as a yellow action card.
+
+    Visually distinct from PAPER BUY: yellow circle, explicit 'No fue
+    ejecutada en paper' wording, and the 'Signal-only \u00B7 Manual-review'
+    badge. Reason / stop / take fields are included only when present in
+    metadata; nothing is invented.
+    """
+
+    title = f"SIGNAL ONLY \u2014 {html.escape(symbol)}"
+    reference_price = metadata.get("reference_price")
+    requested_notional = metadata.get("requested_notional")
+    sl = metadata.get("stop_loss")
+    tp = metadata.get("take_profit")
+    raw_reason = metadata.get("rejection_reason") or metadata.get("reason")
+    lines: list[str] = [
+        f"{_EMOJI_BY_EVENT_TYPE['SIGNAL_ONLY']} <b>{title}</b>",
+        "",
+        "<b>Acci\u00F3n manual:</b>",
+        "Revisar oportunidad. No fue ejecutada en paper.",
+    ]
+    reason_text = str(raw_reason or "").strip()
+    if reason_text:
+        lines.append("")
+        lines.append("<b>Motivo:</b>")
+        lines.append(html.escape(reason_text))
+    lines.append("")
+    lines.append(f"<b>Precio ref:</b> {_fmt_price(reference_price)}")
+    if requested_notional is not None:
+        lines.append(
+            f"<b>Monto sugerido:</b> {_fmt_amount(requested_notional)} {quote}"
+        )
+    if sl is not None:
+        lines.append(f"<b>Stop loss:</b> {_fmt_price(sl)}")
+    if tp is not None:
+        lines.append(f"<b>Take profit:</b> {_fmt_price(tp)}")
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_SIGNAL_ONLY)
     return "\n".join(lines)
 
 
@@ -695,6 +843,7 @@ def _format_exit_card(
     emoji: str,
     title: str,
     manual_action_es: str,
+    time_lines: list[str] | None = None,
 ) -> str:
     head = f"{title} \u2014 {html.escape(symbol)}"
     entry = metadata.get("entry_average_price")
@@ -713,13 +862,18 @@ def _format_exit_card(
     ]
     if return_pct is not None:
         lines.append(f"<b>Return:</b> {_fmt_signed_pct(return_pct)}")
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
     lines.append("")
     lines.append("<b>Estado:</b>")
     lines.append(_SPANISH_DISCLAIMER_PAPER_NO_REAL)
     return "\n".join(lines)
 
 
-def _format_order_rejected_card(*, symbol: str, metadata: dict[str, Any]) -> str:
+def _format_order_rejected_card(
+    *, symbol: str, metadata: dict[str, Any], time_lines: list[str] | None = None
+) -> str:
     head = f"ORDEN RECHAZADA \u2014 {html.escape(symbol)}"
     reason = str(metadata.get("reason") or "unspecified")
     lines = [
@@ -730,14 +884,19 @@ def _format_order_rejected_card(*, symbol: str, metadata: dict[str, Any]) -> str
         "",
         "<b>Acci\u00F3n manual:</b>",
         "No copiar autom\u00E1ticamente. Revisar s\u00F3lo si se repite demasiado.",
-        "",
-        "<b>Estado:</b>",
-        "Paper-only",
     ]
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append("Paper-only")
     return "\n".join(lines)
 
 
-def _format_error_card(*, event: dict[str, Any]) -> str:
+def _format_error_card(
+    *, event: dict[str, Any], time_lines: list[str] | None = None
+) -> str:
     title = str(event.get("human_title") or "ERROR")
     manual = str(event.get("manual_action") or "Investigar logs.")
     short_message = str(event.get("human_message") or "")[:240]
@@ -749,13 +908,18 @@ def _format_error_card(*, event: dict[str, Any]) -> str:
     ]
     if short_message:
         lines.extend(["", html.escape(short_message)])
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
     lines.append("")
     lines.append("<b>Estado:</b>")
     lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
     return "\n".join(lines)
 
 
-def _format_warning_card(*, event: dict[str, Any]) -> str:
+def _format_warning_card(
+    *, event: dict[str, Any], time_lines: list[str] | None = None
+) -> str:
     title = str(event.get("human_title") or "Warning")
     metadata = event.get("metadata") or {}
     raw = str(metadata.get("raw_warning") or event.get("human_message") or "")[:240]
@@ -763,14 +927,19 @@ def _format_warning_card(*, event: dict[str, Any]) -> str:
         f"{_EMOJI_BY_EVENT_TYPE['WARNING']} <b>{html.escape(title)}</b>",
         "",
         html.escape(raw),
-        "",
-        "<b>Estado:</b>",
-        _SPANISH_DISCLAIMER_PAPER_MANUAL,
     ]
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
+    lines.append("")
+    lines.append("<b>Estado:</b>")
+    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
     return "\n".join(lines)
 
 
-def _format_generic_card(*, event: dict[str, Any]) -> str:
+def _format_generic_card(
+    *, event: dict[str, Any], time_lines: list[str] | None = None
+) -> str:
     title = str(event.get("human_title") or event.get("event_type") or "Event")
     manual = str(event.get("manual_action") or "").strip()
     lines = [f"<b>{html.escape(title)}</b>"]
@@ -778,10 +947,38 @@ def _format_generic_card(*, event: dict[str, Any]) -> str:
         lines.append("")
         lines.append("<b>Acci\u00F3n manual:</b>")
         lines.append(html.escape(manual))
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
     lines.append("")
     lines.append("<b>Estado:</b>")
     lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
     return "\n".join(lines)
+
+
+def _build_time_lines(
+    *, event: dict[str, Any], tz_name: str
+) -> list[str]:
+    """Return ``['<b>Hora local:</b> HH:MM ART', '<b>UTC:</b> HH:MM']``.
+
+    Source preference: per-event ``metadata.occurred_at`` (the actual time the
+    paper event happened) over ``created_at`` (the time the semantic layer
+    rendered the event). Returns an empty list when no parseable timestamp is
+    available so the renderers can skip the section cleanly.
+    """
+
+    metadata = event.get("metadata") or {}
+    occurred = metadata.get("occurred_at") if isinstance(metadata, dict) else None
+    candidate = str(occurred or event.get("created_at") or "").strip()
+    if not candidate:
+        return []
+    local = local_display_for_iso(candidate, tz_name=tz_name)
+    if local is None:
+        return []
+    return [
+        f"<b>Hora local:</b> {local['time_local']} {local['tz_label']}",
+        f"<b>UTC:</b> {local['time_utc']}",
+    ]
 
 
 # --- Formatting helpers -----------------------------------------------------
@@ -934,6 +1131,8 @@ def main(argv: list[str] | None = None) -> int:
         rebuild_semantic=bool(args.rebuild_semantic),
         bootstrap_dedupe=bool(args.bootstrap_dedupe),
         include_order_rejected=bool(args.include_order_rejected),
+        include_signal_only=bool(args.include_signal_only),
+        local_tz=args.local_tz,
     )
     sys.stdout.write(
         json.dumps(
@@ -950,6 +1149,8 @@ def main(argv: list[str] | None = None) -> int:
                 "skipped_count": len(result.get("skipped") or []),
                 "sent_event_ids": result.get("sent_event_ids") or [],
                 "skipped_event_ids": result.get("skipped_event_ids") or [],
+                "include_signal_only": result.get("include_signal_only"),
+                "local_tz": result.get("local_tz"),
                 "min_severity": result.get("min_severity"),
                 "chat_id_masked": result.get("chat_id_masked"),
                 "state_path": result.get("state_path"),

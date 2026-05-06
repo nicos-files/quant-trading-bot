@@ -1122,3 +1122,179 @@
 [ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/223007/run.log
 [POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/223007/dashboard.log
 [POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/223007/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.347244
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/224504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/224504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/224504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/224504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/224504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.437930
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/225007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/225007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/225007/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/225007/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/225007/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.599035
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/225504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/225504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/225504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/225504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/225504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.507929
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/230007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/230007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/230007/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/230007/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/230007/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.491184
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/230504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/230504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/230504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/230504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/230504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 1
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.534791
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/231007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/231007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/231007/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/231007/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/231007/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.593059
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/231504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/231504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/231504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/231504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/231504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.482781
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/232007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/232007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/232007/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/232007/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/232007/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.447960
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/232504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/232504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/232504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/232504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/232504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.224841
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/233007
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/233007/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/233007/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/233007/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/233007/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.132281
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/233504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/233504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/233504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/233504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/233504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.159857
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/234009
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/234009/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/234009/run.log
+[POST-RUN] dashboard ok=False exit=1 log=artifacts/crypto_paper/archive/2026-05-05/234009/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/234009/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.248671
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/234504
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/234504/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/234504/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/234504/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/234504/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.295998
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/235008
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/235008/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/235008/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/235008/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/235008/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.244900
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-05/235508
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-05/235508/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-05/235508/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/235508/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-05/235508/notify.log
+[CRYPTO-PAPER-FORWARD]
+- status: SUCCESS
+- recommendations_count: 0
+- fills_count: 0
+- exits_count: 0
+- total_equity: 100.254055
+[ARCHIVE] artifacts/crypto_paper/archive/2026-05-06/000005
+[ARCHIVE-METADATA] artifacts/crypto_paper/archive/2026-05-06/000005/run_metadata.json
+[ARCHIVE-LOG] artifacts/crypto_paper/archive/2026-05-06/000005/run.log
+[POST-RUN] dashboard ok=True exit=0 log=artifacts/crypto_paper/archive/2026-05-06/000005/dashboard.log
+[POST-RUN] notify ok=True dry_run=False real_send=True exit=0 log=artifacts/crypto_paper/archive/2026-05-06/000005/notify.log

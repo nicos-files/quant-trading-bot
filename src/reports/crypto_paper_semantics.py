@@ -26,13 +26,23 @@ Public API:
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # Python 3.9+ stdlib
+except ImportError:  # pragma: no cover - zoneinfo is stdlib in supported Python versions
+    ZoneInfo = None  # type: ignore[assignment]
+
+    class ZoneInfoNotFoundError(Exception):  # type: ignore[no-redef]
+        pass
+
 SEMANTIC_EVENT_TYPES: tuple[str, ...] = (
     "BUY_SIGNAL",
     "BUY_FILLED_PAPER",
+    "SIGNAL_ONLY",
     "TAKE_PROFIT",
     "STOP_LOSS",
     "POSITION_OPEN",
@@ -50,6 +60,7 @@ _SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_
 _DEFAULT_SEVERITY: dict[str, str] = {
     "BUY_SIGNAL": "INFO",
     "BUY_FILLED_PAPER": "ACTION",
+    "SIGNAL_ONLY": "INFO",
     "TAKE_PROFIT": "ACTION",
     "STOP_LOSS": "ACTION",
     "POSITION_OPEN": "INFO",
@@ -70,6 +81,31 @@ ALERTABLE_EVENT_TYPES: frozenset[str] = frozenset(
         "DAILY_SUMMARY",
     }
 )
+
+# SIGNAL_ONLY is intentionally excluded from ``ALERTABLE_EVENT_TYPES`` so the
+# notifier does not surface it on Telegram by default. It is opt-in via
+# ``--include-signal-only`` or env ``ENABLE_CRYPTO_SIGNAL_ONLY_ALERTS=1``.
+SIGNAL_ONLY_EVENT_TYPE: str = "SIGNAL_ONLY"
+
+CRYPTO_LOCAL_TZ_ENV: str = "CRYPTO_LOCAL_TZ"
+DEFAULT_CRYPTO_LOCAL_TZ: str = "America/Argentina/Buenos_Aires"
+
+# Curated tz abbreviations because zoneinfo's ``%Z`` often returns numeric
+# offsets (e.g. ``-03``) for South-American zones. The notifier and dashboard
+# fall back to ``%Z`` when the zone is not in this map.
+_LOCAL_TZ_ABBREV: dict[str, str] = {
+    "America/Argentina/Buenos_Aires": "ART",
+    "America/Buenos_Aires": "ART",
+    "America/New_York": "NYT",
+    "America/Chicago": "CT",
+    "America/Denver": "MT",
+    "America/Los_Angeles": "PT",
+    "America/Sao_Paulo": "BRT",
+    "America/Mexico_City": "CST-MX",
+    "Europe/Madrid": "CET",
+    "Europe/London": "BST",
+    "UTC": "UTC",
+}
 
 PAPER_DISCLAIMER = "Paper-only / manual-review only. Not auto-executed."
 
@@ -169,6 +205,15 @@ def build_semantic_layer(
         _emit_buy_filled_events(fills=fills, created_at=moment_iso, events=events)
     )
     sources.extend(
+        _emit_signal_only_events(
+            orders=orders,
+            fills=fills,
+            forward_result=forward_result,
+            created_at=moment_iso,
+            events=events,
+        )
+    )
+    sources.extend(
         _emit_exit_events(
             exit_events=exit_events,
             fills=fills,
@@ -212,6 +257,10 @@ def build_semantic_layer(
         reverse=True,
     )
 
+    # Resolve the local-display timezone (UTC archive ids are unchanged).
+    local_tz_name = _resolve_local_tz_name()
+    _enrich_events_with_local_display(events=events, tz_name=local_tz_name)
+
     summary = _build_summary(
         snapshot=snapshot,
         metrics=metrics,
@@ -221,6 +270,7 @@ def build_semantic_layer(
         events=events,
         layer_warnings=layer_warnings,
         generated_at=moment_iso,
+        local_tz_name=local_tz_name,
         artifacts_dir=root,
     )
 
@@ -352,6 +402,105 @@ def _emit_buy_filled_events(
             )
         )
         sources.append("crypto_paper_fills.json")
+    return sources
+
+
+def _emit_signal_only_events(
+    *,
+    orders: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+    forward_result: dict[str, Any],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    """Emit one ``SIGNAL_ONLY`` event per BUY order that did not produce a fill.
+
+    A SIGNAL_ONLY event represents the case "the strategy detected a BUY
+    opportunity, but paper execution did not open a position." Emission rule:
+
+    - the artifact contains a BUY ``order`` (i.e. a paper-forward
+      recommendation reached the order layer), AND
+    - no entry in ``crypto_paper_fills.json`` carries a matching ``order_id``.
+
+    The notifier may surface these events on Telegram only when the user
+    explicitly opts in (``--include-signal-only`` /
+    ``ENABLE_CRYPTO_SIGNAL_ONLY_ALERTS=1``). The semantic layer always records
+    them so the dashboard and audit trail include unexecuted opportunities.
+    """
+
+    sources: list[str] = []
+    if not isinstance(orders, list):
+        return sources
+    filled_order_ids: set[str] = set()
+    if isinstance(fills, list):
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            order_id = str(fill.get("order_id") or "").strip()
+            if order_id:
+                filled_order_ids.add(order_id)
+
+    forward_meta = forward_result if isinstance(forward_result, dict) else {}
+    rec_count = _safe_int(forward_meta.get("recommendations_count")) or 0
+    fill_count = _safe_int(forward_meta.get("fills_count")) or 0
+
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("side") or "").upper() != "BUY":
+            continue
+        order_id = str(order.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        if order_id in filled_order_ids:
+            # The recommendation actually opened a position; surfaced as
+            # BUY_FILLED_PAPER instead.
+            continue
+
+        order_created = str(order.get("created_at") or "")
+        symbol = str(order.get("symbol") or "")
+        status = str(order.get("status") or "").upper()
+        rejection_reason = order.get("reason")
+        order_metadata = order.get("metadata") or {}
+        events.append(
+            _build_event(
+                event_id=f"signal_only:{order_id}:{order_created}",
+                event_type="SIGNAL_ONLY",
+                symbol=symbol,
+                action="REVIEW_SIGNAL",
+                human_title=f"Crypto BUY signal not executed in paper: {symbol}",
+                human_message=(
+                    f"Strategy detected a BUY opportunity for {symbol} at "
+                    f"{_format_price(order.get('reference_price'))} but paper "
+                    f"execution did not open a position (status={status or 'UNKNOWN'}). "
+                    f"{PAPER_DISCLAIMER}"
+                ),
+                manual_action=(
+                    "Review the missed opportunity. No paper position was "
+                    "opened; no live action will be taken."
+                ),
+                created_at=created_at,
+                source_artifacts=[
+                    "crypto_paper_orders.json",
+                    "paper_forward/crypto_paper_forward_result.json",
+                ],
+                metadata={
+                    "order_id": order_id,
+                    "status": order.get("status"),
+                    "reference_price": order.get("reference_price"),
+                    "requested_notional": order.get("requested_notional"),
+                    "stop_loss": order_metadata.get("stop_loss"),
+                    "take_profit": order_metadata.get("take_profit"),
+                    "rejection_reason": rejection_reason,
+                    "reason": rejection_reason,
+                    "quote_asset": _quote_asset_from_symbol(symbol),
+                    "recommendations_count": rec_count,
+                    "fills_count": fill_count,
+                    "occurred_at": order_created,
+                },
+            )
+        )
+        sources.append("crypto_paper_orders.json")
     return sources
 
 
@@ -626,6 +775,7 @@ def _has_actionable_event(events: list[dict[str, Any]]) -> bool:
             "ORDER_REJECTED",
             "ERROR",
             "BUY_SIGNAL",
+            "SIGNAL_ONLY",
         ):
             return True
     return False
@@ -692,6 +842,7 @@ def _build_summary(
     events: list[dict[str, Any]],
     layer_warnings: list[str],
     generated_at: str,
+    local_tz_name: str,
     artifacts_dir: Path,
 ) -> dict[str, Any]:
     starting_equity = _starting_equity_from_curve(equity_curve)
@@ -736,10 +887,13 @@ def _build_summary(
             "take_profit_count": _safe_int(metrics.get("take_profit_count")),
         },
         "rejected_orders_count": counts_by_type.get("ORDER_REJECTED", 0),
+        "signal_only_count": counts_by_type.get("SIGNAL_ONLY", 0),
         "manual_tickets_count": len(manual_tickets),
         "events_count_by_type": counts_by_type,
         "events_total": len(events),
         "latest_event": latest_event,
+        "local_tz": local_tz_name,
+        "generated_at_local": _local_display_for(generated_at, tz_name=local_tz_name),
         "warnings": list(layer_warnings) + list(metrics.get("warnings") or []) + list(forward_result.get("warnings") or []),
         "forward_run_status": forward_result.get("status"),
     }
@@ -921,3 +1075,125 @@ def _load_json(path: Path, *, default: Any) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+# --- Local-timezone display helpers ----------------------------------------
+
+
+def resolve_local_tz(name: str | None = None) -> Any:
+    """Return a ``ZoneInfo`` for ``name`` (or env / default) or ``None``.
+
+    Falls back to ``timezone.utc`` only as a last resort: callers should treat
+    a ``None`` return as "do not enrich local-time fields" so UTC archive ids
+    remain authoritative.
+    """
+
+    if ZoneInfo is None:
+        return None
+    candidate = name or os.environ.get(CRYPTO_LOCAL_TZ_ENV) or DEFAULT_CRYPTO_LOCAL_TZ
+    try:
+        return ZoneInfo(str(candidate))
+    except ZoneInfoNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_local_tz_name() -> str:
+    return str(os.environ.get(CRYPTO_LOCAL_TZ_ENV) or DEFAULT_CRYPTO_LOCAL_TZ)
+
+
+def local_tz_label(tz_name: str) -> str:
+    """Return a human-friendly tz abbreviation (e.g. ``ART`` for Buenos Aires).
+
+    Falls back to ``%Z`` / numeric offset when the tz is not in the curated
+    map; callers can therefore display a meaningful badge regardless of the
+    user-configured tz.
+    """
+
+    text = str(tz_name or "").strip()
+    if text in _LOCAL_TZ_ABBREV:
+        return _LOCAL_TZ_ABBREV[text]
+    tz = resolve_local_tz(text)
+    if tz is None:
+        return text or "UTC"
+    sample = datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone(tz)
+    abbrev = sample.strftime("%Z")
+    if abbrev and not abbrev.startswith(("+", "-")):
+        return abbrev
+    # Numeric offset like "-03": prefer the last segment of the IANA name.
+    short = text.split("/")[-1] if "/" in text else text
+    return short or abbrev or "UTC"
+
+
+def local_display_for_iso(iso_text: str, *, tz_name: str) -> dict[str, Any] | None:
+    """Project ``iso_text`` (UTC ISO-8601) to a small local-display dict.
+
+    Returns ``None`` when ``iso_text`` is empty or unparseable. The output is
+    intentionally minimal so the notifier and the dashboard can render
+    ``Hora local: HH:MM ART`` and ``UTC: HH:MM`` without re-implementing tz
+    logic.
+    """
+
+    text = str(iso_text or "").strip()
+    if not text:
+        return None
+    try:
+        # ``fromisoformat`` accepts both naive and tz-aware ISO strings on Py 3.11+.
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment_utc = moment.astimezone(timezone.utc)
+    tz = resolve_local_tz(tz_name)
+    if tz is None:
+        local_dt = moment_utc
+        label = "UTC"
+    else:
+        local_dt = moment_utc.astimezone(tz)
+        label = local_tz_label(tz_name)
+    return {
+        "tz": tz_name,
+        "tz_label": label,
+        "time_local": local_dt.strftime("%H:%M"),
+        "datetime_local": local_dt.strftime("%Y-%m-%d %H:%M"),
+        "time_utc": moment_utc.strftime("%H:%M"),
+        "datetime_utc": moment_utc.strftime("%Y-%m-%d %H:%M"),
+        "iso_local": local_dt.isoformat(),
+        "iso_utc": moment_utc.isoformat(),
+    }
+
+
+def _local_display_for(iso_text: str, *, tz_name: str) -> dict[str, Any] | None:
+    """Internal alias kept for symmetry with ``_enrich_events_with_local_display``."""
+
+    return local_display_for_iso(iso_text, tz_name=tz_name)
+
+
+def _enrich_events_with_local_display(
+    *, events: list[dict[str, Any]], tz_name: str
+) -> None:
+    """Annotate each event in-place with ``local_tz`` / ``created_at_local``.
+
+    The original ``created_at`` UTC ISO field is preserved untouched so
+    archive folder naming and downstream UTC-only consumers stay stable.
+    Per-event ``metadata.occurred_at`` is also projected when present.
+    """
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event["local_tz"] = tz_name
+        created_local = local_display_for_iso(
+            str(event.get("created_at") or ""), tz_name=tz_name
+        )
+        if created_local is not None:
+            event["created_at_local"] = created_local
+        metadata = event.get("metadata")
+        if isinstance(metadata, dict):
+            occurred_iso = metadata.get("occurred_at")
+            if isinstance(occurred_iso, str) and occurred_iso:
+                occurred_local = local_display_for_iso(occurred_iso, tz_name=tz_name)
+                if occurred_local is not None:
+                    metadata["occurred_at_local"] = occurred_local

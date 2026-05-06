@@ -1170,5 +1170,340 @@ class NotifyCryptoPaperTelegramDailySummaryOnlyTests(unittest.TestCase):
         self.assertIn("below_min_severity", skipped_reasons)
 
 
+class NotifyCryptoPaperTelegramSignalOnlyTests(unittest.TestCase):
+    """SIGNAL_ONLY routing, opt-in, formatting, dedupe, and visual contract."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 5, 23, 30, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, relative: str, payload) -> None:
+        path = self.artifacts_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _seed_signal_only(self) -> None:
+        """Seed an artifact set with one BUY order that produced no fill."""
+
+        order = {
+            "order_id": "crypto-paper-order-20260505T123007-0001",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "REJECTED",
+            "reason": "risk:cash_insufficient",
+            "reference_price": 81482.11,
+            "requested_notional": 25.0,
+            "created_at": "2026-05-05T12:30:07",
+            "metadata": {"stop_loss": 79812.56, "take_profit": 82255.80},
+        }
+        self._write("crypto_paper_orders.json", [order])
+        self._write(
+            "paper_forward/crypto_paper_forward_result.json",
+            {
+                "recommendations_count": 1,
+                "fills_count": 0,
+                "exits_count": 0,
+                "status": "SUCCESS",
+            },
+        )
+        # Empty fills/snapshot so the only candidates are SIGNAL_ONLY +
+        # ORDER_REJECTED. The default cash_insufficient filter on the latter
+        # keeps it out of the alert path.
+        self._write("crypto_paper_fills.json", [])
+        self._write(
+            "crypto_paper_snapshot.json", {"equity": 100.0, "positions": []}
+        )
+
+    def test_signal_only_is_not_sent_by_default(self) -> None:
+        self._seed_signal_only()
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(sender.calls, [])
+        self.assertEqual(len(result["sent"]), 0)
+
+    def test_include_signal_only_flag_sends_signal_only(self) -> None:
+        self._seed_signal_only()
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            include_signal_only=True,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(sender.calls), 1)
+        text = sender.calls[0]["text"]
+        self.assertIn("SIGNAL ONLY", text)
+        self.assertIn("BTCUSDT", text)
+
+    def test_env_enable_crypto_signal_only_alerts_enables_signal_only(self) -> None:
+        self._seed_signal_only()
+        sender = _RecordingSender()
+        env = _enabled_env({"ENABLE_CRYPTO_SIGNAL_ONLY_ALERTS": "1"})
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=env,
+            sender=sender,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn("SIGNAL ONLY", sender.calls[0]["text"])
+
+    def test_signal_only_card_uses_yellow_emoji_and_no_fue_ejecutada_wording(self) -> None:
+        self._seed_signal_only()
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            include_signal_only=True,
+            now=self.now,
+        )
+        self.assertEqual(len(sender.calls), 1)
+        text = sender.calls[0]["text"]
+        self.assertIn("\U0001F7E1", text)  # yellow circle emoji
+        self.assertIn("<b>SIGNAL ONLY \u2014 BTCUSDT</b>", text)
+        self.assertIn("Revisar oportunidad. No fue ejecutada en paper.", text)
+        self.assertIn("<b>Motivo:</b>", text)
+        self.assertIn("risk:cash_insufficient", text)
+        self.assertIn("<b>Precio ref:</b> 81,482.11", text)
+        self.assertIn("<b>Monto sugerido:</b> 25.00 USDT", text)
+        self.assertIn("<b>Stop loss:</b> 79,812.56", text)
+        self.assertIn("<b>Take profit:</b> 82,255.80", text)
+        self.assertIn("Signal-only \u00B7 Manual-review", text)
+
+    def test_signal_only_card_is_visually_distinct_from_buy_filled_paper(self) -> None:
+        # Render both card types side-by-side and check that no SIGNAL_ONLY
+        # card can be confused with a PAPER BUY card.
+        signal_event = {
+            "event_type": "SIGNAL_ONLY",
+            "severity": "INFO",
+            "symbol": "BTCUSDT",
+            "metadata": {
+                "reference_price": 81482.11,
+                "requested_notional": 25.0,
+                "stop_loss": 79812.56,
+                "take_profit": 82255.80,
+                "rejection_reason": "risk:cash_insufficient",
+                "quote_asset": "USDT",
+            },
+        }
+        buy_filled_event = {
+            "event_type": "BUY_FILLED_PAPER",
+            "severity": "ACTION",
+            "symbol": "BTCUSDT",
+            "metadata": {
+                "fill_price": 76026.52,
+                "gross_notional": 25.0,
+                "stop_loss": 74840.0,
+                "take_profit": 77131.0,
+                "quote_asset": "USDT",
+            },
+        }
+        signal_text = format_event_message(signal_event)
+        buy_text = format_event_message(buy_filled_event)
+
+        # Distinct emojis.
+        self.assertIn("\U0001F7E1", signal_text)  # yellow
+        self.assertIn("\U0001F7E2", buy_text)     # green
+        self.assertNotIn("\U0001F7E2", signal_text)
+        self.assertNotIn("\U0001F7E1", buy_text)
+        # Distinct titles.
+        self.assertIn("SIGNAL ONLY", signal_text)
+        self.assertNotIn("SIGNAL ONLY", buy_text)
+        self.assertIn("PAPER BUY", buy_text)
+        self.assertNotIn("PAPER BUY", signal_text)
+        # SIGNAL_ONLY must NOT claim the order was executed.
+        self.assertNotIn("Revisar compra manual", signal_text)
+        self.assertIn("No fue ejecutada en paper", signal_text)
+        # SIGNAL_ONLY uses the dedicated badge.
+        self.assertIn("Signal-only \u00B7 Manual-review", signal_text)
+        self.assertNotIn("Signal-only \u00B7 Manual-review", buy_text)
+
+    def test_signal_only_does_not_leak_raw_json_or_token(self) -> None:
+        self._seed_signal_only()
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            include_signal_only=True,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        for call in sender.calls:
+            text = call["text"]
+            self.assertNotIn(BOT_TOKEN, text)
+            self.assertNotIn('"event_id"', text)
+            self.assertNotIn('"metadata"', text)
+            self.assertNotIn("{", text)
+            self.assertNotIn("}", text)
+
+    def test_signal_only_html_is_escaped_safely(self) -> None:
+        # Hostile content in symbol and reason must not break HTML.
+        event = {
+            "event_type": "SIGNAL_ONLY",
+            "severity": "INFO",
+            "symbol": "<script>alert(1)</script>",
+            "metadata": {
+                "reference_price": 100.0,
+                "requested_notional": 25.0,
+                "rejection_reason": "bad & evil <tag>",
+                "quote_asset": "USDT",
+            },
+        }
+        text = format_event_message(event)
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("bad &amp; evil &lt;tag&gt;", text)
+
+    def test_signal_only_is_deduped_across_runs(self) -> None:
+        self._seed_signal_only()
+        first = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=_RecordingSender(),
+            include_signal_only=True,
+            now=self.now,
+        )
+        self.assertEqual(len(first["sent"]), 1)
+
+        second_sender = _RecordingSender()
+        second = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=second_sender,
+            include_signal_only=True,
+            now=self.now,
+        )
+        self.assertTrue(second["ok"])
+        self.assertEqual(second_sender.calls, [])
+        self.assertEqual(len(second["sent"]), 0)
+        skip_reasons = {s["reason"] for s in second["skipped"]}
+        self.assertIn("already_sent", skip_reasons)
+
+    def test_daily_summary_card_includes_signal_only_count_when_present(self) -> None:
+        from src.tools.notify_crypto_paper_telegram import format_daily_summary
+
+        summary = {
+            "snapshot": {"equity": 100.0, "realized_pnl": 0.0, "unrealized_pnl": 0.0},
+            "performance": {
+                "closed_trades_count": 0,
+                "win_rate": None,
+                "take_profit_count": 0,
+                "stop_loss_count": 0,
+                "total_fees": 0.0,
+            },
+            "rejected_orders_count": 0,
+            "signal_only_count": 4,
+            "warnings": [],
+        }
+        text = format_daily_summary(summary, self.now)
+        self.assertIn("<b>Signals sin ejecutar:</b> 4", text)
+        # Zero values should NOT bloat the summary.
+        summary_zero = dict(summary, signal_only_count=0)
+        text_zero = format_daily_summary(summary_zero, self.now)
+        self.assertNotIn("<b>Signals sin ejecutar:</b>", text_zero)
+
+
+class NotifyCryptoPaperTelegramLocalTzTests(unittest.TestCase):
+    """Local-tz line and CRYPTO_LOCAL_TZ env override behavior."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        # 23:30 UTC -> 20:30 ART.
+        self.now = datetime(2026, 5, 5, 23, 30, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, relative: str, payload) -> None:
+        path = self.artifacts_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_local_time_line_is_argentina_by_default(self) -> None:
+        # Seed a TAKE_PROFIT that occurred at 23:30 UTC -> 20:30 ART.
+        exit_event = {
+            "exit_id": "e1",
+            "symbol": "BTCUSDT",
+            "exit_reason": "TAKE_PROFIT",
+            "exit_quantity": 0.001,
+            "trigger_price": 77131.478,
+            "fill_price": 77092.91,
+            "realized_pnl": 0.717,
+            "fee": 0.075,
+            "exited_at": "2026-05-05T23:30:00",
+            "metadata": {"stop_loss": 74840.0, "take_profit": 77131.478},
+        }
+        self._write("crypto_paper_exit_events.json", [exit_event])
+        sender = _RecordingSender()
+        notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            now=self.now,
+        )
+        self.assertEqual(len(sender.calls), 1)
+        text = sender.calls[0]["text"]
+        # The semantic layer's created_at is the moment ``now`` UTC, so the
+        # local line on the exit card maps to 20:30 ART for both occurred_at
+        # and created_at.
+        self.assertIn("Hora local:</b> 20:30 ART", text)
+        self.assertIn("UTC:</b> 23:30", text)
+
+    def test_archive_iso_is_not_overridden_by_local_display(self) -> None:
+        exit_event = {
+            "exit_id": "e1",
+            "symbol": "BTCUSDT",
+            "exit_reason": "TAKE_PROFIT",
+            "exit_quantity": 0.001,
+            "trigger_price": 77131.478,
+            "fill_price": 77092.91,
+            "realized_pnl": 0.717,
+            "fee": 0.075,
+            "exited_at": "2026-05-05T23:30:00",
+            "metadata": {},
+        }
+        self._write("crypto_paper_exit_events.json", [exit_event])
+        # Build the semantic layer once via the notifier path and then
+        # re-read the artifact to confirm UTC ISO is preserved.
+        notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=_RecordingSender(),
+            now=self.now,
+        )
+        events = json.loads(
+            (self.artifacts_dir / "semantic" / "crypto_semantic_events.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(events)
+        for event in events:
+            self.assertTrue(str(event["created_at"]).endswith("+00:00"))
+
+
 if __name__ == "__main__":
     unittest.main()

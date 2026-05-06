@@ -249,5 +249,101 @@ class BuildCryptoPaperDashboardTests(unittest.TestCase):
         self.assertTrue((self.dashboard_dir / "index.html").exists())
 
 
+class BuildCryptoPaperDashboardSignalOnlyTests(unittest.TestCase):
+    """Dashboard surfaces SIGNAL_ONLY count and recent SIGNAL_ONLY events."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.dashboard_dir = self.artifacts_dir / "dashboard"
+        self.now = datetime(2026, 5, 5, 23, 30, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_with_signal_only(self) -> None:
+        order = {
+            "order_id": "crypto-paper-order-20260505T123007-0001",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "REJECTED",
+            "reason": "risk:cash_insufficient",
+            "reference_price": 81482.11,
+            "requested_notional": 25.0,
+            "created_at": "2026-05-05T12:30:07",
+            "metadata": {"stop_loss": 79812.56, "take_profit": 82255.80},
+        }
+        snapshot = {
+            "as_of": "2026-05-05T23:30:00",
+            "equity": 100.0,
+            "cash": 100.0,
+            "positions_value": 0.0,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "fees_paid": 0.0,
+            "positions": [],
+        }
+        (self.artifacts_dir / "crypto_paper_orders.json").write_text(
+            json.dumps([order]), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_fills.json").write_text("[]", encoding="utf-8")
+        (self.artifacts_dir / "crypto_paper_snapshot.json").write_text(
+            json.dumps(snapshot), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_positions.json").write_text("[]", encoding="utf-8")
+        (self.artifacts_dir / "crypto_paper_exit_events.json").write_text("[]", encoding="utf-8")
+        (self.artifacts_dir / "paper_forward" / "crypto_paper_forward_result.json").write_text(
+            json.dumps(
+                {
+                    "recommendations_count": 1,
+                    "fills_count": 0,
+                    "exits_count": 0,
+                    "status": "SUCCESS",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_dashboard_data_includes_signal_only_count_and_recent(self) -> None:
+        self._seed_with_signal_only()
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            rebuild_semantic=True,
+            now=self.now,
+        )
+        data = result["data"]
+        self.assertEqual(data["performance"]["signal_only_count"], 1)
+        recent = data["recent_signal_only_events"]
+        self.assertEqual(len(recent), 1)
+        self.assertEqual(recent[0]["symbol"], "BTCUSDT")
+        self.assertEqual(
+            (recent[0].get("metadata") or {}).get("rejection_reason"),
+            "risk:cash_insufficient",
+        )
+
+    def test_dashboard_html_renders_signal_only_card_and_section(self) -> None:
+        self._seed_with_signal_only()
+        build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            rebuild_semantic=True,
+            now=self.now,
+        )
+        content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8")
+        # Card and section are present.
+        self.assertIn("Signal-only", content)
+        self.assertIn("Recent SIGNAL_ONLY events", content)
+        # The seeded SIGNAL_ONLY symbol appears in the recent table.
+        self.assertIn("BTCUSDT", content)
+        # Markdown summary also includes the Signal-only line.
+        md_content = (self.dashboard_dir / "latest_summary.md").read_text(encoding="utf-8")
+        self.assertIn("Signal-only", md_content)
+
+
 if __name__ == "__main__":
     unittest.main()

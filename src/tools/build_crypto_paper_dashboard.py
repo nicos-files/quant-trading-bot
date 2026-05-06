@@ -25,8 +25,11 @@ from pathlib import Path
 from typing import Any
 
 from src.reports.crypto_paper_semantics import (
+    DEFAULT_CRYPTO_LOCAL_TZ,
     PAPER_DISCLAIMER,
     build_semantic_layer,
+    local_display_for_iso,
+    local_tz_label,
 )
 
 
@@ -38,6 +41,7 @@ _SUMMARY_FILENAME = "latest_summary.md"
 _RECENT_FILLS_LIMIT = 10
 _RECENT_EXITS_LIMIT = 10
 _RECENT_EVENTS_LIMIT = 25
+_RECENT_SIGNAL_ONLY_LIMIT = 10
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,6 +117,15 @@ def build_crypto_paper_dashboard(
         if isinstance(order, dict) and str(order.get("status") or "").upper() == "REJECTED"
     )
 
+    signal_only_events = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("event_type") or "") == "SIGNAL_ONLY"
+    ]
+    signal_only_count = len(signal_only_events)
+    recent_signal_only_events = signal_only_events[:_RECENT_SIGNAL_ONLY_LIMIT]
+
     recent_fills = _sort_recent(
         [item for item in fills if isinstance(item, dict)],
         key="filled_at",
@@ -171,14 +184,18 @@ def build_crypto_paper_dashboard(
             "stop_loss_count": performance.get("stop_loss_count"),
             "take_profit_count": performance.get("take_profit_count"),
             "rejected_orders_count": rejected_count,
+            "signal_only_count": signal_only_count,
         },
         "open_positions": open_positions_table,
         "recent_fills": recent_fills,
         "recent_exits": recent_exits,
         "recent_events": recent_events,
+        "recent_signal_only_events": recent_signal_only_events,
         "current_action": current_action,
         "warnings": list(summary.get("warnings") or []),
         "forward_run_status": summary.get("forward_run_status"),
+        "local_tz": summary.get("local_tz") or DEFAULT_CRYPTO_LOCAL_TZ,
+        "generated_at_local": summary.get("generated_at_local"),
     }
 
     index_html = _render_index_html(dashboard_data)
@@ -302,6 +319,7 @@ def _render_index_html(data: dict[str, Any]) -> str:
     parts.append(_render_card("Take-profits", _format_int(performance.get("take_profit_count"))))
     parts.append(_render_card("Stop-losses", _format_int(performance.get("stop_loss_count"))))
     parts.append(_render_card("Rejected orders", _format_int(performance.get("rejected_orders_count"))))
+    parts.append(_render_card("Signal-only", _format_int(performance.get("signal_only_count"))))
     parts.append(_render_card("Total fees", _format_number(performance.get("total_fees"))))
     parts.append(_render_card("Total slippage", _format_number(performance.get("total_slippage"))))
     parts.append("</section>")
@@ -349,6 +367,26 @@ def _render_index_html(data: dict[str, Any]) -> str:
     parts.append(_render_table(
         ["exited_at", "symbol", "exit_reason", "exit_quantity", "trigger_price", "fill_price", "realized_pnl", "source"],
         data.get("recent_exits") or [],
+    ))
+    parts.append("</section>")
+
+    parts.append('<section class="block">')
+    parts.append("<h2>Recent SIGNAL_ONLY events</h2>")
+    signal_rows = [
+        {
+            "created_at": event.get("created_at"),
+            "created_at_local": _format_local_time(event.get("created_at_local")),
+            "symbol": event.get("symbol"),
+            "reference_price": (event.get("metadata") or {}).get("reference_price"),
+            "requested_notional": (event.get("metadata") or {}).get("requested_notional"),
+            "reason": (event.get("metadata") or {}).get("rejection_reason")
+            or (event.get("metadata") or {}).get("reason"),
+        }
+        for event in (data.get("recent_signal_only_events") or [])
+    ]
+    parts.append(_render_table(
+        ["created_at", "created_at_local", "symbol", "reference_price", "requested_notional", "reason"],
+        signal_rows,
     ))
     parts.append("</section>")
 
@@ -448,6 +486,18 @@ def _format_int(value: Any) -> str:
         return str(value)
 
 
+def _format_local_time(value: Any) -> str:
+    """Render a ``created_at_local`` dict as ``HH:MM ART`` for table cells."""
+
+    if not isinstance(value, dict):
+        return ""
+    time_local = str(value.get("time_local") or "").strip()
+    label = str(value.get("tz_label") or "").strip()
+    if not time_local:
+        return ""
+    return f"{time_local} {label}".strip()
+
+
 def _format_pct(value: Any, *, already_pct: bool = False) -> str:
     if value is None:
         return "n/a"
@@ -479,6 +529,7 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
     lines.append(f"- Take-profits: {_format_int(performance.get('take_profit_count'))}")
     lines.append(f"- Stop-losses: {_format_int(performance.get('stop_loss_count'))}")
     lines.append(f"- Rejected orders: {_format_int(performance.get('rejected_orders_count'))}")
+    lines.append(f"- Signal-only: {_format_int(performance.get('signal_only_count'))}")
     lines.append("")
     current_action = data.get("current_action")
     if current_action:

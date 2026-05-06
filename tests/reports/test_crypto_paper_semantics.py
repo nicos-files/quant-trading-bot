@@ -454,5 +454,219 @@ class CryptoPaperSemanticsExitEnrichmentTests(unittest.TestCase):
         self.assertEqual(events[0]["metadata"]["quote_asset"], "USDT")
 
 
+class CryptoPaperSemanticsSignalOnlyTests(unittest.TestCase):
+    """SIGNAL_ONLY is emitted for BUY orders without a matching fill."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 5, 18, 0, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, relative: str, payload) -> None:
+        path = self.artifacts_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _build(self):
+        return build_semantic_layer(
+            artifacts_dir=self.artifacts_dir,
+            output_dir=self.artifacts_dir / "semantic",
+            write=False,
+            now=self.now,
+        )
+
+    def test_recommendations_count_one_with_fills_count_zero_emits_signal_only(self) -> None:
+        # Mirror the bug report: a BUY order exists (recommendation reached
+        # the order layer) but execution did not produce a fill.
+        order = {
+            "order_id": "crypto-paper-order-20260505T123007-0001",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "REJECTED",
+            "reason": "risk:cash_insufficient",
+            "reference_price": 81482.11,
+            "requested_notional": 25.0,
+            "created_at": "2026-05-05T12:30:07",
+            "metadata": {"stop_loss": 79812.56, "take_profit": 82255.80},
+        }
+        self._write("crypto_paper_orders.json", [order])
+        self._write(
+            "paper_forward/crypto_paper_forward_result.json",
+            {
+                "recommendations_count": 1,
+                "fills_count": 0,
+                "exits_count": 0,
+                "status": "SUCCESS",
+            },
+        )
+
+        result = self._build()
+        signals = [
+            event for event in result["events"] if event["event_type"] == "SIGNAL_ONLY"
+        ]
+        self.assertEqual(len(signals), 1)
+        signal = signals[0]
+        self.assertEqual(signal["symbol"], "BTCUSDT")
+        self.assertEqual(signal["action"], "REVIEW_SIGNAL")
+        self.assertEqual(signal["severity"], "INFO")
+        self.assertTrue(signal["paper_only"])
+        self.assertTrue(signal["not_auto_executed"])
+        self.assertEqual(signal["metadata"]["reference_price"], 81482.11)
+        self.assertEqual(signal["metadata"]["requested_notional"], 25.0)
+        self.assertEqual(signal["metadata"]["stop_loss"], 79812.56)
+        self.assertEqual(signal["metadata"]["take_profit"], 82255.80)
+        self.assertEqual(signal["metadata"]["rejection_reason"], "risk:cash_insufficient")
+        self.assertEqual(signal["metadata"]["recommendations_count"], 1)
+        self.assertEqual(signal["metadata"]["fills_count"], 0)
+        # Stable, dedupe-friendly id derived from order_id + created_at.
+        self.assertTrue(
+            signal["event_id"].startswith(
+                "signal_only:crypto-paper-order-20260505T123007-0001:"
+            )
+        )
+
+    def test_buy_order_with_matching_fill_does_not_emit_signal_only(self) -> None:
+        order = {
+            "order_id": "o1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "PENDING",
+            "reason": None,
+            "reference_price": 76000.0,
+            "requested_notional": 25.0,
+            "created_at": "2026-05-05T12:30:07",
+            "metadata": {},
+        }
+        fill = {
+            "fill_id": "f1",
+            "order_id": "o1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": 0.0003,
+            "fill_price": 76000.0,
+            "gross_notional": 25.0,
+            "fee": 0.025,
+            "filled_at": "2026-05-05T12:30:07",
+            "metadata": {},
+        }
+        self._write("crypto_paper_orders.json", [order])
+        self._write("crypto_paper_fills.json", [fill])
+
+        result = self._build()
+        signals = [
+            event for event in result["events"] if event["event_type"] == "SIGNAL_ONLY"
+        ]
+        self.assertEqual(signals, [])
+        # The BUY_FILLED_PAPER path is the one that surfaces the executed entry.
+        self.assertTrue(
+            any(e["event_type"] == "BUY_FILLED_PAPER" for e in result["events"])
+        )
+
+    def test_signal_only_is_in_event_types_constant(self) -> None:
+        self.assertIn("SIGNAL_ONLY", SEMANTIC_EVENT_TYPES)
+
+    def test_signal_only_is_not_in_default_alertable_set(self) -> None:
+        # Off by default; the notifier opts in via --include-signal-only.
+        self.assertNotIn("SIGNAL_ONLY", ALERTABLE_EVENT_TYPES)
+
+    def test_summary_signal_only_count_reflects_emitted_events(self) -> None:
+        rejected = {
+            "order_id": "rej-1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "REJECTED",
+            "reason": "risk:cash_insufficient",
+            "reference_price": 80000.0,
+            "requested_notional": 25.0,
+            "created_at": "2026-05-05T12:30:07",
+            "metadata": {},
+        }
+        pending_no_fill = {
+            "order_id": "pend-1",
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "status": "PENDING",
+            "reason": None,
+            "reference_price": 3000.0,
+            "requested_notional": 25.0,
+            "created_at": "2026-05-05T12:35:07",
+            "metadata": {},
+        }
+        self._write("crypto_paper_orders.json", [rejected, pending_no_fill])
+        result = self._build()
+        self.assertEqual(result["summary"]["signal_only_count"], 2)
+
+
+class CryptoPaperSemanticsLocalTzTests(unittest.TestCase):
+    """Local timezone enrichment without changing UTC archive ids."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.artifacts_dir = Path(self._tmp.name) / "crypto_paper"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifacts_dir / "evaluation").mkdir(exist_ok=True)
+        (self.artifacts_dir / "history").mkdir(exist_ok=True)
+        (self.artifacts_dir / "paper_forward").mkdir(exist_ok=True)
+        self.now = datetime(2026, 5, 5, 23, 30, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, relative: str, payload) -> None:
+        path = self.artifacts_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_local_display_for_iso_returns_argentina_time(self) -> None:
+        from src.reports.crypto_paper_semantics import (
+            DEFAULT_CRYPTO_LOCAL_TZ,
+            local_display_for_iso,
+            local_tz_label,
+        )
+
+        # 23:30 UTC -> 20:30 ART.
+        local = local_display_for_iso(
+            "2026-05-05T23:30:00+00:00", tz_name=DEFAULT_CRYPTO_LOCAL_TZ
+        )
+        self.assertIsNotNone(local)
+        assert local is not None  # mypy / type-narrow.
+        self.assertEqual(local["time_local"], "20:30")
+        self.assertEqual(local["time_utc"], "23:30")
+        self.assertEqual(local["tz_label"], "ART")
+        self.assertEqual(local_tz_label(DEFAULT_CRYPTO_LOCAL_TZ), "ART")
+
+    def test_summary_includes_local_tz_and_generated_at_local(self) -> None:
+        result = build_semantic_layer(
+            artifacts_dir=self.artifacts_dir,
+            output_dir=self.artifacts_dir / "semantic",
+            write=False,
+            now=self.now,
+        )
+        summary = result["summary"]
+        self.assertEqual(summary["local_tz"], "America/Argentina/Buenos_Aires")
+        self.assertIsInstance(summary["generated_at_local"], dict)
+        self.assertEqual(summary["generated_at_local"]["time_local"], "20:30")
+        self.assertEqual(summary["generated_at_local"]["tz_label"], "ART")
+
+    def test_archive_compatible_utc_iso_is_not_mutated(self) -> None:
+        # The semantic layer writes ``created_at`` as UTC ISO. The local-tz
+        # enrichment must NOT replace it (archive folders depend on UTC).
+        result = build_semantic_layer(
+            artifacts_dir=self.artifacts_dir,
+            output_dir=self.artifacts_dir / "semantic",
+            write=False,
+            now=self.now,
+        )
+        for event in result["events"]:
+            self.assertTrue(str(event["created_at"]).endswith("+00:00"))
+
+
 if __name__ == "__main__":
     unittest.main()
