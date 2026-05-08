@@ -345,5 +345,288 @@ class BuildCryptoPaperDashboardSignalOnlyTests(unittest.TestCase):
         self.assertIn("Signal-only", md_content)
 
 
+class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
+    """Dashboard surfaces a read-only Binance Spot Testnet section when
+    ``crypto_testnet`` artifacts are present. Paper-only artifacts must be
+    untouched, the section is omitted otherwise, and ``live_trading`` stays
+    ``False`` everywhere."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.artifacts_dir = self.root / "crypto_paper"
+        self.testnet_dir = self.root / "crypto_testnet"
+        self.dashboard_dir = self.artifacts_dir / "dashboard"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        self.now = datetime(2026, 5, 5, 23, 30, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seed_paper_minimum(self) -> None:
+        snapshot = {
+            "as_of": "2026-05-05T23:00:00",
+            "equity": 100.0,
+            "cash": 100.0,
+            "positions_value": 0.0,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "fees_paid": 0.0,
+            "positions": [],
+        }
+        (self.artifacts_dir / "crypto_paper_snapshot.json").write_text(
+            json.dumps(snapshot), encoding="utf-8"
+        )
+        (self.artifacts_dir / "crypto_paper_positions.json").write_text(
+            "[]", encoding="utf-8"
+        )
+
+    def _seed_testnet(
+        self,
+        *,
+        order_test_only: bool = True,
+        api_key_masked: str = "****abcd",
+    ) -> None:
+        orders = [
+            {
+                "client_order_id": "tnbuy-deadbeefdeadbeefdeadbeef",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "type": "MARKET",
+                "quantity": None,
+                "quote_order_qty": 25.0,
+                "requested_notional": 25.0,
+                "reference_price": 76000.0,
+                "paper_event_id": "buy:fill-1:2026",
+                "paper_event_type": "BUY_FILLED_PAPER",
+                "mode": "order_test" if order_test_only else "place_order",
+                "status": "TEST_OK" if order_test_only else "FILLED",
+                "reason": None,
+                "created_at": "2026-05-05T22:00:00+00:00",
+                "metadata": {},
+            },
+            {
+                "client_order_id": "tnbuy-rejected",
+                "symbol": "DOGEUSDT",
+                "side": "BUY",
+                "type": "MARKET",
+                "quantity": None,
+                "quote_order_qty": None,
+                "requested_notional": 25.0,
+                "reference_price": 0.1,
+                "paper_event_id": "buy:fill-2:2026",
+                "paper_event_type": "BUY_FILLED_PAPER",
+                "mode": "order_test" if order_test_only else "place_order",
+                "status": "REJECTED",
+                "reason": "symbol_not_allowed:DOGEUSDT",
+                "created_at": "2026-05-05T22:01:00+00:00",
+                "metadata": {},
+            },
+        ]
+        fills = (
+            []
+            if order_test_only
+            else [
+                {
+                    "fill_id": "tn-tnbuy-deadbeef",
+                    "client_order_id": "tnbuy-deadbeefdeadbeefdeadbeef",
+                    "binance_order_id": 9999,
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 0.0003,
+                    "price": 76000.0,
+                    "commission": 0.025,
+                    "commission_asset": "USDT",
+                    "status": "FILLED",
+                    "transact_time_ms": 1700000001000,
+                    "filled_at": "2026-05-05T22:00:01+00:00",
+                    "metadata": {},
+                }
+            ]
+        )
+        positions = (
+            []
+            if order_test_only
+            else [
+                {
+                    "symbol": "BTCUSDT",
+                    "quantity": 0.0003,
+                    "avg_entry_price": 76000.0,
+                    "last_event_at": "2026-05-05T22:00:01+00:00",
+                    "metadata": {},
+                }
+            ]
+        )
+        reconciliation = [
+            {
+                "paper_event_id": "buy:fill-1:2026",
+                "paper_event_type": "BUY_FILLED_PAPER",
+                "symbol": "BTCUSDT",
+                "paper_side": "BUY",
+                "expected_notional": 25.0,
+                "testnet_client_order_id": "tnbuy-deadbeefdeadbeefdeadbeef",
+                "testnet_status": "TEST_OK" if order_test_only else "FILLED",
+                "testnet_mode": "order_test" if order_test_only else "place_order",
+                "match": True,
+                "mismatches": [],
+                "metadata": {},
+            }
+        ]
+        result = {
+            "ok": True,
+            "testnet": True,
+            "live_trading": False,
+            "order_test_only": order_test_only,
+            "base_url": "https://testnet.binance.vision",
+            "max_notional": 25.0,
+            "allowed_symbols": ["BTCUSDT", "ETHUSDT"],
+            "considered_count": 2,
+            "placed_count": 0 if order_test_only else 1,
+            "test_ok_count": 1 if order_test_only else 0,
+            "rejected_count": 1,
+            "skipped_count": 0,
+            "warnings": [],
+            "api_key_masked": api_key_masked,
+            "testnet_artifacts_dir": str(self.testnet_dir),
+        }
+        (self.testnet_dir / "binance_testnet_orders.json").write_text(
+            json.dumps(orders), encoding="utf-8"
+        )
+        (self.testnet_dir / "binance_testnet_fills.json").write_text(
+            json.dumps(fills), encoding="utf-8"
+        )
+        (self.testnet_dir / "binance_testnet_positions.json").write_text(
+            json.dumps(positions), encoding="utf-8"
+        )
+        (self.testnet_dir / "binance_testnet_reconciliation.json").write_text(
+            json.dumps(reconciliation), encoding="utf-8"
+        )
+        (self.testnet_dir / "binance_testnet_execution_result.json").write_text(
+            json.dumps(result), encoding="utf-8"
+        )
+
+    def test_section_absent_when_no_testnet_artifacts(self) -> None:
+        self._seed_paper_minimum()
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,  # empty dir => no artifacts
+            now=self.now,
+        )
+        self.assertFalse(result["data"]["testnet"]["present"])
+        html_content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("Binance Spot Testnet", html_content)
+        self.assertEqual(result["data"]["live_trading"], False)
+
+    def test_section_renders_in_order_test_mode(self) -> None:
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=True)
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        section = result["data"]["testnet"]
+        self.assertTrue(section["present"])
+        self.assertTrue(section["order_test_only"])
+        self.assertEqual(section["test_ok_count"], 1)
+        self.assertEqual(section["placed_count"], 0)
+        self.assertEqual(section["rejected_count"], 1)
+        self.assertEqual(section["api_key_masked"], "****abcd")
+        self.assertEqual(section["base_url"], "https://testnet.binance.vision")
+
+        html_content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8")
+        self.assertIn("Binance Spot Testnet", html_content)
+        self.assertIn("order/test", html_content)
+        self.assertIn("****abcd", html_content)
+        self.assertIn("BTCUSDT", html_content)
+        self.assertIn("symbol_not_allowed:DOGEUSDT", html_content)
+
+    def test_section_renders_in_real_place_order_mode(self) -> None:
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=False)
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        section = result["data"]["testnet"]
+        self.assertTrue(section["present"])
+        self.assertFalse(section["order_test_only"])
+        self.assertEqual(section["placed_count"], 1)
+        self.assertEqual(section["fills_count"], 1)
+        self.assertEqual(len(section["positions"]), 1)
+        html_content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8")
+        self.assertIn("place_order (real testnet)", html_content)
+        # live_trading must remain False even in real testnet mode.
+        self.assertFalse(result["data"]["live_trading"])
+
+    def test_summary_markdown_includes_testnet_block_when_present(self) -> None:
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=True)
+        build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        md = (self.dashboard_dir / "latest_summary.md").read_text(encoding="utf-8")
+        self.assertIn("Binance Spot Testnet", md)
+        self.assertIn("order/test", md)
+        self.assertIn("Test OK: 1", md)
+        self.assertIn("Rejected: 1", md)
+
+    def test_dashboard_does_not_modify_testnet_artifacts(self) -> None:
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=True)
+        before = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in self.testnet_dir.iterdir()
+            if path.is_file()
+        }
+        build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        after = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in self.testnet_dir.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_default_testnet_dir_is_sibling_crypto_testnet(self) -> None:
+        # Don't pass testnet_artifacts_dir => the dashboard should fall back
+        # to <artifacts_dir>/../crypto_testnet, which is self.testnet_dir.
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=True)
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            now=self.now,
+        )
+        self.assertTrue(result["data"]["testnet"]["present"])
+
+    def test_html_remains_offline_with_testnet_section(self) -> None:
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=False)
+        build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8").lower()
+        # The base_url string is present once in the testnet meta line, but
+        # the page must not include script/CDN references.
+        for forbidden in ("cdn.", "<script", " src="):
+            self.assertNotIn(forbidden, content)
+
+
 if __name__ == "__main__":
     unittest.main()

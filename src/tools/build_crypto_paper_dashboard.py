@@ -42,6 +42,9 @@ _RECENT_FILLS_LIMIT = 10
 _RECENT_EXITS_LIMIT = 10
 _RECENT_EVENTS_LIMIT = 25
 _RECENT_SIGNAL_ONLY_LIMIT = 10
+_RECENT_TESTNET_ORDERS_LIMIT = 10
+_RECENT_TESTNET_FILLS_LIMIT = 10
+_TESTNET_DIRNAME = "crypto_testnet"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force rebuild of the semantic layer from the canonical artifacts.",
     )
+    parser.add_argument(
+        "--testnet-artifacts-dir",
+        default=None,
+        help=(
+            "Optional Binance Spot Testnet artifacts root to surface read-only "
+            "in the dashboard (default: <artifacts-dir>/../crypto_testnet)."
+        ),
+    )
     return parser
 
 
@@ -75,6 +86,7 @@ def build_crypto_paper_dashboard(
     dashboard_dir: str | Path | None = None,
     rebuild_semantic: bool = False,
     now: datetime | None = None,
+    testnet_artifacts_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     artifacts_root = Path(artifacts_dir)
     target_dir = (
@@ -154,6 +166,13 @@ def build_crypto_paper_dashboard(
 
     current_action = _select_current_action(events)
 
+    testnet_root = (
+        Path(testnet_artifacts_dir)
+        if testnet_artifacts_dir is not None
+        else artifacts_root.parent / _TESTNET_DIRNAME
+    )
+    testnet_section = _build_testnet_section(testnet_root)
+
     dashboard_data = {
         "generated_at": moment.isoformat(),
         "paper_only": True,
@@ -196,6 +215,7 @@ def build_crypto_paper_dashboard(
         "forward_run_status": summary.get("forward_run_status"),
         "local_tz": summary.get("local_tz") or DEFAULT_CRYPTO_LOCAL_TZ,
         "generated_at_local": summary.get("generated_at_local"),
+        "testnet": testnet_section,
     }
 
     index_html = _render_index_html(dashboard_data)
@@ -260,6 +280,99 @@ def _select_current_action(events: list[dict[str, Any]]) -> dict[str, Any] | Non
         "manual_action": events[0].get("manual_action"),
         "paper_only": True,
         "not_auto_executed": True,
+    }
+
+
+def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
+    """Read read-only Binance Spot Testnet artifacts under ``testnet_root`` and
+    return a JSON-serializable section. Returns ``{"present": False}`` when
+    no testnet artifacts exist (the dashboard then renders nothing).
+
+    The dashboard never writes into the testnet artifact tree.
+    """
+
+    if not testnet_root.exists() or not testnet_root.is_dir():
+        return {"present": False}
+
+    orders = _load_json(testnet_root / "binance_testnet_orders.json", default=[])
+    fills = _load_json(testnet_root / "binance_testnet_fills.json", default=[])
+    positions = _load_json(testnet_root / "binance_testnet_positions.json", default=[])
+    reconciliation = _load_json(
+        testnet_root / "binance_testnet_reconciliation.json", default=[]
+    )
+    last_result = _load_json(
+        testnet_root / "binance_testnet_execution_result.json", default={}
+    )
+    if not isinstance(orders, list):
+        orders = []
+    if not isinstance(fills, list):
+        fills = []
+    if not isinstance(positions, list):
+        positions = []
+    if not isinstance(reconciliation, list):
+        reconciliation = []
+    if not isinstance(last_result, dict):
+        last_result = {}
+
+    if not orders and not fills and not positions and not last_result:
+        return {"present": False}
+
+    accepted = [
+        order
+        for order in orders
+        if isinstance(order, dict) and str(order.get("status") or "").upper() != "REJECTED"
+    ]
+    rejected = [
+        order
+        for order in orders
+        if isinstance(order, dict) and str(order.get("status") or "").upper() == "REJECTED"
+    ]
+    test_ok_count = sum(
+        1
+        for order in accepted
+        if str(order.get("status") or "").upper() == "TEST_OK"
+        or str(order.get("mode") or "") == "order_test"
+    )
+    placed_count = sum(
+        1
+        for order in accepted
+        if str(order.get("mode") or "") == "place_order"
+    )
+
+    recent_orders = sorted(
+        [order for order in orders if isinstance(order, dict)],
+        key=lambda item: str(item.get("created_at") or ""),
+        reverse=True,
+    )[:_RECENT_TESTNET_ORDERS_LIMIT]
+    recent_fills = sorted(
+        [fill for fill in fills if isinstance(fill, dict)],
+        key=lambda item: str(item.get("filled_at") or ""),
+        reverse=True,
+    )[:_RECENT_TESTNET_FILLS_LIMIT]
+
+    return {
+        "present": True,
+        "live_trading": False,
+        "testnet": True,
+        "ok": bool(last_result.get("ok")),
+        "order_test_only": last_result.get("order_test_only"),
+        "base_url": last_result.get("base_url"),
+        "max_notional": last_result.get("max_notional"),
+        "allowed_symbols": list(last_result.get("allowed_symbols") or []),
+        "api_key_masked": last_result.get("api_key_masked"),
+        "considered_count": int(last_result.get("considered_count") or 0),
+        "placed_count": int(placed_count),
+        "test_ok_count": int(test_ok_count),
+        "rejected_count": int(len(rejected)),
+        "skipped_count": int(last_result.get("skipped_count") or 0),
+        "orders_count": int(len(orders)),
+        "fills_count": int(len(fills)),
+        "positions": positions,
+        "recent_orders": recent_orders,
+        "recent_fills": recent_fills,
+        "reconciliation": reconciliation,
+        "reason": last_result.get("reason"),
+        "warnings": list(last_result.get("warnings") or []),
     }
 
 
@@ -409,6 +522,96 @@ def _render_index_html(data: dict[str, Any]) -> str:
     ))
     parts.append("</section>")
 
+    testnet = data.get("testnet") or {}
+    if isinstance(testnet, dict) and testnet.get("present"):
+        parts.append('<section class="block testnet">')
+        parts.append('<h2>\U0001F9EA Binance Spot Testnet (no live trading)</h2>')
+        mode_label = (
+            "order/test (no real placement)"
+            if testnet.get("order_test_only")
+            else "place_order (real testnet)"
+        )
+        parts.append(
+            '<p class="testnet-meta">'
+            f'Base URL: {html.escape(str(testnet.get("base_url") or "n/a"))} '
+            f'| Mode: {html.escape(mode_label)} '
+            f'| API key: {html.escape(str(testnet.get("api_key_masked") or "n/a"))} '
+            f'| Max notional: {html.escape(_format_number(testnet.get("max_notional")))}'
+            "</p>"
+        )
+        parts.append('<div class="cards">')
+        parts.append(_render_card("Considered", _format_int(testnet.get("considered_count"))))
+        parts.append(_render_card("Test OK", _format_int(testnet.get("test_ok_count"))))
+        parts.append(_render_card("Placed", _format_int(testnet.get("placed_count"))))
+        parts.append(_render_card("Rejected", _format_int(testnet.get("rejected_count"))))
+        parts.append(_render_card("Skipped", _format_int(testnet.get("skipped_count"))))
+        parts.append(_render_card("Fills", _format_int(testnet.get("fills_count"))))
+        parts.append("</div>")
+        parts.append("<h3>Recent testnet orders</h3>")
+        parts.append(
+            _render_table(
+                [
+                    "created_at",
+                    "symbol",
+                    "side",
+                    "type",
+                    "mode",
+                    "status",
+                    "requested_notional",
+                    "client_order_id",
+                    "reason",
+                ],
+                testnet.get("recent_orders") or [],
+            )
+        )
+        parts.append("<h3>Recent testnet fills</h3>")
+        parts.append(
+            _render_table(
+                [
+                    "filled_at",
+                    "symbol",
+                    "side",
+                    "quantity",
+                    "price",
+                    "commission",
+                    "commission_asset",
+                    "status",
+                    "client_order_id",
+                ],
+                testnet.get("recent_fills") or [],
+            )
+        )
+        parts.append("<h3>Testnet positions</h3>")
+        parts.append(
+            _render_table(
+                ["symbol", "quantity", "avg_entry_price", "last_event_at"],
+                testnet.get("positions") or [],
+            )
+        )
+        parts.append("<h3>Paper-vs-testnet reconciliation</h3>")
+        parts.append(
+            _render_table(
+                [
+                    "paper_event_id",
+                    "paper_event_type",
+                    "symbol",
+                    "paper_side",
+                    "expected_notional",
+                    "testnet_status",
+                    "testnet_mode",
+                    "match",
+                    "mismatches",
+                ],
+                testnet.get("reconciliation") or [],
+            )
+        )
+        if testnet.get("reason"):
+            parts.append(
+                f'<p class="testnet-reason"><strong>Last run reason:</strong> '
+                f'{html.escape(str(testnet.get("reason")))}</p>'
+            )
+        parts.append("</section>")
+
     warnings = data.get("warnings") or []
     if warnings:
         parts.append('<section class="block warnings">')
@@ -541,6 +744,24 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
         lines.append(f"- Title: {current_action.get('human_title')}")
         lines.append(f"- Manual action: {current_action.get('manual_action')}")
         lines.append("")
+    testnet = data.get("testnet") or {}
+    if isinstance(testnet, dict) and testnet.get("present"):
+        lines.append("## Binance Spot Testnet (no live trading)")
+        mode_label = (
+            "order/test"
+            if testnet.get("order_test_only")
+            else "place_order (real testnet)"
+        )
+        lines.append(f"- Mode: {mode_label}")
+        lines.append(f"- Base URL: {testnet.get('base_url') or 'n/a'}")
+        lines.append(f"- Considered: {_format_int(testnet.get('considered_count'))}")
+        lines.append(f"- Test OK: {_format_int(testnet.get('test_ok_count'))}")
+        lines.append(f"- Placed: {_format_int(testnet.get('placed_count'))}")
+        lines.append(f"- Rejected: {_format_int(testnet.get('rejected_count'))}")
+        lines.append(f"- Skipped: {_format_int(testnet.get('skipped_count'))}")
+        if testnet.get("reason"):
+            lines.append(f"- Last reason: {testnet.get('reason')}")
+        lines.append("")
     warnings = data.get("warnings") or []
     if warnings:
         lines.append("## Warnings")
@@ -583,6 +804,11 @@ body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 0;
 .warnings ul { margin: 0; padding-left: 20px; }
 .footer { padding: 16px 24px; border-top: 1px solid #2d333b; color: #8b949e; font-size: 12px; }
 .footer p { margin: 4px 0; }
+.testnet { background: #11161d; border-top: 2px dashed #d29922; }
+.testnet h2 { color: #d29922; }
+.testnet h3 { color: #ffa657; font-size: 14px; margin: 16px 0 8px 0; }
+.testnet-meta { color: #8b949e; font-size: 12px; margin: 0 0 12px 0; }
+.testnet-reason { color: #ffa657; margin-top: 12px; }
 """
 
 
@@ -607,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
         artifacts_dir=args.artifacts_dir,
         dashboard_dir=args.dashboard_dir,
         rebuild_semantic=bool(args.rebuild_semantic),
+        testnet_artifacts_dir=args.testnet_artifacts_dir,
     )
     sys.stdout.write(
         f"[CRYPTO-DASHBOARD] paper-only OK\n"
