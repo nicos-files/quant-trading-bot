@@ -64,38 +64,38 @@ def main() -> None:
 
         append_signal_artifact(manifest, args.signals)
 
-    registry = RuleRegistry()
-    registry.register_sizing("size.fixed", sizing_fixed)
-    registry.register_constraint("risk.max_positions", constraint_max_positions)
-    registry.register_filter("eligibility.liquid", filter_min_liquidity)
+        registry = RuleRegistry()
+        registry.register_sizing("size.fixed", sizing_fixed)
+        registry.register_constraint("risk.max_positions", constraint_max_positions)
+        registry.register_filter("eligibility.liquid", filter_min_liquidity)
 
-    rules = registry.resolve(
-        sizing_rule=strategy.rules.sizing_rule,
-        constraints=strategy.rules.constraints,
-        filters=strategy.rules.filters,
-    )
+        rules = registry.resolve(
+            sizing_rule=strategy.rules.sizing_rule,
+            constraints=strategy.rules.constraints,
+            filters=strategy.rules.filters,
+        )
 
-    decisions = run_decision_engine(
-        strategy=strategy,
-        signals=signals["signals"],
-        rules=rules,
-        rule_configs={"sizing_rule": {}, "constraints": {}, "filters": {}},
-    )
+        decisions = run_decision_engine(
+            strategy=strategy,
+            signals=signals["signals"],
+            rules=rules,
+            rule_configs={"sizing_rule": {}, "constraints": {}, "filters": {}},
+        )
 
         output_path, decision_entry = write_decision_outputs(
-        run_id=args.run_id,
-        decisions=[d.__dict__ for d in decisions],
-        strategy_id=strategy.strategy_id,
-        variant_id=strategy.variant_id,
-        horizon=strategy.horizon,
-        rule_refs={
-            "sizing_rule": strategy.rules.sizing_rule,
-            "constraints": strategy.rules.constraints,
-            "filters": strategy.rules.filters,
-        },
-        config_snapshot_path=str(config_snapshot),
-        base_path=args.base_path,
-    )
+            run_id=args.run_id,
+            decisions=[d.__dict__ for d in decisions],
+            strategy_id=strategy.strategy_id,
+            variant_id=strategy.variant_id,
+            horizon=strategy.horizon,
+            rule_refs={
+                "sizing_rule": strategy.rules.sizing_rule,
+                "constraints": strategy.rules.constraints,
+                "filters": strategy.rules.filters,
+            },
+            config_snapshot_path=str(config_snapshot),
+            base_path=args.base_path,
+        )
 
         # update manifest with artifacts and finalize
         run_manifest = append_manifest_artifact(run_manifest, manifest["artifact_index"][0])
