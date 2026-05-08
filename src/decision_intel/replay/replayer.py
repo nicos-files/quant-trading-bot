@@ -82,14 +82,14 @@ def replay_run(
 
     replay_root, replay_base, replay_run_id = _replay_root(run_id, base_path=base_path, replay_id=replay_id)
     replay_output_path, _ = write_decision_outputs(
-        run_id=replay_run_id,
+        run_id=run_id,
         decisions=[d.__dict__ for d in decisions],
         strategy_id=strategy.strategy_id,
         variant_id=strategy.variant_id,
         horizon=strategy.horizon,
         rule_refs=rule_refs,
         config_snapshot_path=config_snapshot_path,
-        base_path=replay_base,
+        base_path=str(replay_root),
     )
 
     replay_artifacts = {DECISION_ARTIFACT_NAME: str(replay_output_path)}
@@ -141,7 +141,7 @@ def _find_artifact_path(manifest: Dict[str, Any], name: str) -> str:
 def _replay_root(run_id: str, base_path: str, replay_id: Optional[str]) -> tuple[Path, str, str]:
     if replay_id is None:
         replay_id = datetime.now(timezone.utc).strftime("replay-%Y%m%dT%H%M%SZ")
-    replay_base_root = Path(base_path).parent / "replays" / run_id
+    replay_base_root = Path(base_path) / "replays" / run_id
     replay_root = replay_base_root / replay_id
     replay_root.mkdir(parents=True, exist_ok=False)
     return replay_root, str(replay_base_root), replay_id
