@@ -61,3 +61,19 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Runtime/generated artifacts
+artifacts/crypto_paper/
+artifacts/long_term/
+artifacts/capital_routing/
+artifacts/manual_execution/
+artifacts/reports/
+
+# Local logs and caches
+*.log
+.env
+.env.*
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
