@@ -1,1 +1,0 @@
-{"bootstrap_dedupe": false, "chat_id_masked": "******0977", "considered_count": null, "dry_run": false, "live_trading": false, "marked_count": 0, "min_severity": "ACTION", "ok": true, "paper_only": true, "reason": null, "sent_count": 0, "skipped_count": 13, "state_path": "artifacts/crypto_paper/semantic/telegram_alert_state.json"}

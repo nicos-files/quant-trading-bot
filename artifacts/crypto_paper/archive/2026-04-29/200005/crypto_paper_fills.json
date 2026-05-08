@@ -1,1 +1,0 @@
-[{"fee":0.025,"fill_id":"crypto-paper-fill-0001","fill_price":76405.993905,"filled_at":"2026-04-28T22:00:09.418034","gross_notional":25.0,"metadata":{"provider":"binance_spot","stop_loss":74840.444,"take_profit":77131.478},"net_notional":25.025,"order_id":"crypto-paper-order-0001","quantity":0.0003271994607004779,"side":"BUY","slippage":38.183904999999996,"symbol":"BTCUSDT"}]
