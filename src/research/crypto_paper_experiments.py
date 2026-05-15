@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +101,7 @@ def run_crypto_paper_experiments(
     }
     configs = expand_crypto_paper_parameter_grid(experiment_config, max_configs=max_configs)
     ranked_results: list[dict[str, Any]] = []
-    started_at = datetime.utcnow().isoformat()
+    started_at = datetime.now(timezone.utc).isoformat()
     for candidate in configs:
         result = _run_single_config(
             experiment_config=experiment_config,
@@ -118,7 +118,7 @@ def run_crypto_paper_experiments(
     summary = {
         "experiment_name": str(experiment_config.get("experiment_name") or "crypto_paper_experiment"),
         "started_at": started_at,
-        "completed_at": datetime.utcnow().isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
         "symbols": sorted(normalized_candles.keys()),
         "configs_tested": len(ranked_results),
         "eligible_configs": sum(1 for item in ranked_results if bool(item.get("eligible"))),
@@ -470,7 +470,7 @@ def _run_single_config(
             }
         )
 
-    final_time = all_events[-1]["timestamp"] if all_events else datetime.utcnow()
+    final_time = all_events[-1]["timestamp"] if all_events else datetime.now(timezone.utc)
     final_snapshot = ledger.snapshot(final_time, metadata={"config_id": config_id})
     payloads = {
         "fills": [fill.to_dict() for fill in fills],

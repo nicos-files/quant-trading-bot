@@ -9,6 +9,7 @@ from src.decision_intel.contracts.recommendations.recommendation_models import R
 from src.decision_intel.utils.io import ensure_run_dir
 from src.market_data.crypto_symbols import is_crypto_symbol, normalize_crypto_symbol
 from src.risk import RiskCheckInput, RiskEngine
+from src.utils.atomic_io import atomic_write_json
 
 from .crypto_paper_ledger import CryptoPaperLedger
 from .crypto_paper_models import CryptoPaperExitEvent, CryptoPaperPosition
@@ -331,7 +332,7 @@ def write_crypto_paper_execution_artifacts(
     written: dict[str, Path] = {}
     for filename, payload in payloads.items():
         path = target_dir / filename
-        path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, payload)
         written[filename] = path
     return written
 
@@ -345,11 +346,26 @@ def load_crypto_paper_ledger(
     base_path: str = "runs",
     config: CryptoPaperExecutionConfig | None = None,
 ) -> CryptoPaperLedger:
+    ledger, _, _ = load_crypto_paper_ledger_state(
+        run_id=run_id,
+        base_path=base_path,
+        config=config,
+    )
+    return ledger
+
+
+def load_crypto_paper_ledger_state(
+    run_id: str,
+    base_path: str = "runs",
+    config: CryptoPaperExecutionConfig | None = None,
+) -> tuple[CryptoPaperLedger, list[str], bool]:
     active_config = config or CryptoPaperExecutionConfig()
     ledger = CryptoPaperLedger(active_config)
     root = Path(base_path) / run_id / "artifacts" / "crypto_paper"
     snapshot_path = root / "crypto_paper_snapshot.json"
     positions_path = root / "crypto_paper_positions.json"
+    warnings: list[str] = []
+    degraded = False
     if snapshot_path.exists():
         try:
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -357,19 +373,32 @@ def load_crypto_paper_ledger(
                 ledger.cash = float(snapshot.get("cash") or ledger.cash)
                 ledger.fees_paid = float(snapshot.get("fees_paid") or 0.0)
                 ledger.realized_pnl = float(snapshot.get("realized_pnl") or 0.0)
-        except Exception:
-            pass
+            else:
+                warnings.append("ledger_snapshot_invalid")
+                degraded = True
+        except Exception as exc:
+            warnings.append(f"ledger_snapshot_malformed:{exc}")
+            degraded = True
     if positions_path.exists():
         try:
             payload = json.loads(positions_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
             payload = []
+            warnings.append(f"ledger_positions_malformed:{exc}")
+            degraded = True
+        if positions_path.exists() and not isinstance(payload, list):
+            warnings.append("ledger_positions_invalid")
+            degraded = True
         if isinstance(payload, list):
             for item in payload:
                 position = _position_from_payload(item)
+                if item is not None and position is None:
+                    warnings.append("ledger_position_invalid")
+                    degraded = True
+                    continue
                 if position is not None and float(position.quantity) > 0.0:
                     ledger.positions[position.symbol] = position
-    return ledger
+    return ledger, sorted(set(warnings)), degraded
 
 
 def _position_from_payload(payload: Any) -> CryptoPaperPosition | None:

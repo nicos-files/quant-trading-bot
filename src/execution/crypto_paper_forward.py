@@ -24,8 +24,19 @@ from src.execution.crypto_paper_models import (
     CryptoPaperPortfolioSnapshot,
     CryptoPaperPosition,
 )
-from src.market_data.providers import BinanceSpotMarketDataProvider, ProviderHealth
+from src.market_data.providers import (
+    BinanceSpotMarketDataProvider,
+    ProviderHealth,
+    parse_quote_timestamp,
+    quote_age_seconds,
+)
 from src.risk import RiskEngine
+from src.utils.atomic_io import (
+    FileLockActiveError,
+    advisory_file_lock,
+    atomic_write_json,
+    atomic_write_text,
+)
 
 
 def load_crypto_paper_forward_candidate(path: str | Path) -> dict[str, Any]:
@@ -164,6 +175,7 @@ def run_crypto_paper_forward(
     artifact_root = Path(artifacts_dir)
     paper_forward_dir = artifact_root / "paper_forward"
     paper_forward_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = paper_forward_dir / ".crypto_paper_forward.lock"
 
     candidate_payload = (
         load_crypto_paper_forward_candidate(candidate_config)
@@ -194,26 +206,76 @@ def run_crypto_paper_forward(
         validation["warnings"] = _dedupe(list(validation["warnings"]) + [f"provider_unhealthy:{health.message}"])
 
     validation_path = paper_forward_dir / "crypto_paper_forward_validation.json"
-    validation_path.write_text(json.dumps(validation, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
-
     effective_as_of = _parse_as_of(as_of)
-    if not validation["eligible_to_run"]:
-        result = {
-            "status": "FAILED",
+    try:
+        with advisory_file_lock(
+            lock_path,
+            metadata={"mode": "crypto_paper_forward", "as_of": effective_as_of.isoformat()},
+        ):
+            atomic_write_json(validation_path, validation)
+            if not validation["eligible_to_run"]:
+                result = {
+                    "status": "FAILED",
+                    "paper_only": True,
+                    "dry_run": bool(dry_run),
+                    "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
+                    "warnings": list(validation["warnings"]),
+                    "validation_errors": list(validation["errors"]),
+                    "artifacts": {"crypto_paper_forward_validation.json": str(validation_path)},
+                    "live_trading": False,
+                }
+                _write_forward_terminal_artifacts(
+                    paper_forward_dir=paper_forward_dir,
+                    result=result,
+                    report_text=_build_failed_report(result),
+                )
+                return result
+
+            return _run_forward_with_lock(
+                artifact_root=artifact_root,
+                paper_forward_dir=paper_forward_dir,
+                validation=validation,
+                validation_path=validation_path,
+                candidate_config=candidate_config,
+                candidate_payload=candidate_payload,
+                effective_as_of=effective_as_of,
+                dry_run=dry_run,
+                active_provider=active_provider,
+                health=health,
+                injected_bundle=injected_bundle,
+                engine=engine,
+                executor=executor,
+            )
+    except FileLockActiveError:
+        return {
+            "status": "SKIPPED",
             "paper_only": True,
             "dry_run": bool(dry_run),
             "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
-            "warnings": list(validation["warnings"]),
-            "validation_errors": list(validation["errors"]),
-            "artifacts": {"crypto_paper_forward_validation.json": str(validation_path)},
+            "warnings": ["forward_run_locked"],
+            "validation_errors": [],
+            "artifacts": {},
             "live_trading": False,
+            "reason": "forward_run_locked",
+            "lock_path": str(lock_path),
         }
-        result_path = paper_forward_dir / "crypto_paper_forward_result.json"
-        result_path.write_text(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
-        report_path = paper_forward_dir / "crypto_paper_forward_report.md"
-        report_path.write_text(_build_failed_report(result), encoding="utf-8")
-        return result
 
+def _run_forward_with_lock(
+    *,
+    artifact_root: Path,
+    paper_forward_dir: Path,
+    validation: dict[str, Any],
+    validation_path: Path,
+    candidate_config: dict[str, Any] | str | Path,
+    candidate_payload: dict[str, Any],
+    effective_as_of: datetime,
+    dry_run: bool,
+    active_provider: Any,
+    health: ProviderHealth,
+    injected_bundle: dict[str, Any] | None,
+    engine: IntradayCryptoEngine | None,
+    executor: Any | None,
+) -> dict[str, Any]:
     warnings: list[str] = list(validation["warnings"])
     step_status = {
         "validation": "SUCCESS",
@@ -224,6 +286,12 @@ def run_crypto_paper_forward(
         "evaluation": "PENDING",
     }
     active_engine = engine or IntradayCryptoEngine()
+    crypto_risk_config = dict(candidate_payload.get("crypto_risk") or candidate_payload.get("risk") or {})
+    crypto_risk_config.setdefault("reject_reentry_on_open_position", True)
+    max_quote_age_seconds = _resolve_max_quote_age_seconds(
+        strategy_config=dict(candidate_payload.get("strategy") or {}),
+        risk_config=crypto_risk_config,
+    )
     active_executor = executor or __import__("src.execution.crypto_paper_executor", fromlist=["CryptoPaperExecutor"]).CryptoPaperExecutor(
         CryptoPaperExecutionConfig(
             starting_cash=100.0,
@@ -231,12 +299,39 @@ def run_crypto_paper_forward(
             max_notional_per_order=float((candidate_payload.get("strategy") or {}).get("max_paper_notional") or 25.0),
             enable_exits=True,
         ),
-        RiskEngine(),
+        RiskEngine(crypto_risk_config),
     )
-    ledger = _load_forward_ledger(
+    ledger, ledger_warnings, ledger_degraded = _load_forward_ledger(
         artifact_root=artifact_root,
         config=active_executor.config,
     )
+    warnings.extend(ledger_warnings)
+    if ledger_degraded:
+        result = {
+            "status": "FAILED",
+            "paper_only": True,
+            "dry_run": bool(dry_run),
+            "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
+            "warnings": _dedupe(warnings + ["ledger_state_corrupt"]),
+            "validation_errors": list(validation["errors"]),
+            "artifacts": {"crypto_paper_forward_validation.json": str(validation_path)},
+            "live_trading": False,
+            "reason": "ledger_state_corrupt",
+            "step_status": {
+                **step_status,
+                "signals": "SKIPPED",
+                "execution": "SKIPPED",
+                "daily_close": "SKIPPED",
+                "history": "SKIPPED",
+                "evaluation": "SKIPPED",
+            },
+        }
+        _write_forward_terminal_artifacts(
+            paper_forward_dir=paper_forward_dir,
+            result=result,
+            report_text=_build_failed_report(result),
+        )
+        return result
 
     enabled_symbols = [
         str(item.get("symbol") or "").upper()
@@ -253,11 +348,15 @@ def run_crypto_paper_forward(
         run_id=effective_as_of.strftime("%Y%m%d-%H%M"),
         mode="crypto_paper_forward",
         universe=enabled_symbols,
+        positions=list(ledger.positions.values()),
+        cash=float(ledger.cash),
         config={
             "crypto_universe": list(candidate_payload.get("symbols") or []),
             "crypto_strategy": dict(candidate_payload.get("strategy") or {}),
             "crypto_symbols": enabled_symbols,
             "enable_crypto_market_data": True,
+            "crypto_risk": crypto_risk_config,
+            "crypto_execution": active_executor.config.to_dict(),
         },
         provider_health={
             active_provider.provider_name: {
@@ -283,11 +382,29 @@ def run_crypto_paper_forward(
         warnings.extend(engine_result.diagnostics.warnings)
         for symbol in sorted(set(strategy_enabled_symbols + list(ledger.positions.keys()))):
             try:
-                latest_quotes[symbol] = active_provider.get_latest_quote(symbol)
+                quote = active_provider.get_latest_quote(symbol)
             except Exception as exc:
                 warnings.append(f"Quote retrieval failed for {symbol}: {exc}")
+                continue
+            quote_issue = _quote_issue(
+                quote,
+                as_of=effective_as_of,
+                max_quote_age_seconds=max_quote_age_seconds,
+            )
+            if quote_issue is not None:
+                warnings.append(f"{quote_issue}:{symbol}")
+                continue
+            latest_quotes[symbol] = quote
         for item in engine_result.recommendations.recommendations:
-            latest_quotes.setdefault(item.asset_id, {"last_price": item.price_used, "ask": item.price_used, "provider": active_provider.provider_name})
+            latest_quotes.setdefault(
+                item.asset_id,
+                {
+                    "last_price": item.price_used,
+                    "ask": item.price_used,
+                    "provider": active_provider.provider_name,
+                    "timestamp": effective_as_of.isoformat(),
+                },
+            )
     except Exception as exc:
         step_status["signals"] = "FAILED"
         warnings.append(f"signal_engine_failed:{exc}")
@@ -341,6 +458,7 @@ def run_crypto_paper_forward(
             price_map=price_map,
             provider=None if injected_bundle is not None else active_provider,
             provider_health=validation["provider_health"],
+            snapshot_kind="intraday_run",
         )
         step_status["daily_close"] = "SUCCESS"
         warnings.extend(close_result.warnings)
@@ -421,6 +539,7 @@ def run_crypto_paper_forward(
         "manual_trade_ticket_count": len(tickets),
         "live_trading": False,
         "provider_health": validation["provider_health"],
+        "snapshot_kind": "intraday_run",
         "artifacts": {
             "crypto_paper_forward_validation.json": str(validation_path),
             **ticket_artifacts,
@@ -428,6 +547,7 @@ def run_crypto_paper_forward(
     }
     if close_result is not None:
         result["daily_close"] = {
+            "snapshot_kind": close_result.metadata.get("snapshot_kind"),
             "ending_equity": close_result.performance.ending_equity,
             "total_pnl": close_result.performance.total_pnl,
             "artifacts": dict(close_result.artifacts_written),
@@ -438,15 +558,17 @@ def run_crypto_paper_forward(
         result["evaluation"] = evaluation_result
 
     result_path = paper_forward_dir / "crypto_paper_forward_result.json"
-    result_path.write_text(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
     report_text = build_crypto_paper_forward_report(
         result=result,
         recommendations=engine_result.recommendations,
         execution_result=combined_execution,
         tickets=tickets,
     )
-    report_path = paper_forward_dir / "crypto_paper_forward_report.md"
-    report_path.write_text(report_text, encoding="utf-8")
+    report_path = _write_forward_terminal_artifacts(
+        paper_forward_dir=paper_forward_dir,
+        result=result,
+        report_text=report_text,
+    )
     result["artifacts"]["crypto_paper_forward_result.json"] = str(result_path)
     result["artifacts"]["crypto_paper_forward_report.md"] = str(report_path)
     return result
@@ -521,12 +643,25 @@ def write_crypto_manual_trade_tickets(
     root.mkdir(parents=True, exist_ok=True)
     json_path = root / "crypto_manual_trade_tickets.json"
     md_path = root / "crypto_manual_trade_tickets.md"
-    json_path.write_text(json.dumps(tickets, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
-    md_path.write_text(build_crypto_manual_trade_tickets_report(tickets), encoding="utf-8")
+    atomic_write_json(json_path, tickets)
+    atomic_write_text(md_path, build_crypto_manual_trade_tickets_report(tickets))
     return {
         "crypto_manual_trade_tickets.json": str(json_path),
         "crypto_manual_trade_tickets.md": str(md_path),
     }
+
+
+def _write_forward_terminal_artifacts(
+    *,
+    paper_forward_dir: Path,
+    result: dict[str, Any],
+    report_text: str,
+) -> Path:
+    result_path = paper_forward_dir / "crypto_paper_forward_result.json"
+    report_path = paper_forward_dir / "crypto_paper_forward_report.md"
+    atomic_write_json(result_path, result)
+    atomic_write_text(report_path, report_text)
+    return report_path
 
 
 def build_crypto_manual_trade_tickets_report(tickets: list[dict[str, Any]]) -> str:
@@ -572,6 +707,7 @@ def build_crypto_paper_forward_report(
         "## Executive Summary",
         f"- Run status: {result['status']}",
         f"- Paper-only status: {result['paper_only']}",
+        f"- Snapshot kind: {result.get('snapshot_kind', 'intraday_run')}",
         f"- Candidate config used: {result['candidate_config_used']}",
         f"- Symbols evaluated: {', '.join(result.get('symbols_evaluated') or [])}",
         f"- Recommendations count: {result['recommendations_count']}",
@@ -650,13 +786,15 @@ def _evaluate_forward_exits(
     latest_quotes: dict[str, Any] | None = None,
 ) -> list[CryptoPaperExitEvent]:
     candles_by_symbol: dict[str, Any] = {}
+    timeframe = str(strategy_config.get("timeframe", "5m"))
     for symbol in list(ledger.positions.keys()):
         try:
-            candles_by_symbol[symbol] = provider.get_historical_bars(
+            candles = provider.get_historical_bars(
                 symbol=symbol,
-                timeframe=str(strategy_config.get("timeframe", "5m")),
+                timeframe=timeframe,
                 limit=int(strategy_config.get("lookback_limit", 120)),
             )
+            candles_by_symbol[symbol] = _filter_closed_candles(candles=candles, timeframe=timeframe, as_of=as_of)
         except Exception as exc:
             warnings.append(f"exit_candle_retrieval_failed:{symbol}:{exc}")
     return evaluate_crypto_exit_triggers(
@@ -700,6 +838,8 @@ def _load_forward_ledger(*, artifact_root: Path, config: CryptoPaperExecutionCon
     ledger = CryptoPaperLedger(config)
     snapshot_path = artifact_root / "crypto_paper_snapshot.json"
     positions_path = artifact_root / "crypto_paper_positions.json"
+    warnings: list[str] = []
+    degraded = False
     if snapshot_path.exists():
         try:
             payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -707,19 +847,32 @@ def _load_forward_ledger(*, artifact_root: Path, config: CryptoPaperExecutionCon
                 ledger.cash = float(payload.get("cash") or ledger.cash)
                 ledger.fees_paid = float(payload.get("fees_paid") or 0.0)
                 ledger.realized_pnl = float(payload.get("realized_pnl") or 0.0)
-        except Exception:
-            pass
+            else:
+                warnings.append("forward_ledger_snapshot_invalid")
+                degraded = True
+        except Exception as exc:
+            warnings.append(f"forward_ledger_snapshot_malformed:{exc}")
+            degraded = True
     if positions_path.exists():
         try:
             payload = json.loads(positions_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
             payload = []
+            warnings.append(f"forward_ledger_positions_malformed:{exc}")
+            degraded = True
+        if positions_path.exists() and not isinstance(payload, list):
+            warnings.append("forward_ledger_positions_invalid")
+            degraded = True
         if isinstance(payload, list):
             for item in payload:
                 position = _position_from_payload(item)
+                if item is not None and position is None:
+                    warnings.append("forward_ledger_position_invalid")
+                    degraded = True
+                    continue
                 if position is not None and float(position.quantity) > 0.0:
                     ledger.positions[position.symbol] = position
-    return ledger
+    return ledger, _dedupe(warnings), degraded
 
 
 def _position_from_payload(payload: Any) -> CryptoPaperPosition | None:
@@ -778,7 +931,7 @@ def _write_execution_artifacts(*, artifact_root: Path, result: CryptoPaperExecut
         "crypto_paper_execution_result.json": result.to_dict(),
     }
     for filename, payload in payloads.items():
-        (artifact_root / filename).write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(artifact_root / filename, payload)
     return _dedupe(list(order_warnings) + list(fill_warnings) + list(exit_warnings))
 
 
@@ -890,6 +1043,22 @@ def _empty_engine_result(context: EngineContext):
     )()
 
 
+def _filter_closed_candles(*, candles: Any, timeframe: str, as_of: datetime) -> Any:
+    if candles is None or not isinstance(candles, pd.DataFrame) or candles.empty or "date" not in candles.columns:
+        return candles
+    delta = _timeframe_delta(timeframe)
+    if delta is None:
+        return candles
+    frame = candles.copy()
+    timestamps = pd.to_datetime(frame["date"], errors="coerce", utc=True)
+    close_times = timestamps + pd.Timedelta(delta)
+    mask = close_times <= pd.Timestamp(_naive_utc(as_of), tz="UTC")
+    filtered = frame.loc[mask.fillna(False)].copy()
+    normalized = pd.to_datetime(filtered["date"], errors="coerce", utc=True)
+    filtered["date"] = normalized.dt.tz_convert(None)
+    return filtered.reset_index(drop=True)
+
+
 def _normalize_prices_bundle(bundle: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     payload = dict(bundle or {})
     if "candles" in payload or "quotes" in payload:
@@ -935,28 +1104,93 @@ def _normalize_prices_bundle(bundle: dict[str, Any]) -> tuple[dict[str, dict[str
                 "last_price": close,
                 "ask": close,
                 "bid": close,
+                "timestamp": normalized_rows[-1]["date"].isoformat(),
             }
     for symbol, quote in raw_quotes.items():
         normalized_symbol = str(symbol).upper()
         if isinstance(quote, dict):
             last_price = quote.get("last_price", quote.get("ask", quote.get("bid")))
+            raw_timestamp = quote.get("timestamp") or quote.get("date")
+            if raw_timestamp is None:
+                last_candle = candles.get(normalized_symbol) or []
+                if last_candle:
+                    raw_timestamp = last_candle[-1]["date"].isoformat()
             quotes[normalized_symbol] = {
                 "provider": "static_crypto_forward",
                 "symbol": normalized_symbol,
                 "last_price": float(last_price) if last_price is not None else None,
                 "ask": float(quote["ask"]) if quote.get("ask") is not None else (float(last_price) if last_price is not None else None),
                 "bid": float(quote["bid"]) if quote.get("bid") is not None else (float(last_price) if last_price is not None else None),
+                "timestamp": str(raw_timestamp) if raw_timestamp is not None else None,
             }
         else:
             value = float(quote)
+            last_candle = candles.get(normalized_symbol) or []
+            inferred_timestamp = last_candle[-1]["date"].isoformat() if last_candle else None
             quotes[normalized_symbol] = {
                 "provider": "static_crypto_forward",
                 "symbol": normalized_symbol,
                 "last_price": value,
                 "ask": value,
                 "bid": value,
+                "timestamp": inferred_timestamp,
             }
     return quotes, candles
+
+
+def _resolve_max_quote_age_seconds(
+    *,
+    strategy_config: dict[str, Any],
+    risk_config: dict[str, Any],
+) -> float:
+    for payload in (risk_config, strategy_config):
+        raw_value = payload.get("max_quote_age_seconds")
+        if raw_value is None:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    timeframe = str(strategy_config.get("timeframe") or "").strip().lower()
+    defaults = {
+        "1m": 120.0,
+        "5m": 600.0,
+        "15m": 1800.0,
+        "1h": 7200.0,
+        "1d": 172800.0,
+    }
+    return defaults.get(timeframe, 600.0)
+
+
+def _quote_issue(
+    quote: Any,
+    *,
+    as_of: datetime,
+    max_quote_age_seconds: float,
+) -> str | None:
+    if not isinstance(quote, dict):
+        return "missing_quote"
+    last_price = quote.get("last_price")
+    try:
+        if last_price is None or float(last_price) <= 0.0:
+            return "quote_invalid:last_price"
+    except (TypeError, ValueError):
+        return "quote_invalid:last_price"
+    raw_timestamp = quote.get("timestamp")
+    if raw_timestamp is None:
+        return "quote_invalid:timestamp_missing"
+    if parse_quote_timestamp(raw_timestamp) is None:
+        return "quote_invalid:timestamp_unparseable"
+    age_seconds = quote_age_seconds(quote, as_of=as_of)
+    if age_seconds is None:
+        return "quote_invalid:timestamp_missing"
+    if age_seconds < -1.0:
+        return f"quote_invalid:timestamp_in_future:{age_seconds:.3f}s"
+    if age_seconds > float(max_quote_age_seconds):
+        return f"quote_stale:{age_seconds:.3f}s"
+    return None
 
 
 def _has_sensitive_keys(payload: Any, names: set[str]) -> bool:
@@ -1001,7 +1235,24 @@ def _parse_as_of(value: datetime | str | None) -> datetime:
         if parsed.tzinfo is not None:
             return parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return parsed
-    return datetime.utcnow().replace(tzinfo=None)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _timeframe_delta(timeframe: str) -> pd.Timedelta | None:
+    mapping = {
+        "1m": pd.Timedelta(minutes=1),
+        "5m": pd.Timedelta(minutes=5),
+        "15m": pd.Timedelta(minutes=15),
+        "1h": pd.Timedelta(hours=1),
+        "1d": pd.Timedelta(days=1),
+    }
+    return mapping.get(str(timeframe or "").strip().lower())
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _flag(name: str) -> bool:

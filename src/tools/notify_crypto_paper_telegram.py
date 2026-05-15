@@ -43,6 +43,7 @@ from src.reports.crypto_paper_semantics import (
     build_semantic_layer,
     local_display_for_iso,
 )
+from src.utils.atomic_io import FileLockActiveError, advisory_file_lock, atomic_write_json
 
 
 ENABLE_FLAG = "ENABLE_CRYPTO_TELEGRAM_ALERTS"
@@ -52,6 +53,7 @@ LOCAL_TZ_ENV = "CRYPTO_LOCAL_TZ"
 _DEFAULT_MIN_SEVERITY = "ACTION"
 _SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_SEVERITIES)}
 _STATE_FILENAME = "telegram_alert_state.json"
+_LOCK_FILENAME = "telegram_alert_state.lock"
 _DAILY_SUMMARY_PREFIX = "daily-summary:"
 
 # Default Telegram parse_mode for outbound alert messages.
@@ -265,6 +267,7 @@ def notify_crypto_paper_telegram(
     resolved_state_path = (
         Path(state_path) if state_path is not None else semantic_dir / _STATE_FILENAME
     )
+    lock_path = resolved_state_path.parent / _LOCK_FILENAME
 
     # The ENABLE_CRYPTO_TELEGRAM_ALERTS gate guards real network sends only.
     # Dry-run and bootstrap-dedupe never contact Telegram, so they bypass it.
@@ -327,6 +330,70 @@ def notify_crypto_paper_telegram(
                 continue
         candidates.append(event)
 
+    try:
+        with advisory_file_lock(
+            lock_path,
+            metadata={"mode": "notify_crypto_paper_telegram", "state_path": str(resolved_state_path)},
+        ):
+            return _dispatch_notifications_with_state(
+                candidates=candidates,
+                pre_filtered=pre_filtered,
+                resolved_state_path=resolved_state_path,
+                semantic_layer=semantic_layer,
+                moment=moment,
+                source_env=source_env,
+                sender=sender,
+                dry_run=dry_run,
+                daily_summary=daily_summary,
+                daily_summary_only=daily_summary_only,
+                force=force,
+                bootstrap_dedupe=bootstrap_dedupe,
+                include_signal_only=include_signal_only,
+                resolved_local_tz=resolved_local_tz,
+                min_severity=min_severity,
+            )
+    except FileLockActiveError:
+        return {
+            "ok": False,
+            "paper_only": True,
+            "live_trading": False,
+            "sent": [],
+            "skipped": [],
+            "sent_event_ids": [],
+            "skipped_event_ids": [],
+            "messages": [],
+            "dry_run": bool(dry_run),
+            "daily_summary_only": bool(daily_summary_only),
+            "bootstrap_dedupe": False,
+            "include_signal_only": bool(include_signal_only),
+            "local_tz": resolved_local_tz,
+            "marked_count": 0,
+            "chat_id_masked": None,
+            "state_path": str(resolved_state_path),
+            "min_severity": min_severity,
+            "reason": "notify_locked",
+            "lock_path": str(lock_path),
+        }
+
+
+def _dispatch_notifications_with_state(
+    *,
+    candidates: list[dict[str, Any]],
+    pre_filtered: list[dict[str, Any]],
+    resolved_state_path: Path,
+    semantic_layer: dict[str, Any],
+    moment: datetime,
+    source_env: dict[str, str] | os._Environ[str],
+    sender: Any,
+    dry_run: bool,
+    daily_summary: bool,
+    daily_summary_only: bool,
+    force: bool,
+    bootstrap_dedupe: bool,
+    include_signal_only: bool,
+    resolved_local_tz: str,
+    min_severity: str,
+) -> dict[str, Any]:
     state = _load_state(resolved_state_path)
     sent_ids: set[str] = set(state.get("sent_event_ids") or [])
     sent_payload: list[dict[str, Any]] = []
@@ -385,14 +452,7 @@ def notify_crypto_paper_telegram(
             "min_severity": min_severity,
         }
 
-    # Carry pre-filter skipped entries (severity / noisy rejected) into the
-    # public skipped audit so callers can see why each event_id was dropped.
     skipped_payload.extend(pre_filtered)
-
-    # ``daily_summary_only`` short-circuits the per-event send loop entirely:
-    # every candidate is recorded as ``filtered:daily_summary_only`` in the
-    # skipped audit and is NOT added to ``sent_event_ids``. This guarantees
-    # the daily cron run cannot shadow pending BUY/TAKE/STOP alerts.
     will_send_summary = bool(daily_summary or daily_summary_only)
     iter_candidates = [] if daily_summary_only else candidates
     if daily_summary_only:
@@ -431,7 +491,6 @@ def notify_crypto_paper_telegram(
         chat_id_masked = mask_chat_id(chat_id)
 
     transport = sender if sender is not None else _default_sender
-
     failure_reason: str | None = None
     moment_iso = moment.isoformat()
 
@@ -443,11 +502,6 @@ def notify_crypto_paper_telegram(
         delivery_mode: str,
         telegram_message_id: Any = None,
     ) -> None:
-        """Append a sent_events metadata entry and update the dedupe set.
-
-        Only invoked AFTER Telegram has returned ok=true (or in dry-run /
-        bootstrap modes that explicitly never contact the network).
-        """
         entry: dict[str, Any] = {
             "event_id": event_id,
             "event_type": event_type,
@@ -486,19 +540,11 @@ def notify_crypto_paper_telegram(
             )
         except TelegramSendError as exc:
             failure_reason = redact_token(str(exc), bot_token or "")
-            skipped_payload.append(
-                {"event_id": event_id, "reason": f"send_failed"}
-            )
+            skipped_payload.append({"event_id": event_id, "reason": "send_failed"})
             break
-        # Defensive: only mark sent when the API explicitly returns ok=true.
-        # send_telegram_message already raises on ok=false, but a custom
-        # sender (tests or future implementations) might return a dict whose
-        # ok is missing or false. Refuse to mark in that case.
         if not isinstance(response, dict) or not response.get("ok"):
             failure_reason = "send_failed:non_ok_response"
-            skipped_payload.append(
-                {"event_id": event_id, "reason": "send_failed"}
-            )
+            skipped_payload.append({"event_id": event_id, "reason": "send_failed"})
             break
         message_id = (response.get("result") or {}).get("message_id")
         sent_payload.append(
@@ -549,19 +595,13 @@ def notify_crypto_paper_telegram(
                 except TelegramSendError as exc:
                     failure_reason = redact_token(str(exc), bot_token or "")
                     skipped_payload.append(
-                        {
-                            "event_id": summary_event_id,
-                            "reason": "send_failed",
-                        }
+                        {"event_id": summary_event_id, "reason": "send_failed"}
                     )
                 else:
                     if not isinstance(response, dict) or not response.get("ok"):
                         failure_reason = "send_failed:non_ok_response"
                         skipped_payload.append(
-                            {
-                                "event_id": summary_event_id,
-                                "reason": "send_failed",
-                            }
+                            {"event_id": summary_event_id, "reason": "send_failed"}
                         )
                     else:
                         message_id = (response.get("result") or {}).get("message_id")
@@ -582,10 +622,6 @@ def notify_crypto_paper_telegram(
                             telegram_message_id=message_id,
                         )
 
-    # Persist whatever was actually delivered. In dry-run we do not write
-    # state at all (matches the historic contract). In real-send mode we
-    # always persist the partial state, even when a later send failed: that
-    # way already-delivered events are correctly recorded as sent.
     if not dry_run:
         _save_state(
             resolved_state_path,
@@ -1097,10 +1133,7 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 def _save_state(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-        encoding="utf-8",
-    )
+    atomic_write_json(path, payload)
 
 
 def _load_json(path: Path, *, default: Any) -> Any:

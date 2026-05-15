@@ -9,6 +9,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from src.utils.atomic_io import atomic_write_json, atomic_write_text
+
 
 EPSILON = 1e-12
 
@@ -389,10 +391,13 @@ def write_crypto_paper_evaluation_artifacts(
     written: dict[str, Path] = {}
     for filename, payload in payloads.items():
         path = root / filename
-        path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, payload)
         written[filename] = path
     report_path = root / "crypto_paper_strategy_evaluation_report.md"
-    report_path.write_text(build_crypto_paper_strategy_evaluation_report(closed_trades, open_trades, metrics, exit_breakdown, fee_report), encoding="utf-8")
+    atomic_write_text(
+        report_path,
+        build_crypto_paper_strategy_evaluation_report(closed_trades, open_trades, metrics, exit_breakdown, fee_report),
+    )
     written[report_path.name] = report_path
     return written
 

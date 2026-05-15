@@ -215,6 +215,22 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         # Sender called exactly once across both runs.
         self.assertEqual(len(sender.calls), 1)
 
+    def test_active_notify_lock_refuses_overlap(self) -> None:
+        self._seed_take_profit_exit()
+        lock_path = self.artifacts_dir / "semantic" / "telegram_alert_state.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("{}", encoding="utf-8")
+        sender = _RecordingSender()
+        result = notify_crypto_paper_telegram(
+            artifacts_dir=self.artifacts_dir,
+            env=_enabled_env(),
+            sender=sender,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "notify_locked")
+        self.assertEqual(sender.calls, [])
+
     def test_force_resends_already_sent_events(self) -> None:
         self._seed_take_profit_exit()
         sender = _RecordingSender()

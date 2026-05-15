@@ -72,6 +72,30 @@ class RiskEngineTests(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertEqual(result.rejected_reason, "spread_above_max")
 
+    def test_reject_when_symbol_position_already_exists(self) -> None:
+        engine = RiskEngine()
+        result = engine.evaluate(
+            RiskCheckInput(symbol="BTCUSDT", side="BUY", notional=25.0, symbol_open_exposure=25.0)
+        )
+        self.assertFalse(result.approved)
+        self.assertEqual(result.rejected_reason, "symbol_position_exists")
+
+    def test_reject_when_max_open_positions_reached(self) -> None:
+        engine = RiskEngine({"max_open_positions": 1})
+        result = engine.evaluate(
+            RiskCheckInput(symbol="ETHUSDT", side="BUY", notional=25.0, open_positions_count=1, symbol_open_exposure=0.0)
+        )
+        self.assertFalse(result.approved)
+        self.assertEqual(result.rejected_reason, "max_open_positions_reached")
+
+    def test_reject_when_total_open_exposure_would_be_exceeded(self) -> None:
+        engine = RiskEngine({"max_total_open_exposure": 50.0})
+        result = engine.evaluate(
+            RiskCheckInput(symbol="ETHUSDT", side="BUY", notional=10.0, total_open_exposure=45.0, symbol_open_exposure=0.0)
+        )
+        self.assertFalse(result.approved)
+        self.assertEqual(result.rejected_reason, "max_total_open_exposure_exceeded")
+
     def test_reject_returns_useful_reason_and_tags(self) -> None:
         engine = RiskEngine({"min_expected_net_edge": 0.02})
         result = engine.evaluate(RiskCheckInput(symbol="AAPL", side="BUY", expected_net_edge=0.01))

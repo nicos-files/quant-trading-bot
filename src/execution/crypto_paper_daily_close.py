@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .crypto_paper_models import CryptoPaperPortfolioSnapshot, CryptoPaperPosition
 from .crypto_paper_performance import CryptoPaperPerformanceSummary, compute_crypto_paper_performance
+from src.utils.atomic_io import atomic_write_json, atomic_write_text
 
 
 def _serialize(value: Any) -> Any:
@@ -48,6 +49,7 @@ def close_crypto_paper_day(
     provider: Any | None = None,
     provider_health: dict[str, Any] | None = None,
     starting_cash: float = 100.0,
+    snapshot_kind: str = "intraday_run",
 ) -> CryptoPaperDailyCloseResult:
     artifact_root = Path(artifacts_dir)
     target_dir = Path(output_dir) if output_dir is not None else artifact_root / "daily_close"
@@ -84,6 +86,8 @@ def close_crypto_paper_day(
             "paper_only": True,
             "live_trading": False,
             "exit_events_count": exit_events_count,
+            "snapshot_kind": snapshot_kind,
+            "is_true_daily_close": snapshot_kind == "daily_close",
         },
     )
     result = CryptoPaperDailyCloseResult(
@@ -97,6 +101,8 @@ def close_crypto_paper_day(
             "source_artifacts": sorted(loaded["found"]),
             "artifacts_dir": str(artifact_root),
             "output_dir": str(target_dir),
+            "snapshot_kind": snapshot_kind,
+            "is_true_daily_close": snapshot_kind == "daily_close",
         },
     )
     written = write_crypto_paper_daily_close_artifacts(target_dir, result)
@@ -161,10 +167,10 @@ def write_crypto_paper_daily_close_artifacts(output_dir: str | Path, result: Cry
     written: dict[str, Path] = {}
     for filename, payload in payloads.items():
         path = target / filename
-        path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, payload)
         written[filename] = path
     report_path = target / "crypto_paper_daily_report.md"
-    report_path.write_text(report, encoding="utf-8")
+    atomic_write_text(report_path, report)
     written[report_path.name] = report_path
     return written
 
@@ -178,6 +184,7 @@ def build_crypto_paper_daily_report(result: CryptoPaperDailyCloseResult) -> str:
         "",
         "## Summary",
         f"- As of: {result.as_of.isoformat()}",
+        f"- Snapshot kind: {result.metadata.get('snapshot_kind', 'intraday_run')}",
         f"- Starting equity: {performance.starting_equity:.6f}",
         f"- Ending equity: {performance.ending_equity:.6f}",
         f"- Total P&L: {performance.total_pnl:.6f}",
@@ -222,7 +229,15 @@ def build_crypto_paper_daily_report(result: CryptoPaperDailyCloseResult) -> str:
     else:
         for warning in result.warnings:
             lines.append(f"- {warning}")
-    lines.extend(["", "## Notes", "- Paper-only.", "- No live orders placed."])
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "- Paper-only.",
+            "- No live orders placed.",
+            "- This artifact may be an intraday run snapshot, not a canonical daily close.",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -400,7 +415,7 @@ def _snapshot_from_payload(payload: dict[str, Any]) -> CryptoPaperPortfolioSnaps
     try:
         positions = [_position_from_payload(item) for item in payload.get("positions", []) if isinstance(item, dict)]
         return CryptoPaperPortfolioSnapshot(
-            as_of=_parse_datetime(payload.get("as_of")) or datetime.utcnow(),
+            as_of=_parse_datetime(payload.get("as_of")) or datetime.now(timezone.utc),
             cash=float(payload.get("cash") or 0.0),
             equity=float(payload.get("equity") or 0.0),
             positions_value=float(payload.get("positions_value") or 0.0),

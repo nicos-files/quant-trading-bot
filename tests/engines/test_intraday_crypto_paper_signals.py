@@ -1,6 +1,6 @@
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -12,6 +12,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.decision_intel.contracts.recommendations.recommendation_models import RecommendationOutput
 from src.engines import EngineContext, IntradayCryptoEngine
+
+
+def _fresh_quote(last_price: float = 107.8) -> dict:
+    return {
+        "last_price": last_price,
+        "timestamp": "2026-04-24T11:59:30+00:00",
+    }
 
 
 def _bullish_candles():
@@ -30,6 +37,17 @@ def _flat_candles():
     return pd.DataFrame(
         {
             "date": pd.date_range("2026-04-24 10:00:00", periods=len(closes), freq="5min"),
+            "close": closes,
+            "volume": [10.0] * len(closes),
+        }
+    )
+
+
+def _open_candle_only_bullish_signal():
+    closes = [100.0] * 39 + [120.0]
+    return pd.DataFrame(
+        {
+            "date": pd.date_range("2026-04-24 08:45:00", periods=len(closes), freq="5min"),
             "close": closes,
             "volume": [10.0] * len(closes),
         }
@@ -100,7 +118,7 @@ class IntradayCryptoPaperSignalsTests(unittest.TestCase):
         engine = IntradayCryptoEngine()
         provider = Mock()
         provider.get_historical_bars.return_value = _bullish_candles()
-        provider.get_latest_quote.return_value = {"last_price": 107.8}
+        provider.get_latest_quote.return_value = _fresh_quote()
         context = self._context(metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider})
         result = engine.run(context)
 
@@ -114,7 +132,7 @@ class IntradayCryptoPaperSignalsTests(unittest.TestCase):
         engine = IntradayCryptoEngine()
         provider = Mock()
         provider.get_historical_bars.return_value = _flat_candles()
-        provider.get_latest_quote.return_value = {"last_price": 100.0}
+        provider.get_latest_quote.return_value = _fresh_quote(100.0)
         context = self._context(metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider})
         result = engine.run(context)
 
@@ -143,7 +161,7 @@ class IntradayCryptoPaperSignalsTests(unittest.TestCase):
         engine = IntradayCryptoEngine()
         provider = Mock()
         provider.get_historical_bars.return_value = _bullish_candles()
-        provider.get_latest_quote.return_value = {"last_price": 107.8}
+        provider.get_latest_quote.return_value = _fresh_quote()
         context = self._context(
             metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider},
             config={**self._context().config, "crypto_risk": {"min_expected_net_edge": 1.0}},
@@ -158,11 +176,75 @@ class IntradayCryptoPaperSignalsTests(unittest.TestCase):
         result = engine.run(context)
         self.assertIsInstance(result.recommendations, RecommendationOutput)
 
+    def test_existing_open_position_blocks_duplicate_buy_signal(self) -> None:
+        engine = IntradayCryptoEngine()
+        provider = Mock()
+        provider.get_historical_bars.return_value = _bullish_candles()
+        provider.get_latest_quote.return_value = _fresh_quote()
+        context = self._context(
+            cash=75.0,
+            positions=[{"symbol": "BTCUSDT", "quantity": 0.2, "last_price": 107.8, "avg_entry_price": 100.0}],
+            metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider},
+        )
+        result = engine.run(context)
+        self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
+        self.assertTrue(any("symbol_position_exists" in warning for warning in result.diagnostics.warnings))
+
+    def test_cash_available_in_recommendation_comes_from_context(self) -> None:
+        engine = IntradayCryptoEngine()
+        provider = Mock()
+        provider.get_historical_bars.return_value = _bullish_candles()
+        provider.get_latest_quote.return_value = _fresh_quote()
+        context = self._context(
+            cash=83.5,
+            metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider},
+        )
+        result = engine.run(context)
+        payload = result.recommendations.to_payload()["recommendations"]
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["cash_available_usd"], 83.5)
+
+    def test_open_candle_is_excluded_from_signal_generation(self) -> None:
+        engine = IntradayCryptoEngine()
+        provider = Mock()
+        provider.get_historical_bars.return_value = _open_candle_only_bullish_signal()
+        provider.get_latest_quote.return_value = {
+            "last_price": 120.0,
+            "timestamp": "2026-04-24T12:01:30+00:00",
+        }
+        context = self._context(
+            as_of=datetime(2026, 4, 24, 12, 2, 0),
+            config={
+                **self._context().config,
+                "crypto_strategy": {**self._context().config["crypto_strategy"], "max_volatility_pct": 10.0},
+            },
+            metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider},
+        )
+        result = engine.run(context)
+        self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
+
+    def test_stale_quote_blocks_signal_generation(self) -> None:
+        engine = IntradayCryptoEngine()
+        provider = Mock()
+        provider.get_historical_bars.return_value = _bullish_candles()
+        stale_at = datetime(2026, 4, 24, 11, 40, tzinfo=timezone.utc)
+        provider.get_latest_quote.return_value = {
+            "last_price": 107.8,
+            "timestamp": stale_at.isoformat(),
+        }
+        context = self._context(
+            as_of=datetime(2026, 4, 24, 12, 0, 0),
+            metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider},
+        )
+        result = engine.run(context)
+        self.assertEqual(result.recommendations.to_payload()["recommendations"], [])
+        self.assertTrue(any("quote_stale" in warning for warning in result.diagnostics.warnings))
+
     def test_no_live_order_or_broker_method_is_called(self) -> None:
         engine = IntradayCryptoEngine()
         provider = Mock()
         provider.get_historical_bars.return_value = _bullish_candles()
-        provider.get_latest_quote.return_value = {"last_price": 107.8}
+        provider.get_latest_quote.return_value = _fresh_quote()
         context = self._context(metadata={"crypto_provider_name": "binance_spot", "crypto_provider": provider})
         engine.run(context)
         self.assertFalse(any(call[0] == "place_order" for call in provider.mock_calls))

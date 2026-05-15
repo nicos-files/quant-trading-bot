@@ -1,6 +1,6 @@
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,7 +27,7 @@ class CryptoPaperLedgerTests(unittest.TestCase):
             fee=fee,
             slippage=0.05,
             net_notional=gross + fee,
-            filled_at=datetime.utcnow(),
+            filled_at=datetime.now(timezone.utc),
         )
 
     def _sell_fill(self, qty=0.05, price=110.0, gross=5.5, fee=0.05):
@@ -42,7 +42,7 @@ class CryptoPaperLedgerTests(unittest.TestCase):
             fee=fee,
             slippage=0.05,
             net_notional=gross - fee,
-            filled_at=datetime.utcnow(),
+            filled_at=datetime.now(timezone.utc),
         )
 
     def test_starting_cash_initializes_correctly(self) -> None:
@@ -71,14 +71,15 @@ class CryptoPaperLedgerTests(unittest.TestCase):
 
     def test_snapshot_includes_pnl_and_values(self) -> None:
         self.ledger.apply_buy_fill(self._fill())
-        self.ledger.mark_to_market({"BTCUSDT": 105.0}, datetime.utcnow())
-        snapshot = self.ledger.snapshot(datetime.utcnow())
+        now = datetime.now(timezone.utc)
+        self.ledger.mark_to_market({"BTCUSDT": 105.0}, now)
+        snapshot = self.ledger.snapshot(now)
         self.assertGreater(snapshot.equity, 0)
         self.assertEqual(len(snapshot.positions), 1)
 
     def test_mark_to_market_updates_unrealized_pnl(self) -> None:
         self.ledger.apply_buy_fill(self._fill())
-        self.ledger.mark_to_market({"BTCUSDT": 105.0}, datetime.utcnow())
+        self.ledger.mark_to_market({"BTCUSDT": 105.0}, datetime.now(timezone.utc))
         self.assertGreater(self.ledger.positions["BTCUSDT"].unrealized_pnl, 0)
 
     def test_insufficient_cash_is_rejected(self) -> None:
@@ -131,7 +132,7 @@ class CryptoPaperLedgerTests(unittest.TestCase):
     def test_snapshot_reflects_realized_pnl(self) -> None:
         self.ledger.apply_buy_fill(self._fill(qty=0.1, price=100.0, gross=10.0, fee=0.1))
         self.ledger.apply_sell_fill(self._sell_fill(qty=0.05, price=110.0, gross=5.5, fee=0.05))
-        snapshot = self.ledger.snapshot(datetime.utcnow())
+        snapshot = self.ledger.snapshot(datetime.now(timezone.utc))
         self.assertGreater(snapshot.realized_pnl, 0.0)
 
 

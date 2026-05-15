@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from src.decision_intel.contracts.recommendations.recommendation_models import RecommendationOutput
 from src.engines import EngineContext, IntradayCryptoEngine
-from src.execution.crypto_paper_executor import CryptoPaperExecutor, load_crypto_paper_ledger, write_crypto_paper_execution_artifacts
+from src.execution.crypto_paper_executor import (
+    CryptoPaperExecutor,
+    load_crypto_paper_ledger_state,
+    write_crypto_paper_execution_artifacts,
+)
 from src.execution.crypto_paper_exits import evaluate_crypto_exit_triggers
 from src.execution.crypto_paper_models import CryptoPaperExecutionConfig
 from src.market_data.crypto_symbols import enabled_crypto_symbols, load_crypto_universe_config
@@ -34,21 +40,38 @@ def run_crypto_paper(
     crypto_config = load_crypto_universe_config(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else {}
     crypto_universe = list(crypto_config.get("symbols") or [])
     strategy_config = dict(crypto_config.get("strategy") or {})
-    now = as_of or datetime.utcnow()
+    crypto_risk_config = dict(crypto_config.get("risk") or crypto_config.get("crypto_risk") or {})
+    crypto_risk_config.setdefault("reject_reentry_on_open_position", True)
+    now = as_of or datetime.now(timezone.utc)
     active_provider = provider or BinanceSpotMarketDataProvider()
     health = active_provider.health_check()
     active_config = CryptoPaperExecutionConfig(enable_exits=_flag("ENABLE_CRYPTO_PAPER_EXITS"))
+    active_ledger, ledger_warnings, ledger_degraded = load_crypto_paper_ledger_state(
+        run_id=run_id,
+        base_path=base_path,
+        config=active_config,
+    )
+    if ledger_degraded:
+        return {
+            "status": "FAILED",
+            "reason": "ledger_state_corrupt",
+            "warnings": sorted(set(ledger_warnings + ["ledger_state_corrupt"])),
+        }
     context = EngineContext(
         as_of=now,
         run_id=run_id,
         mode="crypto_paper",
         universe=enabled_crypto_symbols(crypto_universe),
+        positions=list(active_ledger.positions.values()),
+        cash=float(active_ledger.cash),
         config={
             "crypto_universe_path": str(CRYPTO_UNIVERSE_PATH) if CRYPTO_UNIVERSE_PATH.exists() else None,
             "crypto_universe": crypto_universe,
             "crypto_symbols": enabled_crypto_symbols(crypto_universe),
             "crypto_strategy": strategy_config,
             "enable_crypto_market_data": True,
+            "crypto_risk": crypto_risk_config,
+            "crypto_execution": active_config.to_dict(),
         },
         provider_health={
             active_provider.provider_name: {
@@ -68,7 +91,6 @@ def run_crypto_paper(
     active_engine = engine or IntradayCryptoEngine()
     engine_result = active_engine.run(context)
     active_executor = executor or CryptoPaperExecutor(active_config)
-    active_ledger = load_crypto_paper_ledger(run_id=run_id, base_path=base_path, config=active_config) if _flag("ENABLE_CRYPTO_PAPER_EXITS") else None
 
     latest_quotes = {}
     for item in engine_result.recommendations.recommendations:
@@ -79,14 +101,19 @@ def run_crypto_paper(
         }
 
     exit_events = []
-    if _flag("ENABLE_CRYPTO_PAPER_EXITS") and active_ledger is not None:
+    if _flag("ENABLE_CRYPTO_PAPER_EXITS"):
         candles_by_symbol: dict[str, Any] = {}
         for symbol, position in active_ledger.positions.items():
             try:
-                candles_by_symbol[symbol] = active_provider.get_historical_bars(
+                candles = active_provider.get_historical_bars(
                     symbol=symbol,
                     timeframe=str(strategy_config.get("timeframe", "5m")),
                     limit=int(strategy_config.get("lookback_limit", 120)),
+                )
+                candles_by_symbol[symbol] = _filter_closed_candles(
+                    candles=candles,
+                    timeframe=str(strategy_config.get("timeframe", "5m")),
+                    as_of=now,
                 )
                 latest_quotes.setdefault(symbol, active_provider.get_latest_quote(symbol))
             except Exception:
@@ -120,8 +147,31 @@ def _flag(name: str) -> bool:
     return value in {"1", "true", "yes", "y", "si", "s"}
 
 
+def _filter_closed_candles(*, candles: Any, timeframe: str, as_of: datetime) -> Any:
+    if candles is None or not isinstance(candles, pd.DataFrame) or candles.empty or "date" not in candles.columns:
+        return candles
+    mapping = {
+        "1m": pd.Timedelta(minutes=1),
+        "5m": pd.Timedelta(minutes=5),
+        "15m": pd.Timedelta(minutes=15),
+        "1h": pd.Timedelta(hours=1),
+        "1d": pd.Timedelta(days=1),
+    }
+    delta = mapping.get(str(timeframe or "").strip().lower())
+    if delta is None:
+        return candles
+    normalized_as_of = as_of.astimezone(timezone.utc).replace(tzinfo=None) if as_of.tzinfo is not None else as_of
+    frame = candles.copy()
+    timestamps = pd.to_datetime(frame["date"], errors="coerce", utc=True)
+    close_times = timestamps + delta
+    filtered = frame.loc[(close_times <= pd.Timestamp(normalized_as_of, tz="UTC")).fillna(False)].copy()
+    normalized = pd.to_datetime(filtered["date"], errors="coerce", utc=True)
+    filtered["date"] = normalized.dt.tz_convert(None)
+    return filtered.reset_index(drop=True)
+
+
 def main() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     run_id = now.strftime("%Y%m%d-%H%M")
     result = run_crypto_paper(run_id=run_id, as_of=now)
     print(f"[CRYPTO-PAPER] {result}")

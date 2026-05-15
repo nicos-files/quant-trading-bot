@@ -10,6 +10,10 @@ DEFAULT_RISK_CONFIG = {
     "min_notional": None,
     "max_notional": None,
     "max_spread_pct": None,
+    "max_open_positions": None,
+    "max_total_open_exposure": None,
+    "max_symbol_open_exposure": None,
+    "reject_reentry_on_open_position": True,
     "reject_if_provider_unhealthy": True,
 }
 
@@ -28,6 +32,9 @@ class RiskCheckInput:
     liquidity_score: float | None = None
     data_quality_score: float | None = None
     provider_healthy: bool = True
+    open_positions_count: int | None = None
+    total_open_exposure: float | None = None
+    symbol_open_exposure: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -65,6 +72,36 @@ class RiskEngine:
         minimum = self.config.get("min_expected_net_edge")
         if minimum is not None and check.expected_net_edge is not None and check.expected_net_edge < float(minimum):
             return self._reject("expected_net_edge_below_min", "expected_net_edge", check)
+
+        if side == "BUY":
+            symbol_open_exposure = float(check.symbol_open_exposure or 0.0)
+            if self.config.get("reject_reentry_on_open_position", True) and symbol_open_exposure > 1e-9:
+                return self._reject("symbol_position_exists", "symbol_position_exists", check)
+
+            maximum = self.config.get("max_open_positions")
+            if (
+                maximum is not None
+                and check.open_positions_count is not None
+                and symbol_open_exposure <= 1e-9
+                and int(check.open_positions_count) >= int(maximum)
+            ):
+                return self._reject("max_open_positions_reached", "max_open_positions", check)
+
+            maximum = self.config.get("max_total_open_exposure")
+            if (
+                maximum is not None
+                and check.notional is not None
+                and (float(check.total_open_exposure or 0.0) + float(check.notional)) > float(maximum) + 1e-9
+            ):
+                return self._reject("max_total_open_exposure_exceeded", "max_total_open_exposure", check)
+
+            maximum = self.config.get("max_symbol_open_exposure")
+            if (
+                maximum is not None
+                and check.notional is not None
+                and (symbol_open_exposure + float(check.notional)) > float(maximum) + 1e-9
+            ):
+                return self._reject("max_symbol_open_exposure_exceeded", "max_symbol_open_exposure", check)
 
         if (
             check.cash_available is not None

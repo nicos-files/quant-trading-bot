@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,7 @@ def run_close_crypto_paper_day(
 
     artifact_root = Path(artifacts_dir) if artifacts_dir else Path(base_path) / run_id / "artifacts" / "crypto_paper"
     target_output = Path(output_dir) if output_dir else artifact_root / "daily_close"
-    effective_as_of = _parse_datetime(as_of) or datetime.utcnow()
+    effective_as_of = _parse_datetime(as_of) or datetime.now(timezone.utc)
     injected_prices = _load_prices_json(prices_json)
 
     active_provider = None
@@ -55,6 +55,7 @@ def run_close_crypto_paper_day(
         price_map=injected_prices,
         provider=active_provider,
         provider_health=provider_health,
+        snapshot_kind="manual_close",
     )
     return {
         "status": "SUCCESS",

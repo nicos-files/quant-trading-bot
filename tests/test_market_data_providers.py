@@ -58,6 +58,12 @@ class MarketDataProvidersTests(unittest.TestCase):
         self.assertTrue(provider.supports(self.us_asset))
         self.assertFalse(provider.supports(ba_asset))
 
+    def test_alpha_provider_health_is_unavailable_without_env_key(self) -> None:
+        provider = AlphaVantagePriceProvider()
+        with patch.dict("os.environ", {}, clear=True):
+            health = provider.health_check()
+        self.assertEqual(health.status, "unavailable")
+
     def test_fetch_with_fallback_uses_second_provider(self) -> None:
         primary = Mock()
         primary.provider_name = "primary"

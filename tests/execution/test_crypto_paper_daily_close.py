@@ -196,6 +196,7 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
             result = close_crypto_paper_day(artifacts_dir=root, as_of=self.as_of)
             self.assertTrue(result.paper_only)
             self.assertFalse(result.live_trading)
+            self.assertEqual(result.metadata.get("snapshot_kind"), "intraday_run")
 
     def test_daily_close_includes_realized_pnl_after_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

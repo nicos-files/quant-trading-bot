@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -9,9 +9,9 @@ from .crypto_paper_models import CryptoPaperExecutionConfig, CryptoPaperExitEven
 
 
 def _exit_id_stamp(value: datetime | None) -> str:
-    moment = value if isinstance(value, datetime) else datetime.utcnow()
+    moment = value if isinstance(value, datetime) else datetime.now(timezone.utc)
     if moment.tzinfo is not None:
-        moment = moment.astimezone().replace(tzinfo=None)
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
     return moment.strftime("%Y%m%dT%H%M%S")
 
 

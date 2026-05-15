@@ -488,7 +488,7 @@ class CryptoPaperCumulativeIdCollisionTests(unittest.TestCase):
                 candidate_config=candidate_path,
                 artifacts_dir=artifacts_dir,
                 prices_json=prices_path,
-                as_of="2026-04-29T10:20:00+00:00",
+                as_of="2026-04-25T10:20:00+00:00",
             )
             self.assertEqual(run1["status"], "SUCCESS")
             self.assertGreaterEqual(run1["fills_count"], 1)

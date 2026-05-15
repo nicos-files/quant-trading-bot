@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import pandas as pd
 
 from src.decision_intel.contracts.recommendations.recommendation_models import RecommendationOutput
 from src.market_data.crypto_symbols import enabled_crypto_symbols, is_crypto_symbol, load_crypto_universe, normalize_crypto_symbol
-from src.market_data.providers import BinanceSpotMarketDataProvider
+from src.market_data.providers import (
+    BinanceSpotMarketDataProvider,
+    parse_quote_timestamp,
+    quote_age_seconds,
+)
 from src.risk import RiskCheckInput, RiskEngine
 from src.strategies import IntradayCryptoBaselineStrategy
 
@@ -80,18 +87,41 @@ class IntradayCryptoEngine:
         risk_engine = self._risk_engine(context)
         items: list[dict[str, Any]] = []
         failures = 0
+        timeframe = str(strategy_config.get("timeframe", "5m"))
+        current_positions = self._positions_by_symbol(context.positions)
+        open_positions_count = len(current_positions)
+        total_open_exposure = sum(self._position_market_value(position) for position in current_positions.values())
+        available_cash = float(context.cash) if context.cash is not None else None
+        max_quote_age_seconds = self._max_quote_age_seconds(context, timeframe=timeframe)
+        diagnostics.metadata["open_positions_count"] = open_positions_count
+        diagnostics.metadata["open_position_symbols"] = sorted(current_positions.keys())
+        diagnostics.metadata["cash_available"] = available_cash
+        diagnostics.metadata["max_quote_age_seconds"] = max_quote_age_seconds
 
         for symbol in strategy_enabled:
             try:
                 candles = provider.get_historical_bars(
                     symbol=symbol,
-                    timeframe=strategy_config.get("timeframe", "5m"),
+                    timeframe=timeframe,
                     limit=int(strategy_config.get("lookback_limit", 120)),
                 )
+                candles = self._closed_candles(candles, timeframe=timeframe, as_of=context.as_of)
+                if candles.empty:
+                    diagnostics.warnings.append(f"No closed candles available for {symbol}; signal evaluation skipped.")
+                    continue
                 latest_quote = provider.get_latest_quote(symbol)
             except Exception as exc:
                 failures += 1
                 diagnostics.warnings.append(f"Crypto provider error for {symbol}: {exc}")
+                continue
+
+            quote_issue = self._quote_issue(
+                latest_quote,
+                as_of=context.as_of,
+                max_quote_age_seconds=max_quote_age_seconds,
+            )
+            if quote_issue is not None:
+                diagnostics.warnings.append(f"{quote_issue}:{symbol}")
                 continue
 
             signal = strategy.evaluate(
@@ -103,6 +133,8 @@ class IntradayCryptoEngine:
             if signal is None:
                 continue
 
+            symbol_open_exposure = self._position_market_value(current_positions.get(signal.symbol))
+
             risk_result = risk_engine.evaluate(
                 RiskCheckInput(
                     symbol=signal.symbol,
@@ -110,19 +142,41 @@ class IntradayCryptoEngine:
                     quantity=None,
                     notional=signal.max_notional,
                     price=signal.entry_price,
-                    cash_available=signal.max_notional,
+                    cash_available=available_cash,
                     fees_estimate=0.0,
                     expected_net_edge=float(signal.metadata.get("signal_strength") or signal.score),
                     data_quality_score=1.0,
                     provider_healthy=not (isinstance(provider_health, dict) and provider_health.get("status") == "unhealthy"),
-                    metadata={"provider": provider_name, "timeframe": strategy_config.get("timeframe")},
+                    open_positions_count=open_positions_count,
+                    total_open_exposure=total_open_exposure,
+                    symbol_open_exposure=symbol_open_exposure,
+                    metadata={
+                        "provider": provider_name,
+                        "timeframe": timeframe,
+                        "cash_available": available_cash,
+                        "open_positions_count": open_positions_count,
+                    },
                 )
             )
             if not risk_result.approved:
                 diagnostics.warnings.append(f"Risk rejected {symbol}: {risk_result.rejected_reason}")
                 continue
 
-            items.append(self._signal_to_item(context, signal, provider_name))
+            notional = float(signal.max_notional or 0.0)
+            items.append(self._signal_to_item(context, signal, provider_name, available_cash=available_cash))
+            if str(signal.action).upper() == "BUY":
+                if available_cash is not None:
+                    available_cash = max(0.0, available_cash - notional)
+                if symbol_open_exposure <= 1e-9:
+                    open_positions_count += 1
+                total_open_exposure += notional
+                current_positions[signal.symbol] = {
+                    "symbol": signal.symbol,
+                    "notional": max(symbol_open_exposure, 0.0) + notional,
+                    "last_price": signal.entry_price,
+                    "avg_entry_price": signal.entry_price,
+                    "quantity": 1.0,
+                }
 
         diagnostics.candidates_scored = len(items)
         diagnostics.candidates_rejected = max(diagnostics.candidates_seen - diagnostics.candidates_scored, 0)
@@ -200,7 +254,65 @@ class IntradayCryptoEngine:
             return RiskEngine(config)
         return RiskEngine()
 
-    def _signal_to_item(self, context: EngineContext, signal: Any, provider_name: str) -> dict[str, Any]:
+    def _max_quote_age_seconds(self, context: EngineContext, *, timeframe: str) -> float:
+        risk_config = context.config.get("crypto_risk") if isinstance(context.config, dict) else None
+        strategy_config = context.config.get("crypto_strategy") if isinstance(context.config, dict) else None
+        for payload in (risk_config, strategy_config):
+            if isinstance(payload, dict) and payload.get("max_quote_age_seconds") is not None:
+                try:
+                    value = float(payload["max_quote_age_seconds"])
+                    if value > 0:
+                        return value
+                except (TypeError, ValueError):
+                    pass
+        default_by_timeframe = {
+            "1m": 120.0,
+            "5m": 600.0,
+            "15m": 1800.0,
+            "1h": 7200.0,
+            "1d": 172800.0,
+        }
+        return default_by_timeframe.get(str(timeframe or "").strip().lower(), 600.0)
+
+    def _quote_issue(
+        self,
+        latest_quote: Any,
+        *,
+        as_of: datetime,
+        max_quote_age_seconds: float,
+    ) -> str | None:
+        if not isinstance(latest_quote, dict):
+            return "missing_quote"
+        last_price = latest_quote.get("last_price")
+        try:
+            if last_price is None or float(last_price) <= 0.0:
+                return "quote_invalid:last_price"
+        except (TypeError, ValueError):
+            return "quote_invalid:last_price"
+
+        raw_timestamp = latest_quote.get("timestamp")
+        if raw_timestamp is None:
+            return "quote_invalid:timestamp_missing"
+        if parse_quote_timestamp(raw_timestamp) is None:
+            return "quote_invalid:timestamp_unparseable"
+
+        age_seconds = quote_age_seconds(latest_quote, as_of=as_of)
+        if age_seconds is None:
+            return "quote_invalid:timestamp_missing"
+        if age_seconds < -1.0:
+            return f"quote_invalid:timestamp_in_future:{age_seconds:.3f}s"
+        if age_seconds > float(max_quote_age_seconds):
+            return f"quote_stale:{age_seconds:.3f}s"
+        return None
+
+    def _signal_to_item(
+        self,
+        context: EngineContext,
+        signal: Any,
+        provider_name: str,
+        *,
+        available_cash: float | None,
+    ) -> dict[str, Any]:
         return {
             "ticker": signal.symbol,
             "asset_id": signal.symbol,
@@ -221,8 +333,8 @@ class IntradayCryptoEngine:
             "order_notional_ccy": float(signal.max_notional or 0.0),
             "min_notional_usd": 0.0,
             "order_status": "PAPER_SIGNAL",
-            "cash_available_usd": float(signal.max_notional or 0.0),
-            "cash_used_usd": 0.0,
+            "cash_available_usd": available_cash,
+            "cash_used_usd": float(signal.max_notional or 0.0),
             "min_capital_viable_usd": None,
             "price_used": signal.entry_price,
             "price_source": provider_name,
@@ -283,3 +395,82 @@ class IntradayCryptoEngine:
             execution_hour=context.metadata.get("execution_hour"),
             metadata={"engine_name": self.name},
         )
+
+    def _positions_by_symbol(self, positions: Any) -> dict[str, Any]:
+        if isinstance(positions, dict):
+            items = positions.values()
+        elif isinstance(positions, list):
+            items = positions
+        else:
+            return {}
+        result: dict[str, Any] = {}
+        for item in items:
+            symbol = self._position_symbol(item)
+            if not symbol:
+                continue
+            result[symbol] = item
+        return result
+
+    def _position_symbol(self, position: Any) -> str:
+        if hasattr(position, "symbol"):
+            return normalize_crypto_symbol(getattr(position, "symbol"))
+        if isinstance(position, dict):
+            return normalize_crypto_symbol(position.get("symbol") or "")
+        return ""
+
+    def _position_market_value(self, position: Any) -> float:
+        if position is None:
+            return 0.0
+        if isinstance(position, dict) and position.get("notional") is not None:
+            try:
+                return max(float(position.get("notional") or 0.0), 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        quantity = self._position_numeric(position, "quantity")
+        last_price = self._position_numeric(position, "last_price")
+        avg_entry_price = self._position_numeric(position, "avg_entry_price")
+        reference_price = last_price if last_price > 0.0 else avg_entry_price
+        return max(quantity, 0.0) * max(reference_price, 0.0)
+
+    def _position_numeric(self, position: Any, field: str) -> float:
+        if hasattr(position, field):
+            value = getattr(position, field)
+        elif isinstance(position, dict):
+            value = position.get(field)
+        else:
+            value = None
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _closed_candles(self, candles: Any, *, timeframe: str, as_of: datetime) -> pd.DataFrame:
+        if candles is None or not isinstance(candles, pd.DataFrame) or candles.empty or "date" not in candles.columns:
+            return pd.DataFrame() if isinstance(candles, pd.DataFrame) else pd.DataFrame()
+        delta = self._timeframe_delta(timeframe)
+        if delta is None:
+            return candles.copy()
+        normalized_as_of = self._naive_utc(as_of)
+        frame = candles.copy()
+        timestamps = pd.to_datetime(frame["date"], errors="coerce", utc=True)
+        close_times = timestamps + pd.Timedelta(delta)
+        mask = close_times <= pd.Timestamp(normalized_as_of, tz="UTC")
+        filtered = frame.loc[mask.fillna(False)].copy()
+        normalized = pd.to_datetime(filtered["date"], errors="coerce", utc=True)
+        filtered["date"] = normalized.dt.tz_convert(None)
+        return filtered.reset_index(drop=True)
+
+    def _timeframe_delta(self, timeframe: str) -> timedelta | None:
+        mapping = {
+            "1m": timedelta(minutes=1),
+            "5m": timedelta(minutes=5),
+            "15m": timedelta(minutes=15),
+            "1h": timedelta(hours=1),
+            "1d": timedelta(days=1),
+        }
+        return mapping.get(str(timeframe or "").strip().lower())
+
+    def _naive_utc(self, value: datetime) -> datetime:
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value

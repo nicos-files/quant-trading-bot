@@ -53,12 +53,15 @@ class _FakeClient:
         *,
         order_test_response: dict[str, Any] | None = None,
         place_order_response: dict[str, Any] | None = None,
+        exchange_info_response: dict[str, Any] | None = None,
         api_key_masked: str = "****abcd",
         order_test_raises: BaseException | None = None,
         place_order_raises: BaseException | None = None,
+        exchange_info_raises: BaseException | None = None,
     ) -> None:
         self.order_test_calls: list[Mapping[str, Any]] = []
         self.place_order_calls: list[Mapping[str, Any]] = []
+        self.exchange_info_calls: list[tuple[str, ...] | None] = []
         self._order_test_response = order_test_response or {}
         self._place_order_response = place_order_response or {
             "orderId": 999,
@@ -76,8 +79,31 @@ class _FakeClient:
                 }
             ],
         }
+        self._exchange_info_response = exchange_info_response or {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "minQty": "0.000001", "maxQty": "1000", "stepSize": "0.000001"},
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.000001", "maxQty": "1000", "stepSize": "0.000001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10.0"},
+                    ],
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "minQty": "0.00001", "maxQty": "10000", "stepSize": "0.00001"},
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.00001", "maxQty": "10000", "stepSize": "0.00001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10.0"},
+                    ],
+                },
+            ]
+        }
         self._order_test_raises = order_test_raises
         self._place_order_raises = place_order_raises
+        self._exchange_info_raises = exchange_info_raises
         self.api_key_masked = api_key_masked
 
     def order_test(self, *, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -91,6 +117,12 @@ class _FakeClient:
             raise self._place_order_raises
         self.place_order_calls.append(dict(params))
         return dict(self._place_order_response)
+
+    def exchange_info(self, symbols: list[str] | None = None) -> dict[str, Any]:
+        if self._exchange_info_raises is not None:
+            raise self._exchange_info_raises
+        self.exchange_info_calls.append(tuple(symbols) if symbols is not None else None)
+        return dict(self._exchange_info_response)
 
 
 def _testnet_env(**overrides: str) -> dict[str, str]:
@@ -443,6 +475,53 @@ class MaxNotionalTests(_ExecutorTestCase):
         self.assertTrue(
             any("invalid_binance_testnet_max_notional" in w for w in result["warnings"])
         )
+
+
+class ExchangeFilterValidationTests(_ExecutorTestCase):
+    def test_buy_below_exchange_min_notional_is_rejected_pre_submit(self) -> None:
+        self._write_events([self._buy_event(gross_notional=5.0)])
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{MAX_NOTIONAL_ENV: "25"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.order_test_calls, [])
+        self.assertEqual(result["rejected_count"], 1)
+        orders = self._read_artifact("binance_testnet_orders.json")
+        self.assertIn("min_notional_violation", orders[0]["reason"])
+
+    def test_sell_quantity_off_step_size_is_rejected_pre_submit(self) -> None:
+        self._write_events([self._take_profit_event(exit_quantity=0.0003005)])
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.order_test_calls, [])
+        self.assertEqual(result["rejected_count"], 1)
+        orders = self._read_artifact("binance_testnet_orders.json")
+        self.assertIn("quantity_step_mismatch", orders[0]["reason"])
+
+    def test_exchange_info_is_fetched_for_validation(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.exchange_info_calls, [("BTCUSDT", "ETHUSDT")])
 
 
 # ---------------------------------------------------------------------------

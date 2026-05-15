@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from src.utils.atomic_io import atomic_write_json, atomic_write_text
+
 
 EPSILON = 1e-12
 
@@ -373,6 +375,12 @@ def build_crypto_paper_history_summary(
             "paper_only": True,
             "live_trading": False,
             "symbol_attribution_count": len(symbol_attribution),
+            "snapshot_kinds": sorted(
+                {
+                    str((entry.metadata.get("daily_close_metadata") or {}).get("snapshot_kind") or "unknown")
+                    for entry in ordered
+                }
+            ),
         },
     )
 
@@ -407,10 +415,13 @@ def write_crypto_paper_history_artifacts(
     written: dict[str, Path] = {}
     for filename, payload in payloads.items():
         path = root / filename
-        path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, payload)
         written[filename] = path
     report_path = root / "crypto_paper_history_report.md"
-    report_path.write_text(build_crypto_paper_history_report(entries, points, summary, symbol_attribution, attribution_warnings), encoding="utf-8")
+    atomic_write_text(
+        report_path,
+        build_crypto_paper_history_report(entries, points, summary, symbol_attribution, attribution_warnings),
+    )
     written[report_path.name] = report_path
     return written
 
@@ -428,6 +439,7 @@ def build_crypto_paper_history_report(
         "Paper-only analytics. No live orders were placed and no broker integration was used.",
         "",
         "## Summary",
+        f"- Snapshot kinds: {', '.join(summary.metadata.get('snapshot_kinds') or ['unknown'])}",
         f"- Start date: {summary.start_date or 'n/a'}",
         f"- End date: {summary.end_date or 'n/a'}",
         f"- Days tracked: {summary.days_count}",
@@ -495,6 +507,7 @@ def build_crypto_paper_history_report(
             "- Paper-only.",
             "- No live orders placed.",
             "- No broker integration.",
+            "- History may contain intraday run snapshots unless explicitly marked as daily_close.",
             "- Realized P&L may be limited until SELL/EXIT simulation exists.",
         ]
     )

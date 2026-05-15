@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import os
 from typing import Any, Iterable, Optional
 
 import pandas as pd
@@ -18,9 +19,38 @@ YFINANCE_PROVIDER = "yfinance"
 ALPHAV_PROVIDER = "alphaV"
 BINANCE_SPOT_PROVIDER = "binance_spot"
 ALPHAV_URL = "https://www.alphavantage.co/query"
-ALPHAV_API_KEY = "TGES6LEV1PPQSVIB"
+ALPHAV_API_KEY_ENV = "ALPHAV_API_KEY"
 BINANCE_SPOT_URL = "https://api.binance.com"
 BINANCE_INTERVALS = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "1d": "1d"}
+
+
+def normalize_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def parse_quote_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = pd.Timestamp(value).to_pydatetime()
+    except Exception:
+        return None
+    return normalize_utc_datetime(parsed)
+
+
+def quote_age_seconds(quote: dict[str, Any], *, as_of: datetime) -> float | None:
+    if not isinstance(quote, dict):
+        return None
+    timestamp = parse_quote_timestamp(quote.get("timestamp"))
+    if timestamp is None:
+        return None
+    age = normalize_utc_datetime(as_of) - timestamp
+    return float(age.total_seconds())
 
 
 @dataclass(frozen=True)
@@ -95,8 +125,9 @@ class AlphaVantagePriceProvider(MarketDataProvider):
         return _alpha_symbol(asset) is not None
 
     def health_check(self) -> ProviderHealth:
-        status = "healthy" if ALPHAV_API_KEY else "unavailable"
-        message = "api key configured" if ALPHAV_API_KEY else "missing api key"
+        api_key = _alpha_api_key()
+        status = "healthy" if api_key else "unavailable"
+        message = "api key configured" if api_key else f"missing api key env:{ALPHAV_API_KEY_ENV}"
         return ProviderHealth(
             provider_name=self.provider_name,
             status=status,
@@ -108,6 +139,10 @@ class AlphaVantagePriceProvider(MarketDataProvider):
         symbol = _alpha_symbol(asset)
         if not symbol:
             return None
+        api_key = _alpha_api_key()
+        if not api_key:
+            print(f"[FETCH] {asset.asset_id}: missing {ALPHAV_API_KEY_ENV}")
+            return None
 
         # Alpha Vantage free rejects TIME_SERIES_DAILY outputsize=full.
         outputsize = "compact"
@@ -117,7 +152,7 @@ class AlphaVantagePriceProvider(MarketDataProvider):
                 "from_symbol": symbol[:3],
                 "to_symbol": symbol[3:],
                 "outputsize": outputsize,
-                "apikey": ALPHAV_API_KEY,
+                "apikey": api_key,
             }
             series_key = "Time Series FX (Daily)"
         else:
@@ -125,7 +160,7 @@ class AlphaVantagePriceProvider(MarketDataProvider):
                 "function": "TIME_SERIES_DAILY",
                 "symbol": symbol,
                 "outputsize": outputsize,
-                "apikey": ALPHAV_API_KEY,
+                "apikey": api_key,
             }
             series_key = "Time Series (Daily)"
 
@@ -175,6 +210,10 @@ class AlphaVantagePriceProvider(MarketDataProvider):
         return normalized if not normalized.empty else None
 
 
+def _alpha_api_key() -> str:
+    return str(os.getenv(ALPHAV_API_KEY_ENV) or "").strip()
+
+
 class BinanceSpotMarketDataProvider(MarketDataProvider):
     provider_name = BINANCE_SPOT_PROVIDER
 
@@ -212,6 +251,12 @@ class BinanceSpotMarketDataProvider(MarketDataProvider):
             "market": "crypto",
             "symbol": normalized,
             "timestamp": ended.isoformat(),
+            "observed_at": ended.isoformat(),
+            "exchange_close_time": (
+                datetime.fromtimestamp(int(payload["closeTime"]) / 1000, tz=timezone.utc).isoformat()
+                if payload.get("closeTime") is not None
+                else None
+            ),
             "is_realtime": True,
             "is_delayed": False,
             "last_price": float(payload["lastPrice"]),

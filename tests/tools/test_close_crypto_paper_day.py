@@ -90,6 +90,10 @@ class CloseCryptoPaperDayToolTests(unittest.TestCase):
             )
             self.assertTrue((run_root / "artifacts" / "crypto_paper" / "daily_close" / "crypto_paper_daily_close.json").exists())
             self.assertEqual(result["status"], "SUCCESS")
+            payload = json.loads(
+                (run_root / "artifacts" / "crypto_paper" / "daily_close" / "crypto_paper_daily_close.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["metadata"]["snapshot_kind"], "manual_close")
 
     def test_does_not_require_api_keys(self) -> None:
         os.environ["ENABLE_CRYPTO_PAPER_CLOSE"] = "1"

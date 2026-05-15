@@ -41,6 +41,7 @@ import json
 import os
 from dataclasses import asdict
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -62,6 +63,7 @@ from src.execution.binance_testnet_models import (
     BinanceTestnetReconciliationItem,
 )
 from src.reports.crypto_paper_semantics import build_semantic_layer
+from src.utils.atomic_io import atomic_write_json
 
 
 ENABLE_FLAG = "ENABLE_BINANCE_TESTNET_EXECUTION"
@@ -215,6 +217,12 @@ def run_binance_testnet_execution(
     fills: list[BinanceTestnetFill] = []
     skipped: list[dict[str, Any]] = []
     warnings: list[str] = list(config_warnings)
+    exchange_filters_by_symbol = _load_exchange_filters(
+        client=client,
+        allowed_symbols=config.allowed_symbols,
+        warnings=warnings,
+    )
+    enforce_exchange_filters = client is not None
 
     actionable_events: list[dict[str, Any]] = [
         event
@@ -283,6 +291,22 @@ def run_binance_testnet_execution(
             side=side,
             requested_notional=requested_notional,
         )
+        if enforce_exchange_filters:
+            filter_rejection = _validate_order_against_exchange_filters(
+                order=order_record,
+                symbol_filters=exchange_filters_by_symbol.get(symbol),
+            )
+            if filter_rejection is not None:
+                rejected_orders.append(
+                    _build_rejected_order(
+                        event=event,
+                        config=config,
+                        moment=moment,
+                        reason=filter_rejection,
+                        client_order_id=client_order_id,
+                    )
+                )
+                continue
 
         if dry_run or client is None:
             # Never call the broker in dry-run, but still record what would
@@ -393,6 +417,188 @@ def run_binance_testnet_execution(
 
 class _NotionalError(ValueError):
     pass
+
+
+def _load_exchange_filters(
+    *,
+    client: BinanceSpotTestnetClient | None,
+    allowed_symbols: Iterable[str],
+    warnings: list[str],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    if client is None:
+        warnings.append("exchange_filters_unavailable:no_client")
+        return {}
+    exchange_info_fn = getattr(client, "exchange_info", None)
+    if not callable(exchange_info_fn):
+        warnings.append("exchange_filters_unavailable:no_exchange_info_method")
+        return {}
+    try:
+        payload = exchange_info_fn(symbols=list(allowed_symbols))
+    except Exception as exc:
+        warnings.append(f"exchange_filters_unavailable:{exc}")
+        return {}
+    symbols = payload.get("symbols") if isinstance(payload, Mapping) else None
+    if not isinstance(symbols, list):
+        warnings.append("exchange_filters_unavailable:invalid_exchange_info")
+        return {}
+
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for item in symbols:
+        if not isinstance(item, Mapping):
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        filters_payload = item.get("filters")
+        if not isinstance(filters_payload, list):
+            continue
+        parsed_filters: dict[str, dict[str, Any]] = {}
+        for filter_item in filters_payload:
+            if not isinstance(filter_item, Mapping):
+                continue
+            filter_type = str(filter_item.get("filterType") or "").upper()
+            if not filter_type:
+                continue
+            parsed_filters[filter_type] = dict(filter_item)
+        result[symbol] = parsed_filters
+    return result
+
+
+def _validate_order_against_exchange_filters(
+    *,
+    order: BinanceTestnetOrder,
+    symbol_filters: dict[str, dict[str, Any]] | None,
+) -> str | None:
+    if not symbol_filters:
+        return f"exchange_filters_missing:{order.symbol}"
+
+    price_filter = symbol_filters.get("PRICE_FILTER")
+    if price_filter is not None:
+        price_issue = _validate_reference_price(
+            order.reference_price,
+            price_filter=price_filter,
+        )
+        if price_issue is not None:
+            return price_issue
+
+    min_notional_issue = _validate_notional_filters(
+        order=order,
+        symbol_filters=symbol_filters,
+    )
+    if min_notional_issue is not None:
+        return min_notional_issue
+
+    lot_issue = _validate_lot_size_filters(
+        order=order,
+        symbol_filters=symbol_filters,
+    )
+    if lot_issue is not None:
+        return lot_issue
+    return None
+
+
+def _validate_reference_price(
+    reference_price: float | None,
+    *,
+    price_filter: Mapping[str, Any],
+) -> str | None:
+    if reference_price is None:
+        return None
+    price = _to_decimal(reference_price)
+    min_price = _to_decimal(price_filter.get("minPrice"))
+    max_price = _to_decimal(price_filter.get("maxPrice"))
+    tick_size = _to_decimal(price_filter.get("tickSize"))
+    if price is None or price <= 0:
+        return "price_filter_invalid_reference_price"
+    if min_price is not None and min_price > 0 and price < min_price:
+        return f"price_below_min:{float(price)}<{float(min_price)}"
+    if max_price is not None and max_price > 0 and price > max_price:
+        return f"price_above_max:{float(price)}>{float(max_price)}"
+    if tick_size is not None and tick_size > 0 and not _is_step_aligned(price, tick_size):
+        return f"price_tick_mismatch:{float(price)}@{float(tick_size)}"
+    return None
+
+
+def _validate_notional_filters(
+    *,
+    order: BinanceTestnetOrder,
+    symbol_filters: Mapping[str, dict[str, Any]],
+) -> str | None:
+    notional = _to_decimal(order.requested_notional)
+    if notional is None or notional <= 0:
+        return "notional_invalid"
+
+    min_notional_filter = symbol_filters.get("MIN_NOTIONAL")
+    if min_notional_filter is not None:
+        min_notional = _to_decimal(min_notional_filter.get("minNotional"))
+        if min_notional is not None and min_notional > 0 and notional < min_notional:
+            return f"min_notional_violation:{float(notional)}<{float(min_notional)}"
+
+    notional_filter = symbol_filters.get("NOTIONAL")
+    if notional_filter is not None:
+        min_notional = _to_decimal(notional_filter.get("minNotional"))
+        max_notional = _to_decimal(notional_filter.get("maxNotional"))
+        if min_notional is not None and min_notional > 0 and notional < min_notional:
+            return f"notional_below_exchange_min:{float(notional)}<{float(min_notional)}"
+        if max_notional is not None and max_notional > 0 and notional > max_notional:
+            return f"notional_above_exchange_max:{float(notional)}>{float(max_notional)}"
+    return None
+
+
+def _validate_lot_size_filters(
+    *,
+    order: BinanceTestnetOrder,
+    symbol_filters: Mapping[str, dict[str, Any]],
+) -> str | None:
+    if order.side == "BUY" and order.quantity is None and order.quote_order_qty is not None:
+        return None
+    lot_filter = symbol_filters.get("MARKET_LOT_SIZE") or symbol_filters.get("LOT_SIZE")
+    if lot_filter is None:
+        return None
+
+    quantity = _effective_quantity_for_validation(order)
+    if quantity is None:
+        return None
+    min_qty = _to_decimal(lot_filter.get("minQty"))
+    max_qty = _to_decimal(lot_filter.get("maxQty"))
+    step_size = _to_decimal(lot_filter.get("stepSize"))
+    if min_qty is not None and min_qty > 0 and quantity < min_qty:
+        return f"quantity_below_min:{float(quantity)}<{float(min_qty)}"
+    if max_qty is not None and max_qty > 0 and quantity > max_qty:
+        return f"quantity_above_max:{float(quantity)}>{float(max_qty)}"
+    if step_size is not None and step_size > 0 and not _is_step_aligned(quantity, step_size):
+        return f"quantity_step_mismatch:{float(quantity)}@{float(step_size)}"
+    return None
+
+
+def _effective_quantity_for_validation(order: BinanceTestnetOrder) -> Decimal | None:
+    if order.quantity is not None:
+        return _to_decimal(order.quantity)
+    if order.quote_order_qty is None or order.reference_price is None:
+        return None
+    quote_qty = _to_decimal(order.quote_order_qty)
+    ref_price = _to_decimal(order.reference_price)
+    if quote_qty is None or ref_price is None or ref_price <= 0:
+        return None
+    return quote_qty / ref_price
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    try:
+        if value is None:
+            return None
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _is_step_aligned(value: Decimal, step: Decimal) -> bool:
+    if step <= 0:
+        return True
+    try:
+        return (value % step) == 0
+    except InvalidOperation:
+        return False
 
 
 def _resolve_config(env: Mapping[str, str]) -> tuple[BinanceTestnetExecutionConfig, list[str]]:
@@ -813,10 +1019,7 @@ def _build_reconciliation(
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    atomic_write_json(path, payload)
 
 
 def _write_result(testnet_root: Path, payload: dict[str, Any]) -> None:
@@ -849,10 +1052,7 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 def _save_state(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-        encoding="utf-8",
-    )
+    atomic_write_json(path, payload)
 
 
 __all__ = [

@@ -258,6 +258,77 @@ class CryptoPaperForwardTests(unittest.TestCase):
             self.assertEqual(exit_events[0]["exit_reason"], "STOP_LOSS")
             self.assertEqual(exit_events[0]["source"], "stop_take_quote_fallback")
 
+    def test_stale_quote_does_not_trigger_quote_fallback_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            self._seed_open_position(artifacts_dir)
+
+            bundle = {
+                "candles": {
+                    "BTCUSDT": [
+                        {"timestamp": "2026-05-03T17:20:00Z", "open": 76500, "high": 76600, "low": 76400, "close": 76550, "volume": 1.0},
+                        {"timestamp": "2026-05-03T17:25:00Z", "open": 76550, "high": 76600, "low": 76450, "close": 76580, "volume": 1.0},
+                    ]
+                },
+                "quotes": {
+                    "BTCUSDT": {
+                        "last_price": 78734.06,
+                        "bid": 78700.0,
+                        "ask": 78750.0,
+                        "timestamp": "2026-05-03T17:00:00Z",
+                    }
+                },
+            }
+            candidate = self._candidate_config()
+            candidate["crypto_risk"] = {"max_quote_age_seconds": 300}
+            candidate_path, prices_path = self._write_candidate_and_prices(root, candidate=candidate, bundle=bundle)
+            result = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-05-03T17:30:00+00:00",
+            )
+
+            self.assertEqual(result["status"], "SUCCESS", msg=result.get("warnings"))
+            self.assertEqual(result["exits_count"], 0, msg=result)
+            self.assertTrue(any("quote_stale" in warning for warning in result.get("warnings", [])))
+
+            positions = json.loads(
+                (artifacts_dir / "crypto_paper_positions.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(positions), 1)
+
+    def test_existing_open_position_blocks_new_entry_recommendation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            self._seed_open_position(artifacts_dir)
+            bundle = {
+                "candles": {
+                    "BTCUSDT": [
+                        {"timestamp": "2026-04-25T10:00:00Z", "open": 76500.0, "high": 76600.0, "low": 76450.0, "close": 76520.0, "volume": 10.0},
+                        {"timestamp": "2026-04-25T10:05:00Z", "open": 76520.0, "high": 76620.0, "low": 76480.0, "close": 76560.0, "volume": 10.0},
+                        {"timestamp": "2026-04-25T10:10:00Z", "open": 76560.0, "high": 76650.0, "low": 76500.0, "close": 76600.0, "volume": 11.0},
+                        {"timestamp": "2026-04-25T10:15:00Z", "open": 76600.0, "high": 76700.0, "low": 76520.0, "close": 76640.0, "volume": 12.0},
+                    ]
+                },
+                "quotes": {
+                    "BTCUSDT": {"last_price": 76640.0, "bid": 76630.0, "ask": 76650.0}
+                },
+            }
+            candidate_path, prices_path = self._write_candidate_and_prices(root, bundle=bundle)
+            result = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-04-25T10:20:00+00:00",
+            )
+            self.assertEqual(result["status"], "SUCCESS", msg=result.get("warnings"))
+            self.assertEqual(result["recommendations_count"], 0)
+            self.assertEqual(result["fills_count"], 0)
+            self.assertTrue(any("symbol_position_exists" in warning for warning in result["warnings"]))
+
     def test_partial_failure_produces_warnings_not_silent_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -272,6 +343,40 @@ class CryptoPaperForwardTests(unittest.TestCase):
                 )
             self.assertEqual(result["status"], "PARTIAL")
             self.assertTrue(any("evaluation_failed:boom" in warning for warning in result["warnings"]))
+
+    def test_active_forward_lock_skips_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_path, prices_path = self._write_candidate_and_prices(root)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            lock_path = artifacts_dir / "paper_forward" / ".crypto_paper_forward.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text("{}", encoding="utf-8")
+            result = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-04-25T10:20:00+00:00",
+            )
+            self.assertEqual(result["status"], "SKIPPED")
+            self.assertEqual(result["reason"], "forward_run_locked")
+
+    def test_corrupt_ledger_fails_closed_instead_of_trading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_path, prices_path = self._write_candidate_and_prices(root)
+            artifacts_dir = root / "artifacts" / "crypto_paper"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            (artifacts_dir / "crypto_paper_snapshot.json").write_text("{bad json", encoding="utf-8")
+            result = run_crypto_paper_forward(
+                candidate_config=candidate_path,
+                artifacts_dir=artifacts_dir,
+                prices_json=prices_path,
+                as_of="2026-04-25T10:20:00+00:00",
+            )
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["reason"], "ledger_state_corrupt")
+            self.assertIn("ledger_state_corrupt", result["warnings"])
 
 
 if __name__ == "__main__":

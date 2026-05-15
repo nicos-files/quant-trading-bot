@@ -49,7 +49,10 @@ class IntradayCryptoPaperExecutionWiringTests(unittest.TestCase):
         provider.provider_name = "binance_spot"
         provider.health_check.return_value = Mock(status="healthy", message="ok", checked_at_utc="2026-04-24T12:00:00")
         provider.get_historical_bars.return_value = pd.DataFrame()
-        provider.get_latest_quote.return_value = {"last_price": 100.0}
+        provider.get_latest_quote.return_value = {
+            "last_price": 100.0,
+            "timestamp": "2026-04-24T11:59:30+00:00",
+        }
         with tempfile.TemporaryDirectory() as tmp:
             result = run_crypto_paper(run_id="20260424-1200", base_path=tmp, provider=provider, as_of=datetime(2026, 4, 24, 12, 0, 0))
             self.assertEqual(result["fill_count"], 0)
@@ -61,7 +64,11 @@ class IntradayCryptoPaperExecutionWiringTests(unittest.TestCase):
         provider.provider_name = "binance_spot"
         provider.health_check.return_value = Mock(status="healthy", message="ok", checked_at_utc="2026-04-24T12:00:00")
         provider.get_historical_bars.return_value = _bullish_candles()
-        provider.get_latest_quote.return_value = {"last_price": 107.8, "ask": 107.8}
+        provider.get_latest_quote.return_value = {
+            "last_price": 107.8,
+            "ask": 107.8,
+            "timestamp": "2026-04-24T11:59:30+00:00",
+        }
         config_path = REPO_ROOT / "config" / "market_universe" / "crypto.json"
         original = json.loads(config_path.read_text(encoding="utf-8"))
         modified = dict(original)
@@ -81,6 +88,25 @@ class IntradayCryptoPaperExecutionWiringTests(unittest.TestCase):
                 self.assertFalse((Path(tmp) / "20260424-1200" / "artifacts" / "execution.plan.v1.0.0.json").exists())
         finally:
             config_path.write_text(json.dumps(original, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def test_corrupt_existing_ledger_fails_closed(self) -> None:
+        os.environ["ENABLE_CRYPTO_PAPER_EXECUTION"] = "1"
+        os.environ["ENABLE_CRYPTO_MARKET_DATA"] = "1"
+        provider = Mock()
+        provider.provider_name = "binance_spot"
+        provider.health_check.return_value = Mock(status="healthy", message="ok", checked_at_utc="2026-04-24T12:00:00")
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp) / "20260424-1200" / "artifacts" / "crypto_paper"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            (artifact_root / "crypto_paper_snapshot.json").write_text("{bad json", encoding="utf-8")
+            result = run_crypto_paper(
+                run_id="20260424-1200",
+                base_path=tmp,
+                provider=provider,
+                as_of=datetime(2026, 4, 24, 12, 0, 0),
+            )
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["reason"], "ledger_state_corrupt")
 
 
 if __name__ == "__main__":
