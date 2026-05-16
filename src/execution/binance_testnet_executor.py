@@ -71,6 +71,10 @@ ORDER_TEST_ONLY_FLAG = "BINANCE_TESTNET_ORDER_TEST_ONLY"
 BASE_URL_ENV = "BINANCE_TESTNET_BASE_URL"
 MAX_NOTIONAL_ENV = "BINANCE_TESTNET_MAX_NOTIONAL"
 ALLOWED_SYMBOLS_ENV = "BINANCE_TESTNET_ALLOWED_SYMBOLS"
+KILL_SWITCH_ENV = "BINANCE_TESTNET_KILL_SWITCH"
+KILL_SWITCH_PATH_ENV = "BINANCE_TESTNET_KILL_SWITCH_PATH"
+BLOCK_ON_PREVIOUS_MISMATCH_ENV = "BINANCE_TESTNET_BLOCK_ON_PREVIOUS_RECONCILIATION_MISMATCH"
+MAX_OPEN_ORDERS_ENV = "BINANCE_TESTNET_MAX_OPEN_ORDERS"
 
 DEFAULT_MAX_NOTIONAL = 25.0
 DEFAULT_ALLOWED_SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
@@ -84,6 +88,7 @@ _RECON_FILENAME = "binance_testnet_reconciliation.json"
 _EXCHANGE_STATE_FILENAME = "binance_testnet_exchange_state.json"
 _RESULT_FILENAME = "binance_testnet_execution_result.json"
 _STATE_FILENAME = "binance_testnet_state.json"
+_KILL_SWITCH_FILENAME = "binance_testnet_kill_switch.json"
 
 _ACTIONABLE_EVENT_TYPES: frozenset[str] = frozenset(
     {"BUY_FILLED_PAPER", "TAKE_PROFIT", "STOP_LOSS"}
@@ -180,6 +185,26 @@ def run_binance_testnet_execution(
         _write_result(testnet_root, base_result)
         return base_result
 
+    kill_switch_block = _check_kill_switch(source_env=source_env, testnet_root=testnet_root)
+    if kill_switch_block is not None:
+        base_result["reason"] = kill_switch_block
+        _write_result(testnet_root, base_result)
+        return base_result
+
+    previous_exchange_state = _load_json_safe(
+        testnet_root / _EXCHANGE_STATE_FILENAME,
+        default={},
+    )
+    previous_mismatch_block = _check_previous_exchange_state_gate(
+        source_env=source_env,
+        previous_exchange_state=previous_exchange_state,
+    )
+    if previous_mismatch_block is not None:
+        base_result["reason"] = previous_mismatch_block
+        base_result["previous_exchange_state"] = previous_exchange_state
+        _write_result(testnet_root, base_result)
+        return base_result
+
     # ------------------------------------------------------------------
     # Gate 3: credentials (only when we will actually call out)
     # ------------------------------------------------------------------
@@ -209,6 +234,16 @@ def run_binance_testnet_execution(
     if time_sync.get("blocked"):
         base_result["reason"] = str(time_sync.get("reason") or "server_time_sync_blocked")
         base_result["warnings"] = list(time_sync.get("warnings") or [])
+        _write_result(testnet_root, base_result)
+        return base_result
+    open_order_limit_gate = _check_open_order_limit(
+        client=client,
+        source_env=source_env,
+    )
+    base_result["open_order_limit"] = open_order_limit_gate
+    if open_order_limit_gate.get("blocked"):
+        base_result["reason"] = str(open_order_limit_gate.get("reason") or "open_order_limit_exceeded")
+        base_result["warnings"] = list(open_order_limit_gate.get("warnings") or [])
         _write_result(testnet_root, base_result)
         return base_result
 
@@ -427,6 +462,8 @@ def run_binance_testnet_execution(
             "skipped_count": len(skipped),
             "warnings": warnings,
             "time_sync": time_sync,
+            "open_order_limit": open_order_limit_gate,
+            "previous_exchange_state": previous_exchange_state if isinstance(previous_exchange_state, dict) else {},
             "exchange_state": exchange_state,
             "result": final_result_obj.to_dict(),
         }
@@ -442,6 +479,90 @@ def run_binance_testnet_execution(
 
 class _NotionalError(ValueError):
     pass
+
+
+def _check_kill_switch(
+    *,
+    source_env: Mapping[str, str],
+    testnet_root: Path,
+) -> str | None:
+    if _is_flag_enabled(source_env.get(KILL_SWITCH_ENV)):
+        return "kill switch enabled via env"
+    configured_path = str(source_env.get(KILL_SWITCH_PATH_ENV) or "").strip()
+    path = Path(configured_path) if configured_path else (testnet_root / _KILL_SWITCH_FILENAME)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return "kill switch enabled via file"
+    if isinstance(payload, Mapping) and payload.get("enabled") is True:
+        return "kill switch enabled via file"
+    return None
+
+
+def _check_previous_exchange_state_gate(
+    *,
+    source_env: Mapping[str, str],
+    previous_exchange_state: Any,
+) -> str | None:
+    if not _is_flag_enabled(source_env.get(BLOCK_ON_PREVIOUS_MISMATCH_ENV, "1")):
+        return None
+    if not isinstance(previous_exchange_state, Mapping):
+        return None
+    mismatches = previous_exchange_state.get("mismatches")
+    if not isinstance(mismatches, list):
+        return None
+    critical = [str(item) for item in mismatches if str(item).strip()]
+    if not critical:
+        return None
+    return f"previous_exchange_reconciliation_mismatch:{len(critical)}"
+
+
+def _check_open_order_limit(
+    *,
+    client: BinanceSpotTestnetClient | None,
+    source_env: Mapping[str, str],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "configured": False,
+        "blocked": False,
+        "warnings": [],
+    }
+    raw_limit = source_env.get(MAX_OPEN_ORDERS_ENV)
+    if raw_limit is None or str(raw_limit).strip() == "":
+        return result
+    try:
+        limit = int(str(raw_limit).strip())
+    except (TypeError, ValueError):
+        result["configured"] = True
+        result["warnings"].append(f"invalid_{MAX_OPEN_ORDERS_ENV.lower()}:{raw_limit!r}")
+        return result
+    if limit < 0:
+        result["configured"] = True
+        result["warnings"].append(f"invalid_{MAX_OPEN_ORDERS_ENV.lower()}:{raw_limit!r}")
+        return result
+    result["configured"] = True
+    result["limit"] = limit
+    if client is None:
+        result["warnings"].append("open_order_limit_unavailable:no_client")
+        return result
+    open_orders_fn = getattr(client, "open_orders", None)
+    if not callable(open_orders_fn):
+        result["warnings"].append("open_order_limit_unavailable:no_open_orders_method")
+        return result
+    try:
+        payload = open_orders_fn()
+    except Exception as exc:
+        result["warnings"].append(f"open_order_limit_unavailable:{exc}")
+        return result
+    count = len(payload) if isinstance(payload, list) else 0
+    result["current_count"] = count
+    if count > limit:
+        result["blocked"] = True
+        result["reason"] = f"open_order_limit_exceeded:{count}>{limit}"
+        result["warnings"].append(result["reason"])
+    return result
 
 
 def _perform_time_sync(
@@ -1286,10 +1407,14 @@ __all__ = [
     "ALLOWED_SYMBOLS_ENV",
     "ARTIFACTS_SUBDIR",
     "BASE_URL_ENV",
+    "BLOCK_ON_PREVIOUS_MISMATCH_ENV",
     "DEFAULT_ALLOWED_SYMBOLS",
     "DEFAULT_MAX_NOTIONAL",
     "ENABLE_FLAG",
+    "KILL_SWITCH_ENV",
+    "KILL_SWITCH_PATH_ENV",
     "MAX_NOTIONAL_ENV",
+    "MAX_OPEN_ORDERS_ENV",
     "ORDER_TEST_ONLY_FLAG",
     "build_client_order_id",
     "run_binance_testnet_execution",

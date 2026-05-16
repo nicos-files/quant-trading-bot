@@ -29,8 +29,12 @@ from pathlib import Path
 from src.execution.binance_testnet_executor import (
     ALLOWED_SYMBOLS_ENV,
     BASE_URL_ENV,
+    BLOCK_ON_PREVIOUS_MISMATCH_ENV,
     ENABLE_FLAG,
+    KILL_SWITCH_ENV,
+    KILL_SWITCH_PATH_ENV,
     MAX_NOTIONAL_ENV,
+    MAX_OPEN_ORDERS_ENV,
     ORDER_TEST_ONLY_FLAG,
     run_binance_testnet_execution,
 )
@@ -105,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
             BASE_URL_ENV: "must be a testnet host",
             MAX_NOTIONAL_ENV: "default 25.0 USDT",
             ALLOWED_SYMBOLS_ENV: "comma-separated allowlist",
+            KILL_SWITCH_ENV: "set '1' to hard-stop testnet execution",
+            KILL_SWITCH_PATH_ENV: "optional JSON file with {\"enabled\": true}",
+            BLOCK_ON_PREVIOUS_MISMATCH_ENV: "default '1'; block if prior reconcile mismatched",
+            MAX_OPEN_ORDERS_ENV: "optional preflight cap on current open orders",
         },
     }
     sys.stdout.write(json.dumps(audit, sort_keys=True) + "\n")

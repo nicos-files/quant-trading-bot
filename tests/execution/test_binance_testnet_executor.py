@@ -30,10 +30,13 @@ from src.execution.binance_testnet_executor import (
     ALLOWED_SYMBOLS_ENV,
     ARTIFACTS_SUBDIR,
     BASE_URL_ENV,
+    BLOCK_ON_PREVIOUS_MISMATCH_ENV,
     DEFAULT_ALLOWED_SYMBOLS,
     DEFAULT_MAX_NOTIONAL,
     ENABLE_FLAG,
+    KILL_SWITCH_ENV,
     MAX_NOTIONAL_ENV,
+    MAX_OPEN_ORDERS_ENV,
     ORDER_TEST_ONLY_FLAG,
     build_client_order_id,
     run_binance_testnet_execution,
@@ -367,6 +370,98 @@ class TimeSyncGateTests(_ExecutorTestCase):
         self.assertTrue(result["time_sync"]["checked"])
         self.assertIn("skew_ms", result["time_sync"])
         self.assertEqual(client.server_time_calls, 1)
+
+
+class OperationalSafetyGateTests(_ExecutorTestCase):
+    def test_kill_switch_env_blocks_before_broker_call(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{KILL_SWITCH_ENV: "1"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("kill switch enabled via env", result["reason"])
+        self.assertEqual(client.order_test_calls, [])
+        self.assertEqual(client.place_order_calls, [])
+
+    def test_kill_switch_file_blocks_before_broker_call(self) -> None:
+        self._write_events([self._buy_event()])
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        (self.testnet_dir / "binance_testnet_kill_switch.json").write_text(
+            json.dumps({"enabled": True}),
+            encoding="utf-8",
+        )
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("kill switch enabled via file", result["reason"])
+        self.assertEqual(client.order_test_calls, [])
+
+    def test_previous_exchange_mismatch_blocks_new_run_by_default(self) -> None:
+        self._write_events([self._buy_event()])
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        (self.testnet_dir / "binance_testnet_exchange_state.json").write_text(
+            json.dumps({"mismatches": ["filled_order_still_open:tnbuy-abc"]}),
+            encoding="utf-8",
+        )
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("previous_exchange_reconciliation_mismatch", result["reason"])
+        self.assertEqual(client.order_test_calls, [])
+
+    def test_previous_exchange_mismatch_can_be_explicitly_overridden(self) -> None:
+        self._write_events([self._buy_event()])
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        (self.testnet_dir / "binance_testnet_exchange_state.json").write_text(
+            json.dumps({"mismatches": ["filled_order_still_open:tnbuy-abc"]}),
+            encoding="utf-8",
+        )
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{BLOCK_ON_PREVIOUS_MISMATCH_ENV: "0"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(client.order_test_calls), 1)
+
+    def test_max_open_orders_gate_blocks_before_new_orders(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient(
+            open_orders_response=[
+                {"symbol": "BTCUSDT", "clientOrderId": "a"},
+                {"symbol": "ETHUSDT", "clientOrderId": "b"},
+            ]
+        )
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{MAX_OPEN_ORDERS_ENV: "1"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("open_order_limit_exceeded", result["reason"])
+        self.assertEqual(client.order_test_calls, [])
 
 
 class BaseUrlGateTests(_ExecutorTestCase):

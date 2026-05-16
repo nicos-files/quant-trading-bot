@@ -107,6 +107,8 @@ class CLIExitCodeTests(unittest.TestCase):
         # The audit envelope must reference the gating env vars by name.
         self.assertIn("ENABLE_BINANCE_TESTNET_EXECUTION", audit["env_flags"])
         self.assertIn("BINANCE_TESTNET_ORDER_TEST_ONLY", audit["env_flags"])
+        self.assertIn("BINANCE_TESTNET_KILL_SWITCH", audit["env_flags"])
+        self.assertIn("BINANCE_TESTNET_BLOCK_ON_PREVIOUS_RECONCILIATION_MISMATCH", audit["env_flags"])
 
     def test_exit_one_on_ok_false(self) -> None:
         code, audit = self._run_with_fake_executor(
