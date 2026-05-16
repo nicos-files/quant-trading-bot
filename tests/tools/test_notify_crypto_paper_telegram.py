@@ -346,6 +346,52 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertNotIn(BOT_TOKEN, result["reason"])
 
+    def test_critical_testnet_event_formats_as_blocked_testnet_card(self) -> None:
+        event = {
+            "event_id": "tn-1",
+            "event_type": "ERROR",
+            "severity": "CRITICAL",
+            "symbol": "",
+            "mode": "TESTNET",
+            "category": "TESTNET_KILL_SWITCH",
+            "failure_reason": "kill switch enabled via env",
+            "action_taken": "blocked",
+            "human_title": "Crypto testnet blocked",
+            "human_message": "Binance Spot Testnet blocked by kill switch.",
+            "manual_action": "Review kill switch.",
+            "metadata": {},
+        }
+        text = format_event_message(event)
+        self.assertIn("CRYPTO TESTNET BLOCKED", text)
+        self.assertIn("TESTNET_KILL_SWITCH", text)
+        self.assertIn("No live/mainnet", text)
+
+    def test_daily_summary_includes_operational_status(self) -> None:
+        from src.tools.notify_crypto_paper_telegram import format_daily_summary
+
+        text = format_daily_summary(
+            {
+                "snapshot": {"equity": 100.0, "realized_pnl": 0.0},
+                "performance": {
+                    "closed_trades_count": 0,
+                    "win_rate": None,
+                    "take_profit_count": 0,
+                    "stop_loss_count": 0,
+                    "total_fees": 0.0,
+                },
+                "rejected_orders_count": 0,
+                "signal_only_count": 0,
+                "operational_status": "DEGRADED",
+                "events_count_by_severity": {"WARNING": 2},
+                "latest_warning_event": {"category": "DATA_STALE"},
+                "warnings": [],
+            },
+            self.now,
+        )
+        self.assertIn("Estado operativo", text)
+        self.assertIn("DEGRADED", text)
+        self.assertIn("DATA_STALE", text)
+
     def test_format_event_message_includes_disclaimer(self) -> None:
         event = {
             "event_id": "x",

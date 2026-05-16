@@ -65,6 +65,7 @@ def close_crypto_paper_day(
     marked_positions = _mark_positions(positions, marks, as_of, warnings)
 
     current_snapshot = _updated_snapshot(current_snapshot, marked_positions, starting_cash, as_of)
+    operational_summary = _load_operational_summary(artifact_root)
     accepted_orders_count, rejected_orders_count = _order_counts(loaded)
     fills_count = _fills_count(loaded)
     exit_events_count = _exit_events_count(loaded)
@@ -103,6 +104,7 @@ def close_crypto_paper_day(
             "output_dir": str(target_dir),
             "snapshot_kind": snapshot_kind,
             "is_true_daily_close": snapshot_kind == "daily_close",
+            "operational_summary": operational_summary,
         },
     )
     written = write_crypto_paper_daily_close_artifacts(target_dir, result)
@@ -211,6 +213,35 @@ def build_crypto_paper_daily_report(result: CryptoPaperDailyCloseResult) -> str:
                 f"last={float(mark or 0.0):.6f} value={value:.6f} "
                 f"unrealized_pnl={float(position.unrealized_pnl or 0.0):.6f} "
                 f"unrealized_pnl_pct={pnl_pct * 100.0:.4f}"
+            )
+    lines.extend(
+        [
+            "",
+            "## Operational Health",
+        ]
+    )
+    operational_summary = result.metadata.get("operational_summary") if isinstance(result.metadata, dict) else {}
+    if not isinstance(operational_summary, dict) or not operational_summary:
+        lines.append("- No semantic operational summary found.")
+    else:
+        lines.append(f"- Operational status: {operational_summary.get('operational_status') or 'OK'}")
+        lines.append(f"- Paper forward status: {operational_summary.get('paper_forward_status') or operational_summary.get('forward_run_status') or 'n/a'}")
+        if operational_summary.get("testnet_status"):
+            lines.append(f"- Testnet status: {operational_summary.get('testnet_status')}")
+        lines.append(
+            f"- Severity counts: {json.dumps(operational_summary.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}"
+        )
+        latest_critical = operational_summary.get("latest_critical_event") or {}
+        latest_warning = operational_summary.get("latest_warning_event") or {}
+        if latest_critical:
+            lines.append(
+                f"- Latest critical/error: {latest_critical.get('category') or latest_critical.get('event_type')} :: "
+                f"{latest_critical.get('failure_reason') or latest_critical.get('human_title')}"
+            )
+        if latest_warning:
+            lines.append(
+                f"- Latest warning: {latest_warning.get('category') or latest_warning.get('event_type')} :: "
+                f"{latest_warning.get('failure_reason') or latest_warning.get('human_title')}"
             )
     lines.extend(
         [
@@ -453,3 +484,14 @@ def _extract_mark(value: Any, prefer_bid: bool = False) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _load_operational_summary(artifact_root: Path) -> dict[str, Any]:
+    path = artifact_root / "semantic" / "crypto_semantic_summary.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}

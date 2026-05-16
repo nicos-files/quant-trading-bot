@@ -385,6 +385,10 @@ class OperationalSafetyGateTests(_ExecutorTestCase):
         )
         self.assertFalse(result["ok"])
         self.assertIn("kill switch enabled via env", result["reason"])
+        self.assertEqual(result["category"], "TESTNET_KILL_SWITCH")
+        self.assertEqual(result["severity"], "CRITICAL")
+        self.assertEqual(result["action_taken"], "blocked")
+        self.assertFalse(result["submit_attempted"])
         self.assertEqual(client.order_test_calls, [])
         self.assertEqual(client.place_order_calls, [])
 
@@ -424,6 +428,7 @@ class OperationalSafetyGateTests(_ExecutorTestCase):
         )
         self.assertFalse(result["ok"])
         self.assertIn("previous_exchange_reconciliation_mismatch", result["reason"])
+        self.assertEqual(result["category"], "TESTNET_RECONCILIATION_MISMATCH")
         self.assertEqual(client.order_test_calls, [])
 
     def test_previous_exchange_mismatch_can_be_explicitly_overridden(self) -> None:
@@ -461,6 +466,7 @@ class OperationalSafetyGateTests(_ExecutorTestCase):
         )
         self.assertFalse(result["ok"])
         self.assertIn("open_order_limit_exceeded", result["reason"])
+        self.assertEqual(result["category"], "TESTNET_OPEN_ORDERS_LIMIT")
         self.assertEqual(client.order_test_calls, [])
 
 
@@ -671,6 +677,8 @@ class ExchangeFilterValidationTests(_ExecutorTestCase):
         self.assertEqual(result["rejected_count"], 1)
         orders = self._read_artifact("binance_testnet_orders.json")
         self.assertIn("min_notional_violation", orders[0]["reason"])
+        self.assertEqual(orders[0]["metadata"]["category"], "EXCHANGE_FILTER_REJECT")
+        self.assertFalse(orders[0]["metadata"]["submit_attempted"])
 
     def test_sell_quantity_off_step_size_is_rejected_pre_submit(self) -> None:
         self._write_events([self._take_profit_event(exit_quantity=0.0003005)])
@@ -944,6 +952,9 @@ class BrokerErrorTests(_ExecutorTestCase):
             any("broker_error" in w for w in result["warnings"]),
             f"expected broker_error in warnings, got {result['warnings']!r}",
         )
+        orders = self._read_artifact("binance_testnet_orders.json")
+        self.assertEqual(orders[0]["metadata"]["category"], "TESTNET_SUBMIT_FAILED")
+        self.assertTrue(orders[0]["metadata"]["submit_attempted"])
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.reports.crypto_paper_semantics import (
     ALERTABLE_EVENT_TYPES,
+    OPERATIONAL_EVENT_CATEGORIES,
+    OPERATIONAL_SEVERITIES,
     PAPER_DISCLAIMER,
     SEMANTIC_EVENT_TYPES,
     SEMANTIC_SEVERITIES,
@@ -265,8 +267,18 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
             "NO_ACTION",
         ):
             self.assertIn(needed, SEMANTIC_EVENT_TYPES)
-        for severity in ("INFO", "ACTION", "WARNING", "CRITICAL"):
+        for severity in ("INFO", "ACTION", "WARNING", "ERROR", "CRITICAL"):
             self.assertIn(severity, SEMANTIC_SEVERITIES)
+        for severity in ("INFO", "WARNING", "ERROR", "CRITICAL"):
+            self.assertIn(severity, OPERATIONAL_SEVERITIES)
+        for category in (
+            "DATA_STALE",
+            "LEDGER_CORRUPT",
+            "EXCHANGE_FILTER_REJECT",
+            "TESTNET_KILL_SWITCH",
+            "NO_ACTION",
+        ):
+            self.assertIn(category, OPERATIONAL_EVENT_CATEGORIES)
 
     def test_does_not_invent_pnl_when_no_artifacts_present(self) -> None:
         result = self._build()
@@ -276,6 +288,53 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
         self.assertIsNone(snapshot["realized_pnl"])
         self.assertIsNone(performance["net_profit"])
         self.assertIsNone(performance["win_rate"])
+
+    def test_summary_includes_operational_counts(self) -> None:
+        self._write(
+            "paper_forward/crypto_paper_forward_result.json",
+            {
+                "status": "SUCCESS",
+                "warnings": ["quote_stale:BTCUSDT", "risk:cash_insufficient"],
+            },
+        )
+        result = self._build()
+        summary = result["summary"]
+        self.assertIn("events_count_by_severity", summary)
+        self.assertIn("events_count_by_category", summary)
+        self.assertEqual(summary["stale_data_count"], 1)
+        self.assertEqual(summary["risk_block_count"], 1)
+        self.assertEqual(summary["operational_status"], "DEGRADED")
+
+    def test_testnet_blocked_artifact_emits_semantic_error_event(self) -> None:
+        testnet_dir = self.artifacts_dir.parent / "crypto_testnet"
+        testnet_dir.mkdir(parents=True, exist_ok=True)
+        (testnet_dir / "binance_testnet_execution_result.json").write_text(
+            json.dumps(
+                {
+                    "ok": False,
+                    "testnet": True,
+                    "live_trading": False,
+                    "environment": "binance_spot_testnet",
+                    "severity": "CRITICAL",
+                    "category": "TESTNET_KILL_SWITCH",
+                    "reason": "kill switch enabled via env",
+                    "failure_reason": "kill switch enabled via env",
+                    "action_taken": "blocked",
+                    "submit_attempted": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = self._build()
+        testnet_events = [
+            event
+            for event in result["events"]
+            if event.get("category") == "TESTNET_KILL_SWITCH"
+        ]
+        self.assertEqual(len(testnet_events), 1)
+        self.assertEqual(testnet_events[0]["event_type"], "ERROR")
+        self.assertEqual(testnet_events[0]["mode"], "TESTNET")
+        self.assertFalse(testnet_events[0]["paper_only"])
 
 
 class CryptoPaperSemanticsExitEnrichmentTests(unittest.TestCase):

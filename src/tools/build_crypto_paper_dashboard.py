@@ -31,6 +31,7 @@ from src.reports.crypto_paper_semantics import (
     local_display_for_iso,
     local_tz_label,
 )
+from src.utils.atomic_io import atomic_write_json, atomic_write_text
 
 
 _DASHBOARD_DIRNAME = "dashboard"
@@ -211,6 +212,18 @@ def build_crypto_paper_dashboard(
         "recent_events": recent_events,
         "recent_signal_only_events": recent_signal_only_events,
         "current_action": current_action,
+        "operational_status": summary.get("operational_status") or "OK",
+        "paper_forward_status": summary.get("paper_forward_status") or summary.get("forward_run_status"),
+        "testnet_status": summary.get("testnet_status"),
+        "latest_critical_event": summary.get("latest_critical_event"),
+        "latest_warning_event": summary.get("latest_warning_event"),
+        "events_count_by_severity": dict(summary.get("events_count_by_severity") or {}),
+        "events_count_by_category": dict(summary.get("events_count_by_category") or {}),
+        "stale_data_count": int(summary.get("stale_data_count") or 0),
+        "risk_block_count": int(summary.get("risk_block_count") or 0),
+        "exchange_filter_reject_count": int(summary.get("exchange_filter_reject_count") or 0),
+        "kill_switch_active": bool(summary.get("kill_switch_active")),
+        "reconciliation_mismatch_count": int(summary.get("reconciliation_mismatch_count") or 0),
         "warnings": list(summary.get("warnings") or []),
         "forward_run_status": summary.get("forward_run_status"),
         "local_tz": summary.get("local_tz") or DEFAULT_CRYPTO_LOCAL_TZ,
@@ -225,12 +238,9 @@ def build_crypto_paper_dashboard(
     data_path = target_dir / _DATA_FILENAME
     summary_path = target_dir / _SUMMARY_FILENAME
 
-    index_path.write_text(index_html, encoding="utf-8")
-    data_path.write_text(
-        json.dumps(dashboard_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-        encoding="utf-8",
-    )
-    summary_path.write_text(summary_md, encoding="utf-8")
+    atomic_write_text(index_path, index_html)
+    atomic_write_json(data_path, dashboard_data)
+    atomic_write_text(summary_path, summary_md)
 
     return {
         "ok": True,
@@ -271,15 +281,19 @@ def _load_or_build_semantic_layer(
 def _select_current_action(events: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not events:
         return None
+    event = events[0]
     return {
-        "event_type": events[0].get("event_type"),
-        "severity": events[0].get("severity"),
-        "symbol": events[0].get("symbol"),
-        "human_title": events[0].get("human_title"),
-        "human_message": events[0].get("human_message"),
-        "manual_action": events[0].get("manual_action"),
-        "paper_only": True,
-        "not_auto_executed": True,
+        "event_type": event.get("event_type"),
+        "severity": event.get("severity"),
+        "symbol": event.get("symbol"),
+        "human_title": event.get("human_title"),
+        "human_message": event.get("human_message"),
+        "manual_action": event.get("manual_action"),
+        "category": event.get("category"),
+        "mode": event.get("mode"),
+        "action_taken": event.get("action_taken"),
+        "paper_only": bool(event.get("paper_only", True)),
+        "not_auto_executed": bool(event.get("not_auto_executed", True)),
     }
 
 
@@ -303,6 +317,9 @@ def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
     last_result = _load_json(
         testnet_root / "binance_testnet_execution_result.json", default={}
     )
+    exchange_state = _load_json(
+        testnet_root / "binance_testnet_exchange_state.json", default={}
+    )
     if not isinstance(orders, list):
         orders = []
     if not isinstance(fills, list):
@@ -313,6 +330,8 @@ def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
         reconciliation = []
     if not isinstance(last_result, dict):
         last_result = {}
+    if not isinstance(exchange_state, dict):
+        exchange_state = {}
 
     if not orders and not fills and not positions and not last_result:
         return {"present": False}
@@ -365,12 +384,19 @@ def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
         "test_ok_count": int(test_ok_count),
         "rejected_count": int(len(rejected)),
         "skipped_count": int(last_result.get("skipped_count") or 0),
+        "severity": last_result.get("severity"),
+        "category": last_result.get("category"),
+        "failure_reason": last_result.get("failure_reason") or last_result.get("reason"),
+        "action_taken": last_result.get("action_taken"),
+        "submit_attempted": last_result.get("submit_attempted"),
+        "operational_status": _testnet_operational_status(last_result),
         "orders_count": int(len(orders)),
         "fills_count": int(len(fills)),
         "positions": positions,
         "recent_orders": recent_orders,
         "recent_fills": recent_fills,
         "reconciliation": reconciliation,
+        "exchange_state": exchange_state,
         "reason": last_result.get("reason"),
         "warnings": list(last_result.get("warnings") or []),
     }
@@ -435,6 +461,33 @@ def _render_index_html(data: dict[str, Any]) -> str:
     parts.append(_render_card("Signal-only", _format_int(performance.get("signal_only_count"))))
     parts.append(_render_card("Total fees", _format_number(performance.get("total_fees"))))
     parts.append(_render_card("Total slippage", _format_number(performance.get("total_slippage"))))
+    parts.append(_render_card("Operational status", str(data.get("operational_status") or "OK")))
+    parts.append(_render_card("Stale data", _format_int(data.get("stale_data_count"))))
+    parts.append(_render_card("Risk blocks", _format_int(data.get("risk_block_count"))))
+    parts.append(_render_card("Exchange rejects", _format_int(data.get("exchange_filter_reject_count"))))
+    parts.append("</section>")
+
+    parts.append('<section class="block">')
+    parts.append("<h2>Operational health</h2>")
+    parts.append(f"<p><strong>Status:</strong> {html.escape(str(data.get('operational_status') or 'OK'))}</p>")
+    parts.append(f"<p><strong>Paper forward:</strong> {html.escape(str(data.get('paper_forward_status') or 'n/a'))}</p>")
+    if data.get("testnet_status"):
+        parts.append(f"<p><strong>Testnet:</strong> {html.escape(str(data.get('testnet_status')))}</p>")
+    parts.append(
+        f"<p><strong>Severity counts:</strong> {html.escape(json.dumps(data.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False))}</p>"
+    )
+    latest_critical = data.get("latest_critical_event")
+    latest_warning = data.get("latest_warning_event")
+    if latest_critical:
+        parts.append(
+            f"<p><strong>Latest critical/error:</strong> {html.escape(str(latest_critical.get('category') or latest_critical.get('event_type') or 'n/a'))} :: "
+            f"{html.escape(str(latest_critical.get('failure_reason') or latest_critical.get('human_title') or 'n/a'))}</p>"
+        )
+    if latest_warning:
+        parts.append(
+            f"<p><strong>Latest warning:</strong> {html.escape(str(latest_warning.get('category') or latest_warning.get('event_type') or 'n/a'))} :: "
+            f"{html.escape(str(latest_warning.get('failure_reason') or latest_warning.get('human_title') or 'n/a'))}</p>"
+        )
     parts.append("</section>")
 
     current_action = data.get("current_action")
@@ -538,6 +591,11 @@ def _render_index_html(data: dict[str, Any]) -> str:
             f'| API key: {html.escape(str(testnet.get("api_key_masked") or "n/a"))} '
             f'| Max notional: {html.escape(_format_number(testnet.get("max_notional")))}'
             "</p>"
+        )
+        parts.append(
+            f'<p class="testnet-reason"><strong>Status:</strong> {html.escape(str(testnet.get("operational_status") or "n/a"))} '
+            f'| <strong>Category:</strong> {html.escape(str(testnet.get("category") or "n/a"))} '
+            f'| <strong>Action:</strong> {html.escape(str(testnet.get("action_taken") or "n/a"))}</p>'
         )
         parts.append('<div class="cards">')
         parts.append(_render_card("Considered", _format_int(testnet.get("considered_count"))))
@@ -733,6 +791,10 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
     lines.append(f"- Stop-losses: {_format_int(performance.get('stop_loss_count'))}")
     lines.append(f"- Rejected orders: {_format_int(performance.get('rejected_orders_count'))}")
     lines.append(f"- Signal-only: {_format_int(performance.get('signal_only_count'))}")
+    lines.append(f"- Operational status: {data.get('operational_status') or 'OK'}")
+    lines.append(f"- Stale data count: {_format_int(data.get('stale_data_count'))}")
+    lines.append(f"- Risk block count: {_format_int(data.get('risk_block_count'))}")
+    lines.append(f"- Exchange filter rejects: {_format_int(data.get('exchange_filter_reject_count'))}")
     lines.append("")
     current_action = data.get("current_action")
     if current_action:
@@ -744,6 +806,25 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
         lines.append(f"- Title: {current_action.get('human_title')}")
         lines.append(f"- Manual action: {current_action.get('manual_action')}")
         lines.append("")
+    latest_critical = data.get("latest_critical_event")
+    latest_warning = data.get("latest_warning_event")
+    lines.append("## Operational health")
+    lines.append(f"- Status: {data.get('operational_status') or 'OK'}")
+    lines.append(f"- Paper forward: {data.get('paper_forward_status') or 'n/a'}")
+    if data.get("testnet_status"):
+        lines.append(f"- Testnet: {data.get('testnet_status')}")
+    lines.append(f"- Severity counts: {json.dumps(data.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}")
+    if latest_critical:
+        lines.append(
+            f"- Latest critical/error: {latest_critical.get('category') or latest_critical.get('event_type')} :: "
+            f"{latest_critical.get('failure_reason') or latest_critical.get('human_title')}"
+        )
+    if latest_warning:
+        lines.append(
+            f"- Latest warning: {latest_warning.get('category') or latest_warning.get('event_type')} :: "
+            f"{latest_warning.get('failure_reason') or latest_warning.get('human_title')}"
+        )
+    lines.append("")
     testnet = data.get("testnet") or {}
     if isinstance(testnet, dict) and testnet.get("present"):
         lines.append("## Binance Spot Testnet (no live trading)")
@@ -759,6 +840,9 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
         lines.append(f"- Placed: {_format_int(testnet.get('placed_count'))}")
         lines.append(f"- Rejected: {_format_int(testnet.get('rejected_count'))}")
         lines.append(f"- Skipped: {_format_int(testnet.get('skipped_count'))}")
+        lines.append(f"- Operational status: {testnet.get('operational_status') or 'n/a'}")
+        lines.append(f"- Category: {testnet.get('category') or 'n/a'}")
+        lines.append(f"- Action: {testnet.get('action_taken') or 'n/a'}")
         if testnet.get("reason"):
             lines.append(f"- Last reason: {testnet.get('reason')}")
         lines.append("")
@@ -825,6 +909,17 @@ def _load_json(path: Path, *, default: Any) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+def _testnet_operational_status(last_result: dict[str, Any]) -> str:
+    severity = str(last_result.get("severity") or "").upper()
+    if severity == "CRITICAL":
+        return "BLOCKED"
+    if severity == "ERROR":
+        return "ERROR"
+    if severity == "WARNING":
+        return "DEGRADED"
+    return "OK" if last_result.get("ok") else "ERROR"
 
 
 def main(argv: list[str] | None = None) -> int:

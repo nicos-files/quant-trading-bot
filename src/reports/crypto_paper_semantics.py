@@ -30,6 +30,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from src.utils.atomic_io import atomic_write_json, atomic_write_text
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # Python 3.9+ stdlib
@@ -53,7 +54,27 @@ SEMANTIC_EVENT_TYPES: tuple[str, ...] = (
     "NO_ACTION",
 )
 
-SEMANTIC_SEVERITIES: tuple[str, ...] = ("INFO", "ACTION", "WARNING", "CRITICAL")
+SEMANTIC_SEVERITIES: tuple[str, ...] = ("INFO", "ACTION", "WARNING", "ERROR", "CRITICAL")
+
+OPERATIONAL_SEVERITIES: tuple[str, ...] = ("INFO", "WARNING", "ERROR", "CRITICAL")
+OPERATIONAL_EVENT_CATEGORIES: tuple[str, ...] = (
+    "DATA_STALE",
+    "DATA_INVALID",
+    "LEDGER_CORRUPT",
+    "LOCK_ACTIVE",
+    "RISK_BLOCKED",
+    "EXCHANGE_FILTER_REJECT",
+    "TESTNET_KILL_SWITCH",
+    "TESTNET_RECONCILIATION_MISMATCH",
+    "TESTNET_OPEN_ORDERS_LIMIT",
+    "TESTNET_INSUFFICIENT_BALANCE",
+    "TESTNET_TIME_SYNC_FAILED",
+    "TESTNET_SUBMIT_FAILED",
+    "TELEGRAM_NOTIFY_FAILED",
+    "PAPER_ORDER_PLACED",
+    "PAPER_EXIT_PLACED",
+    "NO_ACTION",
+)
 
 _SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_SEVERITIES)}
 
@@ -112,6 +133,7 @@ PAPER_DISCLAIMER = "Paper-only / manual-review only. Not auto-executed."
 _SUMMARY_FILENAME = "crypto_semantic_summary.json"
 _EVENTS_FILENAME = "crypto_semantic_events.json"
 _LATEST_ACTION_FILENAME = "crypto_latest_action.md"
+_TESTNET_DIRNAME = "crypto_testnet"
 
 
 def build_semantic_layer(
@@ -150,6 +172,9 @@ def build_semantic_layer(
     forward_result = _load_json(root / "paper_forward" / "crypto_paper_forward_result.json", default={})
     equity_curve = _load_json(root / "history" / "crypto_paper_equity_curve.json", default=[])
     manual_tickets = _load_json(root / "paper_forward" / "crypto_manual_trade_tickets.json", default=[])
+    testnet_root = root.parent / _TESTNET_DIRNAME
+    testnet_result = _load_json(testnet_root / "binance_testnet_execution_result.json", default={})
+    testnet_orders = _load_json(testnet_root / "binance_testnet_orders.json", default=[])
 
     layer_warnings: list[str] = []
     if not isinstance(snapshot, dict):
@@ -179,6 +204,12 @@ def build_semantic_layer(
     if not isinstance(manual_tickets, list):
         layer_warnings.append("manual_tickets_artifact_unreadable")
         manual_tickets = []
+    if testnet_result not in ({}, None) and not isinstance(testnet_result, dict):
+        layer_warnings.append("testnet_result_artifact_unreadable")
+        testnet_result = {}
+    if testnet_orders not in ([], None) and not isinstance(testnet_orders, list):
+        layer_warnings.append("testnet_orders_artifact_unreadable")
+        testnet_orders = []
 
     if not snapshot and not positions and not fills and not orders and not exit_events:
         layer_warnings.append(
@@ -237,6 +268,14 @@ def build_semantic_layer(
     sources.extend(
         _emit_error_events(forward_result=forward_result, created_at=moment_iso, events=events)
     )
+    sources.extend(
+        _emit_testnet_events(
+            testnet_result=testnet_result if isinstance(testnet_result, dict) else {},
+            testnet_orders=testnet_orders if isinstance(testnet_orders, list) else [],
+            created_at=moment_iso,
+            events=events,
+        )
+    )
 
     if not _has_actionable_event(events):
         events.append(_build_no_action_event(created_at=moment_iso))
@@ -283,15 +322,9 @@ def build_semantic_layer(
         summary_path = target / _SUMMARY_FILENAME
         events_path = target / _EVENTS_FILENAME
         latest_action_path = target / _LATEST_ACTION_FILENAME
-        summary_path.write_text(
-            json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-            encoding="utf-8",
-        )
-        events_path.write_text(
-            json.dumps(events, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
-            encoding="utf-8",
-        )
-        latest_action_path.write_text(latest_action_md, encoding="utf-8")
+        atomic_write_json(summary_path, summary)
+        atomic_write_json(events_path, events)
+        atomic_write_text(latest_action_path, latest_action_md)
         output_paths = {
             "summary": str(summary_path),
             "events": str(events_path),
@@ -399,6 +432,10 @@ def _emit_buy_filled_events(
                     "quote_asset": _quote_asset_from_symbol(symbol),
                     "occurred_at": filled_at,
                 },
+                category="PAPER_ORDER_PLACED",
+                action_taken="paper_executed",
+                mode="PAPER",
+                environment="crypto_paper_forward",
             )
         )
         sources.append("crypto_paper_fills.json")
@@ -498,6 +535,11 @@ def _emit_signal_only_events(
                     "fills_count": fill_count,
                     "occurred_at": order_created,
                 },
+                category="NO_ACTION",
+                failure_reason=str(rejection_reason or "signal_only"),
+                action_taken="skipped",
+                mode="PAPER",
+                environment="crypto_paper_forward",
             )
         )
         sources.append("crypto_paper_orders.json")
@@ -566,6 +608,10 @@ def _emit_exit_events(
                     "quote_asset": _quote_asset_from_symbol(symbol),
                     "occurred_at": exited_at,
                 },
+                category="PAPER_EXIT_PLACED",
+                action_taken="paper_executed",
+                mode="PAPER",
+                environment="crypto_paper_forward",
             )
         )
         sources.append("crypto_paper_exit_events.json")
@@ -665,6 +711,11 @@ def _emit_rejected_order_events(
                     "requested_notional": order.get("requested_notional"),
                     "occurred_at": order_created,
                 },
+                category=_classified_warning_category(str(reason)),
+                failure_reason=str(reason),
+                action_taken="blocked",
+                mode="PAPER",
+                environment="crypto_paper_forward",
             )
         )
         sources.append("crypto_paper_orders.json")
@@ -701,6 +752,12 @@ def _emit_warning_events(
                     "paper_forward/crypto_paper_forward_result.json",
                 ],
                 metadata={"raw_warning": text},
+                severity_override=_classified_warning_severity(text),
+                category=_classified_warning_category(text),
+                failure_reason=text,
+                action_taken=_classified_warning_action(text),
+                mode=_classified_warning_mode(text),
+                environment=_classified_warning_environment(text),
             )
         )
         sources.append("crypto_paper_strategy_metrics.json")
@@ -736,6 +793,14 @@ def _emit_error_events(
                     "status": forward_result.get("status"),
                     "validation_errors": forward_result.get("validation_errors"),
                 },
+                severity_override="CRITICAL",
+                category=_classified_failure_category(
+                    str(forward_result.get("reason") or "forward_status_failed")
+                ),
+                failure_reason=str(forward_result.get("reason") or "forward_status_failed"),
+                action_taken="failed_closed",
+                mode="PAPER",
+                environment="crypto_paper_forward",
             )
         )
         sources.append("crypto_paper_forward_result.json")
@@ -758,9 +823,128 @@ def _emit_error_events(
                         created_at=created_at,
                         source_artifacts=["paper_forward/crypto_paper_forward_result.json"],
                         metadata={"step": step, "status": status},
+                        severity_override="ERROR",
+                        category="DATA_INVALID",
+                        failure_reason=f"step_failed:{step}",
+                        action_taken="failed_closed",
+                        mode="PAPER",
+                        environment="crypto_paper_forward",
                     )
                 )
                 sources.append("crypto_paper_forward_result.json")
+    return sources
+
+
+def _emit_testnet_events(
+    *,
+    testnet_result: dict[str, Any],
+    testnet_orders: list[dict[str, Any]],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    if isinstance(testnet_result, dict) and testnet_result:
+        reason = str(
+            testnet_result.get("failure_reason")
+            or testnet_result.get("reason")
+            or ""
+        ).strip()
+        severity = str(testnet_result.get("severity") or _classified_warning_severity(reason))
+        category = str(testnet_result.get("category") or _classified_warning_category(reason))
+        should_emit = bool(
+            reason
+            or severity in {"WARNING", "ERROR", "CRITICAL"}
+            or category in {
+                "TESTNET_KILL_SWITCH",
+                "TESTNET_RECONCILIATION_MISMATCH",
+                "TESTNET_OPEN_ORDERS_LIMIT",
+                "TESTNET_INSUFFICIENT_BALANCE",
+                "TESTNET_TIME_SYNC_FAILED",
+                "TESTNET_SUBMIT_FAILED",
+                "EXCHANGE_FILTER_REJECT",
+            }
+        )
+        if should_emit:
+            event_type = "ERROR" if severity in {"ERROR", "CRITICAL"} else "WARNING"
+            events.append(
+                _build_event(
+                    event_id=f"testnet:{category}:{reason or created_at}",
+                    event_type=event_type,
+                    symbol="",
+                    action="INVESTIGATE",
+                    human_title=f"Crypto testnet {category or 'status'}",
+                    human_message=(
+                        f"Binance Spot Testnet reported {category or 'an operational state'}: "
+                        f"{reason or 'no reason provided'}. No live/mainnet order path exists."
+                    ),
+                    manual_action="Review testnet artifacts before retrying.",
+                    created_at=created_at,
+                    source_artifacts=["../crypto_testnet/binance_testnet_execution_result.json"],
+                    metadata={
+                        "raw_warning": reason or testnet_result.get("reason"),
+                        "occurred_at": str(
+                            (testnet_result.get("result") or {}).get("metadata", {}).get("generated_at")
+                            or testnet_result.get("generated_at")
+                            or created_at
+                        ),
+                    },
+                    severity_override=severity,
+                    category=category,
+                    failure_reason=reason or category,
+                    action_taken=str(testnet_result.get("action_taken") or "testnet_submit_blocked"),
+                    mode="TESTNET",
+                    environment=str(testnet_result.get("environment") or "binance_spot_testnet"),
+                    paper_only=False,
+                    not_auto_executed=False,
+                    submit_attempted=bool(testnet_result.get("submit_attempted")),
+                )
+            )
+            sources.append("../crypto_testnet/binance_testnet_execution_result.json")
+    for order in testnet_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("status") or "").upper() != "REJECTED":
+            continue
+        meta = order.get("metadata") or {}
+        category = str(meta.get("category") or _classified_warning_category(str(order.get("reason") or "")))
+        severity = str(meta.get("severity") or _classified_warning_severity(str(order.get("reason") or "")))
+        if category not in OPERATIONAL_EVENT_CATEGORIES:
+            continue
+        event_type = "ERROR" if severity in {"ERROR", "CRITICAL"} else "WARNING"
+        reason = str(meta.get("failure_reason") or order.get("reason") or category)
+        symbol = str(order.get("symbol") or "")
+        client_order_id = str(order.get("client_order_id") or "")
+        events.append(
+            _build_event(
+                event_id=f"testnet-reject:{client_order_id or symbol}:{reason}",
+                event_type=event_type,
+                symbol=symbol,
+                action="INVESTIGATE",
+                human_title=f"Crypto testnet rejected {symbol or 'order'}",
+                human_message=(
+                    f"Binance Spot Testnet rejected {symbol or 'an order'}: {reason}. "
+                    "No live/mainnet order path exists."
+                ),
+                manual_action="Inspect testnet order filters and balances before retrying.",
+                created_at=created_at,
+                source_artifacts=["../crypto_testnet/binance_testnet_orders.json"],
+                metadata={
+                    "raw_warning": reason,
+                    "client_order_id": client_order_id,
+                    "occurred_at": str(order.get("created_at") or created_at),
+                },
+                severity_override=severity,
+                category=category,
+                failure_reason=reason,
+                action_taken=str(meta.get("action_taken") or "testnet_submit_blocked"),
+                mode="TESTNET",
+                environment="binance_spot_testnet",
+                paper_only=False,
+                not_auto_executed=False,
+                submit_attempted=bool(meta.get("submit_attempted")),
+            )
+        )
+        sources.append("../crypto_testnet/binance_testnet_orders.json")
     return sources
 
 
@@ -796,6 +980,10 @@ def _build_no_action_event(*, created_at: str) -> dict[str, Any]:
         created_at=created_at,
         source_artifacts=[],
         metadata={},
+        category="NO_ACTION",
+        action_taken="notified",
+        mode="PAPER",
+        environment="crypto_paper_forward",
     )
 
 
@@ -811,11 +999,21 @@ def _build_event(
     created_at: str,
     source_artifacts: list[str],
     metadata: dict[str, Any],
+    severity_override: str | None = None,
+    category: str | None = None,
+    failure_reason: str | None = None,
+    run_id: str | None = None,
+    mode: str | None = None,
+    environment: str | None = None,
+    action_taken: str | None = None,
+    submit_attempted: bool | None = None,
+    paper_only: bool = True,
+    not_auto_executed: bool = True,
 ) -> dict[str, Any]:
     if event_type not in SEMANTIC_EVENT_TYPES:
         raise ValueError(f"Unknown semantic event_type: {event_type!r}")
-    severity = _DEFAULT_SEVERITY[event_type]
-    return {
+    severity = severity_override or _DEFAULT_SEVERITY[event_type]
+    event = {
         "event_id": event_id,
         "event_type": event_type,
         "severity": severity,
@@ -824,12 +1022,27 @@ def _build_event(
         "human_title": human_title,
         "human_message": human_message,
         "manual_action": manual_action,
-        "paper_only": True,
-        "not_auto_executed": True,
+        "paper_only": paper_only,
+        "not_auto_executed": not_auto_executed,
         "created_at": created_at,
         "source_artifacts": list(source_artifacts),
         "metadata": dict(metadata),
     }
+    if category:
+        event["category"] = category
+    if failure_reason:
+        event["failure_reason"] = failure_reason
+    if run_id:
+        event["run_id"] = run_id
+    if mode:
+        event["mode"] = mode
+    if environment:
+        event["environment"] = environment
+    if action_taken:
+        event["action_taken"] = action_taken
+    if submit_attempted is not None:
+        event["submit_attempted"] = bool(submit_attempted)
+    return event
 
 
 def _build_summary(
@@ -851,10 +1064,26 @@ def _build_summary(
     if starting_equity and current_equity is not None and starting_equity != 0:
         total_return_pct = ((current_equity - starting_equity) / starting_equity) * 100.0
     counts_by_type: dict[str, int] = {name: 0 for name in SEMANTIC_EVENT_TYPES}
+    counts_by_severity: dict[str, int] = {name: 0 for name in SEMANTIC_SEVERITIES}
+    counts_by_category: dict[str, int] = {name: 0 for name in OPERATIONAL_EVENT_CATEGORIES}
     for event in events:
         event_type = str(event.get("event_type") or "")
         counts_by_type[event_type] = counts_by_type.get(event_type, 0) + 1
+        severity = str(event.get("severity") or "")
+        counts_by_severity[severity] = counts_by_severity.get(severity, 0) + 1
+        category = str(event.get("category") or "")
+        if category:
+            counts_by_category[category] = counts_by_category.get(category, 0) + 1
     latest_event = events[0] if events else None
+    latest_critical_event = next(
+        (event for event in events if str(event.get("severity") or "") in {"CRITICAL", "ERROR"}),
+        None,
+    )
+    latest_warning_event = next(
+        (event for event in events if str(event.get("severity") or "") == "WARNING"),
+        None,
+    )
+    operational_status = _operational_status_from_events(events)
     summary = {
         "generated_at": generated_at,
         "paper_only": True,
@@ -890,8 +1119,20 @@ def _build_summary(
         "signal_only_count": counts_by_type.get("SIGNAL_ONLY", 0),
         "manual_tickets_count": len(manual_tickets),
         "events_count_by_type": counts_by_type,
+        "events_count_by_severity": counts_by_severity,
+        "events_count_by_category": counts_by_category,
         "events_total": len(events),
         "latest_event": latest_event,
+        "latest_critical_event": latest_critical_event,
+        "latest_warning_event": latest_warning_event,
+        "operational_status": operational_status,
+        "paper_forward_status": forward_result.get("status"),
+        "testnet_status": _latest_testnet_status(events),
+        "stale_data_count": counts_by_category.get("DATA_STALE", 0),
+        "risk_block_count": counts_by_category.get("RISK_BLOCKED", 0),
+        "exchange_filter_reject_count": counts_by_category.get("EXCHANGE_FILTER_REJECT", 0),
+        "kill_switch_active": counts_by_category.get("TESTNET_KILL_SWITCH", 0) > 0,
+        "reconciliation_mismatch_count": counts_by_category.get("TESTNET_RECONCILIATION_MISMATCH", 0),
         "local_tz": local_tz_name,
         "generated_at_local": _local_display_for(generated_at, tz_name=local_tz_name),
         "warnings": list(layer_warnings) + list(metrics.get("warnings") or []) + list(forward_result.get("warnings") or []),
@@ -923,6 +1164,27 @@ def _build_latest_action_markdown(*, summary: dict[str, Any], events: list[dict[
     lines.append(f"- Net profit: {_format_price(performance.get('net_profit'))}")
     lines.append(f"- Take-profits: {performance.get('take_profit_count')}")
     lines.append(f"- Stop-losses: {performance.get('stop_loss_count')}")
+    lines.append("")
+    lines.append("## Operational Health")
+    lines.append(f"- Operational status: {summary.get('operational_status') or 'OK'}")
+    lines.append(f"- Paper forward status: {summary.get('paper_forward_status') or 'n/a'}")
+    if summary.get("testnet_status"):
+        lines.append(f"- Testnet status: {summary.get('testnet_status')}")
+    lines.append(
+        f"- Severity counts: {json.dumps(summary.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}"
+    )
+    latest_critical = summary.get("latest_critical_event")
+    latest_warning = summary.get("latest_warning_event")
+    if latest_critical:
+        lines.append(
+            f"- Latest critical/error: {latest_critical.get('category') or latest_critical.get('event_type')} :: "
+            f"{latest_critical.get('failure_reason') or latest_critical.get('human_title')}"
+        )
+    if latest_warning:
+        lines.append(
+            f"- Latest warning: {latest_warning.get('category') or latest_warning.get('event_type')} :: "
+            f"{latest_warning.get('failure_reason') or latest_warning.get('human_title')}"
+        )
     lines.append("")
     latest_event = summary.get("latest_event")
     lines.append("## Latest event")
@@ -1075,6 +1337,98 @@ def _load_json(path: Path, *, default: Any) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+def _classified_warning_severity(text: str) -> str:
+    raw = str(text or "").lower()
+    if any(token in raw for token in ("ledger_state_corrupt", "snapshot_artifact_unreadable", "positions_artifact_unreadable")):
+        return "CRITICAL"
+    if any(token in raw for token in ("quote_invalid", "data_invalid", "server_time_skew_exceeds_recv_window", "previous_exchange_reconciliation_mismatch", "open_order_limit_exceeded", "exchange_filter", "min_notional_violation", "quantity_step_mismatch", "price_tick_mismatch", "broker_error", "insufficient balance", "insufficient_balance")):
+        return "ERROR"
+    return "WARNING"
+
+
+def _classified_warning_category(text: str) -> str:
+    raw = str(text or "").lower()
+    if "quote_stale" in raw or "stale" in raw:
+        return "DATA_STALE"
+    if any(token in raw for token in ("quote_invalid", "data_invalid", "invalid_payload")):
+        return "DATA_INVALID"
+    if any(token in raw for token in ("ledger_state_corrupt", "artifact_unreadable")):
+        return "LEDGER_CORRUPT"
+    if "locked" in raw:
+        return "LOCK_ACTIVE"
+    if any(token in raw for token in ("risk:", "risk_blocked", "cash_insufficient", "exposure_limit")):
+        return "RISK_BLOCKED"
+    if any(token in raw for token in ("min_notional_violation", "quantity_step_mismatch", "price_tick_mismatch", "symbol_not_allowed", "exchange_filter")):
+        return "EXCHANGE_FILTER_REJECT"
+    if "kill switch" in raw:
+        return "TESTNET_KILL_SWITCH"
+    if "previous_exchange_reconciliation_mismatch" in raw or "exchange_reconciliation_mismatch" in raw:
+        return "TESTNET_RECONCILIATION_MISMATCH"
+    if "open_order_limit_exceeded" in raw:
+        return "TESTNET_OPEN_ORDERS_LIMIT"
+    if "insufficient balance" in raw or "insufficient_balance" in raw:
+        return "TESTNET_INSUFFICIENT_BALANCE"
+    if "server_time_skew_exceeds_recv_window" in raw or "server_time_unavailable" in raw:
+        return "TESTNET_TIME_SYNC_FAILED"
+    if "broker_error" in raw:
+        return "TESTNET_SUBMIT_FAILED"
+    return "NO_ACTION"
+
+
+def _classified_warning_action(text: str) -> str:
+    category = _classified_warning_category(text)
+    if category in {"DATA_STALE", "LOCK_ACTIVE"}:
+        return "skipped"
+    if category in {"LEDGER_CORRUPT"}:
+        return "failed_closed"
+    if category in {
+        "RISK_BLOCKED",
+        "EXCHANGE_FILTER_REJECT",
+        "TESTNET_KILL_SWITCH",
+        "TESTNET_RECONCILIATION_MISMATCH",
+        "TESTNET_OPEN_ORDERS_LIMIT",
+        "TESTNET_INSUFFICIENT_BALANCE",
+        "TESTNET_TIME_SYNC_FAILED",
+    }:
+        return "blocked"
+    if category == "TESTNET_SUBMIT_FAILED":
+        return "testnet_submit_attempted"
+    return "notified"
+
+
+def _classified_warning_mode(text: str) -> str:
+    category = _classified_warning_category(text)
+    return "TESTNET" if category.startswith("TESTNET_") or category == "EXCHANGE_FILTER_REJECT" else "PAPER"
+
+
+def _classified_warning_environment(text: str) -> str:
+    return "binance_spot_testnet" if _classified_warning_mode(text) == "TESTNET" else "crypto_paper_forward"
+
+
+def _classified_failure_category(text: str) -> str:
+    category = _classified_warning_category(text)
+    return "DATA_INVALID" if category == "NO_ACTION" else category
+
+
+def _operational_status_from_events(events: list[dict[str, Any]]) -> str:
+    severities = [str(event.get("severity") or "") for event in events if isinstance(event, dict)]
+    categories = [str(event.get("category") or "") for event in events if isinstance(event, dict)]
+    if any(severity == "CRITICAL" for severity in severities):
+        return "BLOCKED"
+    if any(severity == "ERROR" for severity in severities):
+        return "ERROR"
+    if any(severity == "WARNING" for severity in severities) or any(category not in {"", "PAPER_ORDER_PLACED", "PAPER_EXIT_PLACED", "NO_ACTION"} for category in categories):
+        return "DEGRADED"
+    return "OK"
+
+
+def _latest_testnet_status(events: list[dict[str, Any]]) -> str | None:
+    for event in events:
+        if str(event.get("mode") or "") == "TESTNET":
+            return str(event.get("category") or event.get("severity") or "TESTNET")
+    return None
 
 
 # --- Local-timezone display helpers ----------------------------------------

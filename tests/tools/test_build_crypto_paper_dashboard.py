@@ -144,6 +144,8 @@ class BuildCryptoPaperDashboardTests(unittest.TestCase):
         self.assertIn("snapshot", payload)
         self.assertIn("performance", payload)
         self.assertIn("recent_events", payload)
+        self.assertIn("operational_status", payload)
+        self.assertIn("events_count_by_severity", payload)
 
     def test_dashboard_writes_latest_summary_markdown(self) -> None:
         self._seed_minimal_artifacts()
@@ -223,6 +225,7 @@ class BuildCryptoPaperDashboardTests(unittest.TestCase):
         self.assertTrue((self.dashboard_dir / "index.html").exists())
         payload = json.loads((self.dashboard_dir / "dashboard_data.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["snapshot"]["open_positions_count"], 0)
+        self.assertEqual(payload["operational_status"], "DEGRADED")
 
     def test_dashboard_does_not_reference_external_cdn(self) -> None:
         self._seed_minimal_artifacts()
@@ -536,6 +539,7 @@ class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
         self.assertEqual(section["rejected_count"], 1)
         self.assertEqual(section["api_key_masked"], "****abcd")
         self.assertEqual(section["base_url"], "https://testnet.binance.vision")
+        self.assertIn("operational_status", section)
 
         html_content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8")
         self.assertIn("Binance Spot Testnet", html_content)
@@ -543,6 +547,33 @@ class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
         self.assertIn("****abcd", html_content)
         self.assertIn("BTCUSDT", html_content)
         self.assertIn("symbol_not_allowed:DOGEUSDT", html_content)
+
+    def test_blocked_testnet_result_surfaces_operational_status(self) -> None:
+        self._seed_paper_minimum()
+        self._seed_testnet(order_test_only=True)
+        blocked = json.loads(
+            (self.testnet_dir / "binance_testnet_execution_result.json").read_text(encoding="utf-8")
+        )
+        blocked.update(
+            {
+                "ok": False,
+                "severity": "CRITICAL",
+                "category": "TESTNET_KILL_SWITCH",
+                "failure_reason": "kill switch enabled via env",
+                "action_taken": "blocked",
+                "submit_attempted": False,
+            }
+        )
+        (self.testnet_dir / "binance_testnet_execution_result.json").write_text(
+            json.dumps(blocked), encoding="utf-8"
+        )
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["data"]["testnet"]["operational_status"], "BLOCKED")
 
     def test_section_renders_in_real_place_order_mode(self) -> None:
         self._seed_paper_minimum()

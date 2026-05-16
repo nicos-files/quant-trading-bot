@@ -741,6 +741,15 @@ def format_daily_summary(
     quote = _quote_label((snapshot.get("quote_asset") if isinstance(snapshot, dict) else None) or "USDT")
     rejected_count = summary.get("rejected_orders_count")
     signal_only_count = summary.get("signal_only_count")
+    operational_status = str(summary.get("operational_status") or "OK")
+    severity_counts_raw = summary.get("events_count_by_severity") or {}
+    severity_counts = {
+        str(key): int(value)
+        for key, value in dict(severity_counts_raw).items()
+        if int(value or 0) > 0
+    } if isinstance(severity_counts_raw, dict) else {}
+    latest_critical = summary.get("latest_critical_event") or {}
+    latest_warning = summary.get("latest_warning_event") or {}
     tz_name = str(local_tz or DEFAULT_CRYPTO_LOCAL_TZ)
 
     lines: list[str] = []
@@ -760,6 +769,22 @@ def format_daily_summary(
     if signal_only_count is not None and int(signal_only_count or 0) > 0:
         lines.append(
             f"<b>Signals sin ejecutar:</b> {_fmt_int(signal_only_count)}"
+        )
+    if operational_status != "OK" or severity_counts or latest_critical or latest_warning:
+        lines.append(f"<b>Estado operativo:</b> {html.escape(operational_status)}")
+    if severity_counts:
+        lines.append(
+            f"<b>Severidades:</b> {html.escape(json.dumps(severity_counts, sort_keys=True, ensure_ascii=False))}"
+        )
+    if latest_critical:
+        lines.append(
+            f"<b>\u00DAltimo error/cr\u00EDtico:</b> "
+            f"{html.escape(str(latest_critical.get('category') or latest_critical.get('event_type') or 'n/a'))}"
+        )
+    elif latest_warning:
+        lines.append(
+            f"<b>\u00DAltimo warning:</b> "
+            f"{html.escape(str(latest_warning.get('category') or latest_warning.get('event_type') or 'n/a'))}"
         )
 
     small_sample = _small_sample_warning(summary)
@@ -936,8 +961,18 @@ def _format_error_card(
     title = str(event.get("human_title") or "ERROR")
     manual = str(event.get("manual_action") or "Investigar logs.")
     short_message = str(event.get("human_message") or "")[:240]
+    mode = _operational_mode_label(event)
+    category = str(event.get("category") or event.get("event_type") or "ERROR")
+    action_taken = str(event.get("action_taken") or "failed_closed")
+    reason = str(event.get("failure_reason") or short_message or "unspecified")
     lines = [
-        f"{_EMOJI_BY_EVENT_TYPE['ERROR']} <b>{html.escape(title)}</b>",
+        f"{_EMOJI_BY_EVENT_TYPE['ERROR']} <b>CRYPTO {mode} BLOCKED</b>",
+        "",
+        f"<b>Categor\u00EDa:</b> {html.escape(category)}",
+        f"<b>Acci\u00F3n tomada:</b> {html.escape(action_taken)}",
+        f"<b>Motivo:</b> {html.escape(reason)}",
+        "",
+        f"<b>T\u00EDtulo:</b> {html.escape(title)}",
         "",
         "<b>Acci\u00F3n manual:</b>",
         html.escape(manual),
@@ -949,7 +984,7 @@ def _format_error_card(
         lines.extend(time_lines)
     lines.append("")
     lines.append("<b>Estado:</b>")
-    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    lines.append(f"{mode} only \u00B7 No live/mainnet")
     return "\n".join(lines)
 
 
@@ -959,8 +994,15 @@ def _format_warning_card(
     title = str(event.get("human_title") or "Warning")
     metadata = event.get("metadata") or {}
     raw = str(metadata.get("raw_warning") or event.get("human_message") or "")[:240]
+    mode = _operational_mode_label(event)
+    category = str(event.get("category") or event.get("event_type") or "WARNING")
+    action_taken = str(event.get("action_taken") or "skipped")
     lines = [
-        f"{_EMOJI_BY_EVENT_TYPE['WARNING']} <b>{html.escape(title)}</b>",
+        f"{_EMOJI_BY_EVENT_TYPE['WARNING']} <b>CRYPTO {mode} DEGRADED</b>",
+        "",
+        f"<b>Categor\u00EDa:</b> {html.escape(category)}",
+        f"<b>Acci\u00F3n tomada:</b> {html.escape(action_taken)}",
+        f"<b>T\u00EDtulo:</b> {html.escape(title)}",
         "",
         html.escape(raw),
     ]
@@ -969,7 +1011,7 @@ def _format_warning_card(
         lines.extend(time_lines)
     lines.append("")
     lines.append("<b>Estado:</b>")
-    lines.append(_SPANISH_DISCLAIMER_PAPER_MANUAL)
+    lines.append(f"{mode} only \u00B7 No live/mainnet")
     return "\n".join(lines)
 
 
@@ -1032,6 +1074,13 @@ def _small_sample_warning(summary: dict[str, Any]) -> bool:
         if text.startswith("small_sample_size:"):
             return True
     return False
+
+
+def _operational_mode_label(event: dict[str, Any]) -> str:
+    mode = str(event.get("mode") or "").strip().upper()
+    if mode == "TESTNET":
+        return "TESTNET"
+    return "PAPER"
 
 
 def _fmt_price(value: Any) -> str:

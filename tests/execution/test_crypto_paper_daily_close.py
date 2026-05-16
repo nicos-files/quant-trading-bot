@@ -184,10 +184,28 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._write_artifacts(root)
+            semantic_dir = root / "semantic"
+            semantic_dir.mkdir(parents=True, exist_ok=True)
+            (semantic_dir / "crypto_semantic_summary.json").write_text(
+                json.dumps(
+                    {
+                        "operational_status": "DEGRADED",
+                        "paper_forward_status": "SUCCESS",
+                        "events_count_by_severity": {"WARNING": 1},
+                        "latest_warning_event": {
+                            "category": "DATA_STALE",
+                            "failure_reason": "quote_stale:BTCUSDT",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             close_crypto_paper_day(artifacts_dir=root, as_of=self.as_of)
             report = (root / "daily_close" / "crypto_paper_daily_report.md").read_text(encoding="utf-8")
             self.assertIn("# Crypto Paper Daily Close", report)
             self.assertIn("Paper-only", report)
+            self.assertIn("Operational Health", report)
+            self.assertIn("DEGRADED", report)
 
     def test_result_is_clearly_paper_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

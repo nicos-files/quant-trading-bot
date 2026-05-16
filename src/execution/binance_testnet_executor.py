@@ -152,6 +152,7 @@ def run_binance_testnet_execution(
         "paper_only": False,
         "live_trading": False,
         "testnet": True,
+        "environment": "binance_spot_testnet",
         "dry_run": bool(dry_run),
         "order_test_only": config.order_test_only,
         "base_url": config.base_url,
@@ -172,6 +173,13 @@ def run_binance_testnet_execution(
         base_result["reason"] = (
             f"{ENABLE_FLAG} is not '1'. Testnet execution disabled."
         )
+        _annotate_result(
+            base_result,
+            category="TESTNET_SUBMIT_FAILED",
+            severity="ERROR",
+            action_taken="testnet_submit_blocked",
+            submit_attempted=False,
+        )
         _write_result(testnet_root, base_result)
         return base_result
 
@@ -182,12 +190,26 @@ def run_binance_testnet_execution(
         base_result["reason"] = (
             f"Refusing non-testnet base URL: {config.base_url!r}"
         )
+        _annotate_result(
+            base_result,
+            category="TESTNET_SUBMIT_FAILED",
+            severity="CRITICAL",
+            action_taken="testnet_submit_blocked",
+            submit_attempted=False,
+        )
         _write_result(testnet_root, base_result)
         return base_result
 
     kill_switch_block = _check_kill_switch(source_env=source_env, testnet_root=testnet_root)
     if kill_switch_block is not None:
         base_result["reason"] = kill_switch_block
+        _annotate_result(
+            base_result,
+            category="TESTNET_KILL_SWITCH",
+            severity="CRITICAL",
+            action_taken="blocked",
+            submit_attempted=False,
+        )
         _write_result(testnet_root, base_result)
         return base_result
 
@@ -202,6 +224,13 @@ def run_binance_testnet_execution(
     if previous_mismatch_block is not None:
         base_result["reason"] = previous_mismatch_block
         base_result["previous_exchange_state"] = previous_exchange_state
+        _annotate_result(
+            base_result,
+            category="TESTNET_RECONCILIATION_MISMATCH",
+            severity="ERROR",
+            action_taken="blocked",
+            submit_attempted=False,
+        )
         _write_result(testnet_root, base_result)
         return base_result
 
@@ -214,6 +243,13 @@ def run_binance_testnet_execution(
             api_key, api_secret = resolve_credentials(env=source_env)
         except BinanceTestnetConfigError as exc:
             base_result["reason"] = str(exc)
+            _annotate_result(
+                base_result,
+                category="TESTNET_SUBMIT_FAILED",
+                severity="ERROR",
+                action_taken="testnet_submit_blocked",
+                submit_attempted=False,
+            )
             _write_result(testnet_root, base_result)
             return base_result
         client = BinanceSpotTestnetClient(
@@ -234,6 +270,13 @@ def run_binance_testnet_execution(
     if time_sync.get("blocked"):
         base_result["reason"] = str(time_sync.get("reason") or "server_time_sync_blocked")
         base_result["warnings"] = list(time_sync.get("warnings") or [])
+        _annotate_result(
+            base_result,
+            category="TESTNET_TIME_SYNC_FAILED",
+            severity="ERROR",
+            action_taken="blocked",
+            submit_attempted=False,
+        )
         _write_result(testnet_root, base_result)
         return base_result
     open_order_limit_gate = _check_open_order_limit(
@@ -244,6 +287,13 @@ def run_binance_testnet_execution(
     if open_order_limit_gate.get("blocked"):
         base_result["reason"] = str(open_order_limit_gate.get("reason") or "open_order_limit_exceeded")
         base_result["warnings"] = list(open_order_limit_gate.get("warnings") or [])
+        _annotate_result(
+            base_result,
+            category="TESTNET_OPEN_ORDERS_LIMIT",
+            severity="ERROR",
+            action_taken="blocked",
+            submit_attempted=False,
+        )
         _write_result(testnet_root, base_result)
         return base_result
 
@@ -297,6 +347,7 @@ def run_binance_testnet_execution(
                     config=config,
                     moment=moment,
                     reason=f"symbol_not_allowed:{symbol or 'unknown'}",
+                    submit_attempted=False,
                 )
             )
             continue
@@ -310,6 +361,7 @@ def run_binance_testnet_execution(
                     config=config,
                     moment=moment,
                     reason=str(exc),
+                    submit_attempted=False,
                 )
             )
             continue
@@ -324,6 +376,7 @@ def run_binance_testnet_execution(
                         f"notional_exceeds_max:{requested_notional:.2f}>"
                         f"{config.max_notional_per_order:.2f}"
                     ),
+                    submit_attempted=False,
                 )
             )
             continue
@@ -351,6 +404,7 @@ def run_binance_testnet_execution(
                         moment=moment,
                         reason=filter_rejection,
                         client_order_id=client_order_id,
+                        submit_attempted=False,
                     )
                 )
                 continue
@@ -383,6 +437,7 @@ def run_binance_testnet_execution(
                     moment=moment,
                     reason=f"broker_error:{exc}",
                     client_order_id=client_order_id,
+                    submit_attempted=True,
                 )
             )
             continue
@@ -467,6 +522,13 @@ def run_binance_testnet_execution(
             "exchange_state": exchange_state,
             "result": final_result_obj.to_dict(),
         }
+    )
+    _annotate_result(
+        base_result,
+        category="NO_ACTION" if not accepted_orders and not rejected_orders else None,
+        severity="INFO",
+        action_taken="testnet_submit_attempted" if accepted_orders or rejected_orders else "notified",
+        submit_attempted=bool(accepted_orders or rejected_orders),
     )
     _write_result(testnet_root, base_result)
     return base_result
@@ -998,7 +1060,7 @@ def _is_flag_enabled(value: Any) -> bool:
 
 def _load_semantic_layer(
     *, paper_root: Path, rebuild: bool, moment: datetime
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     semantic_dir = paper_root / "semantic"
     summary_path = semantic_dir / "crypto_semantic_summary.json"
     events_path = semantic_dir / "crypto_semantic_events.json"
@@ -1013,6 +1075,22 @@ def _load_semantic_layer(
         write=True,
         now=moment,
     )
+
+
+def _annotate_result(
+    payload: dict[str, Any],
+    *,
+    category: str | None,
+    severity: str,
+    action_taken: str,
+    submit_attempted: bool,
+) -> None:
+    if category:
+        payload["category"] = category
+    payload["severity"] = severity
+    payload["failure_reason"] = str(payload.get("reason") or category or "")
+    payload["action_taken"] = action_taken
+    payload["submit_attempted"] = bool(submit_attempted)
 
 
 def build_client_order_id(event: Mapping[str, Any]) -> str:
@@ -1107,6 +1185,7 @@ def _build_rejected_order(
     moment: datetime,
     reason: str,
     client_order_id: str | None = None,
+    submit_attempted: bool = False,
 ) -> BinanceTestnetOrder:
     metadata = event.get("metadata") or {}
     event_id = str(event.get("event_id") or "")
@@ -1127,7 +1206,15 @@ def _build_rejected_order(
         status="REJECTED",
         reason=reason,
         created_at=moment,
-        metadata={"paper_metadata": dict(metadata)},
+        metadata={
+            "paper_metadata": dict(metadata),
+            "category": _rejected_order_category(reason),
+            "severity": _rejected_order_severity(reason),
+            "failure_reason": reason,
+            "action_taken": "testnet_submit_attempted" if submit_attempted else "testnet_submit_blocked",
+            "submit_attempted": bool(submit_attempted),
+            "environment": "binance_spot_testnet",
+        },
     )
 
 
@@ -1140,6 +1227,28 @@ def _extract_reference_price(metadata: Mapping[str, Any]) -> float | None:
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def _rejected_order_category(reason: str) -> str:
+    raw = str(reason or "").lower()
+    if "min_notional_violation" in raw or "quantity_step_mismatch" in raw or "price_tick_mismatch" in raw or "symbol_not_allowed" in raw or "notional_exceeds_max" in raw:
+        return "EXCHANGE_FILTER_REJECT"
+    if "insufficient balance" in raw or "insufficient_balance" in raw:
+        return "TESTNET_INSUFFICIENT_BALANCE"
+    if "broker_error" in raw:
+        return "TESTNET_SUBMIT_FAILED"
+    return "TESTNET_SUBMIT_FAILED"
+
+
+def _rejected_order_severity(reason: str) -> str:
+    raw = str(reason or "").lower()
+    if "symbol_not_allowed" in raw:
+        return "ERROR"
+    if "insufficient balance" in raw or "insufficient_balance" in raw:
+        return "ERROR"
+    if "broker_error" in raw:
+        return "ERROR"
+    return "ERROR"
 
 
 def _call_broker(

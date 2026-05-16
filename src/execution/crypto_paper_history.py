@@ -493,6 +493,32 @@ def build_crypto_paper_history_report(
                 f"| {item['symbol']} | {float(item['latest_position_value']):.6f} | "
                 f"{float(item['latest_unrealized_pnl']):.6f} | {int(item['appearances_count'])} |"
             )
+    lines.extend(["", "## Operational Health"])
+    latest_operational = {}
+    if entries:
+        latest_operational = (
+            ((_sort_entries(entries)[-1].metadata or {}).get("daily_close_metadata") or {}
+            ).get("operational_summary") or {}
+        )
+    if not isinstance(latest_operational, dict) or not latest_operational:
+        lines.append("- No operational summary available.")
+    else:
+        lines.append(f"- Latest operational status: {latest_operational.get('operational_status') or 'OK'}")
+        lines.append(
+            f"- Latest severity counts: {json.dumps(latest_operational.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}"
+        )
+        latest_critical = latest_operational.get("latest_critical_event") or {}
+        latest_warning = latest_operational.get("latest_warning_event") or {}
+        if latest_critical:
+            lines.append(
+                f"- Latest critical/error: {latest_critical.get('category') or latest_critical.get('event_type')} :: "
+                f"{latest_critical.get('failure_reason') or latest_critical.get('human_title')}"
+            )
+        if latest_warning:
+            lines.append(
+                f"- Latest warning: {latest_warning.get('category') or latest_warning.get('event_type')} :: "
+                f"{latest_warning.get('failure_reason') or latest_warning.get('human_title')}"
+            )
     lines.extend(["", "## Warnings"])
     combined_warnings = list(summary.warnings) + list(attribution_warnings)
     if not combined_warnings:
