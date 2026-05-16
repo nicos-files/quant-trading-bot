@@ -81,6 +81,7 @@ _ORDERS_FILENAME = "binance_testnet_orders.json"
 _FILLS_FILENAME = "binance_testnet_fills.json"
 _POSITIONS_FILENAME = "binance_testnet_positions.json"
 _RECON_FILENAME = "binance_testnet_reconciliation.json"
+_EXCHANGE_STATE_FILENAME = "binance_testnet_exchange_state.json"
 _RESULT_FILENAME = "binance_testnet_execution_result.json"
 _STATE_FILENAME = "binance_testnet_state.json"
 
@@ -199,6 +200,17 @@ def run_binance_testnet_execution(
     if client is not None and api_key is None:
         api_key = getattr(client, "api_key_masked", None) or ""
     base_result["api_key_masked"] = mask_api_key(api_key) if api_key else None
+    time_sync = _perform_time_sync(
+        client=client,
+        recv_window_ms=config.recv_window_ms,
+        local_time=moment,
+    )
+    base_result["time_sync"] = time_sync
+    if time_sync.get("blocked"):
+        base_result["reason"] = str(time_sync.get("reason") or "server_time_sync_blocked")
+        base_result["warnings"] = list(time_sync.get("warnings") or [])
+        _write_result(testnet_root, base_result)
+        return base_result
 
     # ------------------------------------------------------------------
     # Load semantic events (paper artifacts are read-only).
@@ -216,7 +228,7 @@ def run_binance_testnet_execution(
     rejected_orders: list[BinanceTestnetOrder] = []
     fills: list[BinanceTestnetFill] = []
     skipped: list[dict[str, Any]] = []
-    warnings: list[str] = list(config_warnings)
+    warnings: list[str] = list(config_warnings) + list(time_sync.get("warnings") or [])
     exchange_filters_by_symbol = _load_exchange_filters(
         client=client,
         allowed_symbols=config.allowed_symbols,
@@ -353,6 +365,14 @@ def run_binance_testnet_execution(
     # Persist artifacts.
     # ------------------------------------------------------------------
     positions = _derive_positions(fills=fills, moment=moment)
+    exchange_state = _reconcile_exchange_state(
+        client=client,
+        config=config,
+        accepted_orders=accepted_orders,
+        derived_positions=positions,
+        moment=moment,
+        warnings=warnings,
+    )
     reconciliation = _build_reconciliation(
         events=actionable_events,
         accepted_orders=accepted_orders,
@@ -363,6 +383,7 @@ def run_binance_testnet_execution(
     _write_json(testnet_root / _FILLS_FILENAME, [f.to_dict() for f in fills])
     _write_json(testnet_root / _POSITIONS_FILENAME, [p.to_dict() for p in positions])
     _write_json(testnet_root / _RECON_FILENAME, [r.to_dict() for r in reconciliation])
+    _write_json(testnet_root / _EXCHANGE_STATE_FILENAME, exchange_state)
 
     if not dry_run:
         _save_state(
@@ -388,6 +409,8 @@ def run_binance_testnet_execution(
             "max_notional": config.max_notional_per_order,
             "allowed_symbols": list(config.allowed_symbols),
             "paper_artifacts_dir": str(paper_root),
+            "time_sync": time_sync,
+            "exchange_state": exchange_state,
         },
     )
 
@@ -403,6 +426,8 @@ def run_binance_testnet_execution(
             "rejected_count": len(rejected_orders),
             "skipped_count": len(skipped),
             "warnings": warnings,
+            "time_sync": time_sync,
+            "exchange_state": exchange_state,
             "result": final_result_obj.to_dict(),
         }
     )
@@ -417,6 +442,116 @@ def run_binance_testnet_execution(
 
 class _NotionalError(ValueError):
     pass
+
+
+def _perform_time_sync(
+    *,
+    client: BinanceSpotTestnetClient | None,
+    recv_window_ms: int,
+    local_time: datetime,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "checked": False,
+        "blocked": False,
+        "warnings": [],
+        "recv_window_ms": int(recv_window_ms),
+    }
+    if client is None:
+        result["warnings"].append("server_time_unavailable:no_client")
+        return result
+    server_time_fn = getattr(client, "server_time", None)
+    if not callable(server_time_fn):
+        result["warnings"].append("server_time_unavailable:no_server_time_method")
+        return result
+    try:
+        payload = server_time_fn()
+    except Exception as exc:
+        result["warnings"].append(f"server_time_unavailable:{exc}")
+        return result
+    result["checked"] = True
+    server_time_ms = payload.get("serverTime") if isinstance(payload, Mapping) else None
+    try:
+        server_time_ms_int = int(server_time_ms)
+    except (TypeError, ValueError):
+        result["warnings"].append("server_time_invalid_payload")
+        return result
+    local_time_ms = int(local_time.astimezone(timezone.utc).timestamp() * 1000)
+    skew_ms = local_time_ms - server_time_ms_int
+    result["server_time_ms"] = server_time_ms_int
+    result["local_time_ms"] = local_time_ms
+    result["skew_ms"] = skew_ms
+    if abs(skew_ms) > int(recv_window_ms):
+        result["blocked"] = True
+        result["reason"] = f"server_time_skew_exceeds_recv_window:{skew_ms}ms"
+        result["warnings"].append(result["reason"])
+    return result
+
+
+def _reconcile_exchange_state(
+    *,
+    client: BinanceSpotTestnetClient | None,
+    config: BinanceTestnetExecutionConfig,
+    accepted_orders: Iterable[BinanceTestnetOrder],
+    derived_positions: Iterable[BinanceTestnetPosition],
+    moment: datetime,
+    warnings: list[str],
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "checked_at": moment.isoformat(),
+        "account_checked": False,
+        "open_orders_checked": False,
+        "local_position_symbols": sorted({position.symbol for position in derived_positions}),
+        "open_order_symbols": [],
+        "balance_symbols": [],
+        "mismatches": [],
+    }
+    if client is None:
+        warnings.append("exchange_reconciliation_unavailable:no_client")
+        state["reason"] = "no_client"
+        return state
+
+    account_fn = getattr(client, "account", None)
+    if callable(account_fn):
+        try:
+            account_payload = account_fn()
+            state["account_checked"] = True
+            account_summary = _summarize_account_payload(
+                payload=account_payload,
+                symbols=config.allowed_symbols,
+                quote_currency=config.quote_currency,
+            )
+            state["account"] = account_summary
+            state["balance_symbols"] = sorted(account_summary.get("balances", {}).keys())
+        except Exception as exc:
+            warnings.append(f"exchange_reconciliation_account_unavailable:{exc}")
+            state["account_error"] = str(exc)
+    else:
+        warnings.append("exchange_reconciliation_unavailable:no_account_method")
+
+    open_orders_fn = getattr(client, "open_orders", None)
+    if callable(open_orders_fn):
+        try:
+            open_orders_payload = open_orders_fn()
+            state["open_orders_checked"] = True
+            open_orders_summary = _summarize_open_orders_payload(open_orders_payload)
+            state["open_orders"] = open_orders_summary
+            state["open_order_symbols"] = sorted(open_orders_summary.get("by_symbol", {}).keys())
+        except Exception as exc:
+            warnings.append(f"exchange_reconciliation_open_orders_unavailable:{exc}")
+            state["open_orders_error"] = str(exc)
+    else:
+        warnings.append("exchange_reconciliation_unavailable:no_open_orders_method")
+
+    mismatches = _find_exchange_reconciliation_mismatches(
+        accepted_orders=accepted_orders,
+        derived_positions=derived_positions,
+        exchange_state=state,
+        quote_currency=config.quote_currency,
+    )
+    state["mismatches"] = mismatches
+    for mismatch in mismatches:
+        warnings.append(f"exchange_reconciliation_mismatch:{mismatch}")
+    return state
 
 
 def _load_exchange_filters(
@@ -599,6 +734,98 @@ def _is_step_aligned(value: Decimal, step: Decimal) -> bool:
         return (value % step) == 0
     except InvalidOperation:
         return False
+
+
+def _summarize_account_payload(
+    *,
+    payload: Any,
+    symbols: Iterable[str],
+    quote_currency: str,
+) -> dict[str, Any]:
+    balances_payload = payload.get("balances") if isinstance(payload, Mapping) else None
+    balances: dict[str, dict[str, float]] = {}
+    interested_assets = {str(quote_currency or "").upper()}
+    for symbol in symbols:
+        normalized = str(symbol or "").upper()
+        if normalized.endswith(str(quote_currency or "").upper()):
+            base_asset = normalized[: -len(str(quote_currency or "").upper())]
+            if base_asset:
+                interested_assets.add(base_asset)
+    if isinstance(balances_payload, list):
+        for item in balances_payload:
+            if not isinstance(item, Mapping):
+                continue
+            asset = str(item.get("asset") or "").upper()
+            if not asset or asset not in interested_assets:
+                continue
+            try:
+                free = float(item.get("free") or 0.0)
+                locked = float(item.get("locked") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            balances[asset] = {
+                "free": free,
+                "locked": locked,
+                "total": free + locked,
+            }
+    return {"balances": balances}
+
+
+def _summarize_open_orders_payload(payload: Any) -> dict[str, Any]:
+    orders = payload if isinstance(payload, list) else []
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for item in orders:
+        if not isinstance(item, Mapping):
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        by_symbol.setdefault(symbol, []).append(
+            {
+                "clientOrderId": item.get("clientOrderId"),
+                "status": item.get("status"),
+                "side": item.get("side"),
+                "type": item.get("type"),
+                "origQty": item.get("origQty"),
+                "executedQty": item.get("executedQty"),
+            }
+        )
+    return {
+        "count": sum(len(items) for items in by_symbol.values()),
+        "by_symbol": by_symbol,
+    }
+
+
+def _find_exchange_reconciliation_mismatches(
+    *,
+    accepted_orders: Iterable[BinanceTestnetOrder],
+    derived_positions: Iterable[BinanceTestnetPosition],
+    exchange_state: Mapping[str, Any],
+    quote_currency: str,
+) -> list[str]:
+    mismatches: list[str] = []
+    open_orders = ((exchange_state.get("open_orders") or {}).get("by_symbol") or {}) if isinstance(exchange_state.get("open_orders"), Mapping) else {}
+    balances = ((exchange_state.get("account") or {}).get("balances") or {}) if isinstance(exchange_state.get("account"), Mapping) else {}
+
+    for order in accepted_orders:
+        if order.status == "FILLED":
+            symbol_open_orders = open_orders.get(order.symbol) or []
+            if any(str(item.get("clientOrderId") or "") == order.client_order_id for item in symbol_open_orders):
+                mismatches.append(f"filled_order_still_open:{order.client_order_id}")
+
+    for position in derived_positions:
+        symbol = str(position.symbol or "").upper()
+        base_asset = symbol[: -len(quote_currency)] if symbol.endswith(quote_currency) else symbol
+        balance = balances.get(base_asset)
+        if balance is None:
+            mismatches.append(f"missing_exchange_balance:{base_asset}")
+            continue
+        exchange_qty = float(balance.get("total") or 0.0)
+        if abs(exchange_qty - float(position.quantity)) > 1e-9:
+            mismatches.append(
+                f"position_qty_mismatch:{symbol}:local={float(position.quantity):.12f}:exchange={exchange_qty:.12f}"
+            )
+    return mismatches
 
 
 def _resolve_config(env: Mapping[str, str]) -> tuple[BinanceTestnetExecutionConfig, list[str]]:

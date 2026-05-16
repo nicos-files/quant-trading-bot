@@ -54,14 +54,23 @@ class _FakeClient:
         order_test_response: dict[str, Any] | None = None,
         place_order_response: dict[str, Any] | None = None,
         exchange_info_response: dict[str, Any] | None = None,
+        server_time_response: dict[str, Any] | None = None,
+        account_response: dict[str, Any] | None = None,
+        open_orders_response: list[dict[str, Any]] | None = None,
         api_key_masked: str = "****abcd",
         order_test_raises: BaseException | None = None,
         place_order_raises: BaseException | None = None,
         exchange_info_raises: BaseException | None = None,
+        server_time_raises: BaseException | None = None,
+        account_raises: BaseException | None = None,
+        open_orders_raises: BaseException | None = None,
     ) -> None:
         self.order_test_calls: list[Mapping[str, Any]] = []
         self.place_order_calls: list[Mapping[str, Any]] = []
         self.exchange_info_calls: list[tuple[str, ...] | None] = []
+        self.server_time_calls = 0
+        self.account_calls = 0
+        self.open_orders_calls = 0
         self._order_test_response = order_test_response or {}
         self._place_order_response = place_order_response or {
             "orderId": 999,
@@ -101,9 +110,23 @@ class _FakeClient:
                 },
             ]
         }
+        self._server_time_response = server_time_response or {
+            "serverTime": int(datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc).timestamp() * 1000),
+        }
+        self._account_response = account_response or {
+            "balances": [
+                {"asset": "BTC", "free": "0.0003", "locked": "0.0"},
+                {"asset": "USDT", "free": "975.0", "locked": "0.0"},
+                {"asset": "ETH", "free": "0.0", "locked": "0.0"},
+            ]
+        }
+        self._open_orders_response = open_orders_response or []
         self._order_test_raises = order_test_raises
         self._place_order_raises = place_order_raises
         self._exchange_info_raises = exchange_info_raises
+        self._server_time_raises = server_time_raises
+        self._account_raises = account_raises
+        self._open_orders_raises = open_orders_raises
         self.api_key_masked = api_key_masked
 
     def order_test(self, *, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -123,6 +146,30 @@ class _FakeClient:
             raise self._exchange_info_raises
         self.exchange_info_calls.append(tuple(symbols) if symbols is not None else None)
         return dict(self._exchange_info_response)
+
+    def server_time(self) -> dict[str, Any]:
+        if self._server_time_raises is not None:
+            raise self._server_time_raises
+        self.server_time_calls += 1
+        return dict(self._server_time_response)
+
+    def account(self) -> dict[str, Any]:
+        if self._account_raises is not None:
+            raise self._account_raises
+        self.account_calls += 1
+        return dict(self._account_response)
+
+    def open_orders(self, *, symbol: str | None = None) -> list[dict[str, Any]]:
+        if self._open_orders_raises is not None:
+            raise self._open_orders_raises
+        self.open_orders_calls += 1
+        if symbol is None:
+            return [dict(item) for item in self._open_orders_response]
+        return [
+            dict(item)
+            for item in self._open_orders_response
+            if str(item.get("symbol") or "").upper() == str(symbol).upper()
+        ]
 
 
 def _testnet_env(**overrides: str) -> dict[str, str]:
@@ -284,6 +331,42 @@ class EnableFlagGateTests(_ExecutorTestCase):
         self.assertFalse(payload["ok"])
         self.assertFalse(payload["live_trading"])
         self.assertTrue(payload["testnet"])
+
+
+class TimeSyncGateTests(_ExecutorTestCase):
+    def test_server_time_skew_above_recv_window_blocks_before_broker_call(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient(
+            server_time_response={
+                "serverTime": int(datetime(2026, 5, 3, 17, 59, 40, tzinfo=timezone.utc).timestamp() * 1000)
+            }
+        )
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("server_time_skew_exceeds_recv_window", result["reason"])
+        self.assertEqual(client.order_test_calls, [])
+        self.assertEqual(client.place_order_calls, [])
+
+    def test_server_time_sync_metadata_is_exposed_on_success(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["time_sync"]["checked"])
+        self.assertIn("skew_ms", result["time_sync"])
+        self.assertEqual(client.server_time_calls, 1)
 
 
 class BaseUrlGateTests(_ExecutorTestCase):
@@ -675,6 +758,67 @@ class ReconciliationTests(_ExecutorTestCase):
         self.assertFalse(recon[0]["match"])
         self.assertTrue(
             any("rejected:symbol_not_allowed" in m for m in recon[0]["mismatches"])
+        )
+
+    def test_exchange_state_artifact_captures_account_and_open_orders(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient(
+            open_orders_response=[
+                {
+                    "symbol": "BTCUSDT",
+                    "clientOrderId": "some-other-open-order",
+                    "status": "NEW",
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "origQty": "0.001",
+                    "executedQty": "0.0",
+                }
+            ]
+        )
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        exchange_state = self._read_artifact("binance_testnet_exchange_state.json")
+        self.assertTrue(exchange_state["account_checked"])
+        self.assertTrue(exchange_state["open_orders_checked"])
+        self.assertIn("BTC", exchange_state["account"]["balances"])
+        self.assertIn("BTCUSDT", exchange_state["open_orders"]["by_symbol"])
+        self.assertEqual(client.account_calls, 1)
+        self.assertEqual(client.open_orders_calls, 1)
+
+    def test_reconciliation_flags_filled_order_still_open_mismatch(self) -> None:
+        self._write_events([self._buy_event()])
+        open_client_order_id = build_client_order_id(self._buy_event())
+        client = _FakeClient(
+            open_orders_response=[
+                {
+                    "symbol": "BTCUSDT",
+                    "clientOrderId": open_client_order_id,
+                    "status": "NEW",
+                    "side": "BUY",
+                    "type": "MARKET",
+                    "origQty": "0.0003",
+                    "executedQty": "0.0",
+                }
+            ]
+        )
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        mismatches = result["exchange_state"]["mismatches"]
+        self.assertTrue(any("filled_order_still_open" in item for item in mismatches))
+        self.assertTrue(
+            any("exchange_reconciliation_mismatch:filled_order_still_open" in warning for warning in result["warnings"])
         )
 
 
