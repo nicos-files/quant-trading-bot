@@ -367,6 +367,9 @@ class TimeSyncGateTests(_ExecutorTestCase):
             now=self.now,
         )
         self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "testnet-20260503-180000")
+        self.assertEqual(result["heartbeat"]["run_id"], "testnet-20260503-180000")
+        self.assertEqual(result["heartbeat"]["status"], "SUCCESS")
         self.assertTrue(result["time_sync"]["checked"])
         self.assertIn("skew_ms", result["time_sync"])
         self.assertEqual(client.server_time_calls, 1)
@@ -920,6 +923,14 @@ class ReconciliationTests(_ExecutorTestCase):
         self.assertTrue(result["ok"])
         mismatches = result["exchange_state"]["mismatches"]
         self.assertTrue(any("filled_order_still_open" in item for item in mismatches))
+        self.assertEqual(
+            result["exchange_state"]["reconciliation_summary"]["highest_severity"],
+            "CRITICAL",
+        )
+        self.assertEqual(result["severity"], "CRITICAL")
+        self.assertEqual(result["category"], "TESTNET_RECONCILIATION_MISMATCH")
+        details = result["exchange_state"]["mismatch_details"]
+        self.assertTrue(any(item["level"] == "critical_hard_stop" for item in details))
         self.assertTrue(
             any("exchange_reconciliation_mismatch:filled_order_still_open" in warning for warning in result["warnings"])
         )

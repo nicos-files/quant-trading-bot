@@ -86,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=bool(args.dry_run),
     )
     audit = {
+        "run_id": result.get("run_id"),
         "ok": result.get("ok"),
         "testnet": result.get("testnet"),
         "live_trading": result.get("live_trading"),
@@ -104,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         "failure_reason": result.get("failure_reason"),
         "action_taken": result.get("action_taken"),
         "submit_attempted": result.get("submit_attempted"),
+        "heartbeat": result.get("heartbeat"),
+        "reconciliation_summary": result.get("reconciliation_summary"),
         "api_key_masked": result.get("api_key_masked"),
         "testnet_artifacts_dir": result.get("testnet_artifacts_dir"),
         "reason": result.get("reason"),

@@ -134,6 +134,7 @@ _SUMMARY_FILENAME = "crypto_semantic_summary.json"
 _EVENTS_FILENAME = "crypto_semantic_events.json"
 _LATEST_ACTION_FILENAME = "crypto_latest_action.md"
 _TESTNET_DIRNAME = "crypto_testnet"
+_NOTIFY_RESULT_FILENAME = "telegram_notify_result.json"
 
 
 def build_semantic_layer(
@@ -172,6 +173,7 @@ def build_semantic_layer(
     forward_result = _load_json(root / "paper_forward" / "crypto_paper_forward_result.json", default={})
     equity_curve = _load_json(root / "history" / "crypto_paper_equity_curve.json", default=[])
     manual_tickets = _load_json(root / "paper_forward" / "crypto_manual_trade_tickets.json", default=[])
+    notify_result = _load_json(root / "semantic" / _NOTIFY_RESULT_FILENAME, default={})
     testnet_root = root.parent / _TESTNET_DIRNAME
     testnet_result = _load_json(testnet_root / "binance_testnet_execution_result.json", default={})
     testnet_orders = _load_json(testnet_root / "binance_testnet_orders.json", default=[])
@@ -204,6 +206,9 @@ def build_semantic_layer(
     if not isinstance(manual_tickets, list):
         layer_warnings.append("manual_tickets_artifact_unreadable")
         manual_tickets = []
+    if notify_result not in ({}, None) and not isinstance(notify_result, dict):
+        layer_warnings.append("notify_result_artifact_unreadable")
+        notify_result = {}
     if testnet_result not in ({}, None) and not isinstance(testnet_result, dict):
         layer_warnings.append("testnet_result_artifact_unreadable")
         testnet_result = {}
@@ -276,6 +281,13 @@ def build_semantic_layer(
             events=events,
         )
     )
+    sources.extend(
+        _emit_notify_events(
+            notify_result=notify_result if isinstance(notify_result, dict) else {},
+            created_at=moment_iso,
+            events=events,
+        )
+    )
 
     if not _has_actionable_event(events):
         events.append(_build_no_action_event(created_at=moment_iso))
@@ -311,6 +323,9 @@ def build_semantic_layer(
         generated_at=moment_iso,
         local_tz_name=local_tz_name,
         artifacts_dir=root,
+        notify_result=notify_result if isinstance(notify_result, dict) else {},
+        testnet_result=testnet_result if isinstance(testnet_result, dict) else {},
+        semantic_generated_at=moment_iso,
     )
 
     latest_action_md = _build_latest_action_markdown(summary=summary, events=events)
@@ -888,13 +903,14 @@ def _emit_testnet_events(
                             or created_at
                         ),
                     },
-                    severity_override=severity,
-                    category=category,
-                    failure_reason=reason or category,
-                    action_taken=str(testnet_result.get("action_taken") or "testnet_submit_blocked"),
-                    mode="TESTNET",
-                    environment=str(testnet_result.get("environment") or "binance_spot_testnet"),
-                    paper_only=False,
+                severity_override=severity,
+                category=category,
+                failure_reason=reason or category,
+                run_id=str(testnet_result.get("run_id") or "") or None,
+                action_taken=str(testnet_result.get("action_taken") or "testnet_submit_blocked"),
+                mode="TESTNET",
+                environment=str(testnet_result.get("environment") or "binance_spot_testnet"),
+                paper_only=False,
                     not_auto_executed=False,
                     submit_attempted=bool(testnet_result.get("submit_attempted")),
                 )
@@ -945,6 +961,55 @@ def _emit_testnet_events(
             )
         )
         sources.append("../crypto_testnet/binance_testnet_orders.json")
+    return sources
+
+
+def _emit_notify_events(
+    *,
+    notify_result: dict[str, Any],
+    created_at: str,
+    events: list[dict[str, Any]],
+) -> list[str]:
+    sources: list[str] = []
+    if not isinstance(notify_result, dict) or not notify_result:
+        return sources
+    ok = bool(notify_result.get("ok"))
+    category = str(notify_result.get("category") or "")
+    severity = str(notify_result.get("severity") or ("INFO" if ok else "ERROR"))
+    failure_reason = str(notify_result.get("failure_reason") or notify_result.get("reason") or "").strip()
+    should_emit = (not ok) or category in {"LOCK_ACTIVE", "TELEGRAM_NOTIFY_FAILED"}
+    if not should_emit:
+        return sources
+    event_type = "ERROR" if severity in {"ERROR", "CRITICAL"} else "WARNING"
+    events.append(
+        _build_event(
+            event_id=f"notify:{category or 'status'}:{failure_reason or created_at}",
+            event_type=event_type,
+            symbol="",
+            action="INVESTIGATE",
+            human_title=f"Crypto Telegram notifier {category or 'status'}",
+            human_message=(
+                f"Telegram notifier reported {category or 'an operational state'}: "
+                f"{failure_reason or 'no failure reason recorded'}. No live/mainnet order path exists."
+            ),
+            manual_action="Review notifier configuration and dedupe state before relying on alerts.",
+            created_at=created_at,
+            source_artifacts=[f"semantic/{_NOTIFY_RESULT_FILENAME}"],
+            metadata={
+                "raw_warning": failure_reason or notify_result.get("reason"),
+                "occurred_at": str(notify_result.get("last_attempt_at") or created_at),
+                "result_path": notify_result.get("result_path"),
+            },
+            severity_override=severity,
+            category=category or "TELEGRAM_NOTIFY_FAILED",
+            failure_reason=failure_reason or category or "telegram_notify_failed",
+            run_id=str(notify_result.get("run_id") or "") or None,
+            action_taken=str(notify_result.get("action_taken") or ("notified" if ok else "failed_closed")),
+            mode="PAPER",
+            environment=str(notify_result.get("environment") or "crypto_paper_telegram"),
+        )
+    )
+    sources.append(f"semantic/{_NOTIFY_RESULT_FILENAME}")
     return sources
 
 
@@ -1057,6 +1122,9 @@ def _build_summary(
     generated_at: str,
     local_tz_name: str,
     artifacts_dir: Path,
+    notify_result: dict[str, Any],
+    testnet_result: dict[str, Any],
+    semantic_generated_at: str,
 ) -> dict[str, Any]:
     starting_equity = _starting_equity_from_curve(equity_curve)
     current_equity = _safe_float(snapshot.get("equity"))
@@ -1133,6 +1201,20 @@ def _build_summary(
         "exchange_filter_reject_count": counts_by_category.get("EXCHANGE_FILTER_REJECT", 0),
         "kill_switch_active": counts_by_category.get("TESTNET_KILL_SWITCH", 0) > 0,
         "reconciliation_mismatch_count": counts_by_category.get("TESTNET_RECONCILIATION_MISMATCH", 0),
+        "telegram_status": _telegram_status_from_notify_result(notify_result),
+        "heartbeats": {
+            "paper_as_of": snapshot.get("as_of"),
+            "paper_run_id": forward_result.get("run_id"),
+            "paper_run_started_at": ((forward_result.get("heartbeat") or {}).get("run_started_at")),
+            "paper_run_completed_at": ((forward_result.get("heartbeat") or {}).get("run_completed_at")),
+            "semantic_run_id": f"semantic-{generated_at.replace(':', '').replace('-', '')}",
+            "semantic_generated_at": semantic_generated_at,
+            "testnet_run_id": testnet_result.get("run_id"),
+            "testnet_last_attempt_at": _extract_testnet_heartbeat(events),
+            "telegram_run_id": notify_result.get("run_id") if isinstance(notify_result, dict) else None,
+            "telegram_last_attempt_at": notify_result.get("last_attempt_at") if isinstance(notify_result, dict) else None,
+            "telegram_last_success_at": notify_result.get("last_success_at") if isinstance(notify_result, dict) else None,
+        },
         "local_tz": local_tz_name,
         "generated_at_local": _local_display_for(generated_at, tz_name=local_tz_name),
         "warnings": list(layer_warnings) + list(metrics.get("warnings") or []) + list(forward_result.get("warnings") or []),
@@ -1168,8 +1250,32 @@ def _build_latest_action_markdown(*, summary: dict[str, Any], events: list[dict[
     lines.append("## Operational Health")
     lines.append(f"- Operational status: {summary.get('operational_status') or 'OK'}")
     lines.append(f"- Paper forward status: {summary.get('paper_forward_status') or 'n/a'}")
+    if summary.get("telegram_status"):
+        lines.append(f"- Telegram notifier status: {summary.get('telegram_status')}")
     if summary.get("testnet_status"):
         lines.append(f"- Testnet status: {summary.get('testnet_status')}")
+    heartbeats = summary.get("heartbeats") or {}
+    if heartbeats:
+        if heartbeats.get("paper_run_id"):
+            lines.append(f"- Paper run_id: {heartbeats.get('paper_run_id')}")
+        lines.append(f"- Paper as_of: {heartbeats.get('paper_as_of') or 'n/a'}")
+        if heartbeats.get("paper_run_started_at"):
+            lines.append(f"- Paper run started_at: {heartbeats.get('paper_run_started_at')}")
+        if heartbeats.get("paper_run_completed_at"):
+            lines.append(f"- Paper run completed_at: {heartbeats.get('paper_run_completed_at')}")
+        if heartbeats.get("semantic_run_id"):
+            lines.append(f"- Semantic run_id: {heartbeats.get('semantic_run_id')}")
+        lines.append(f"- Semantic generated_at: {heartbeats.get('semantic_generated_at') or 'n/a'}")
+        if heartbeats.get("testnet_run_id"):
+            lines.append(f"- Testnet run_id: {heartbeats.get('testnet_run_id')}")
+        if heartbeats.get("testnet_last_attempt_at"):
+            lines.append(f"- Testnet last attempt: {heartbeats.get('testnet_last_attempt_at')}")
+        if heartbeats.get("telegram_run_id"):
+            lines.append(f"- Telegram run_id: {heartbeats.get('telegram_run_id')}")
+        if heartbeats.get("telegram_last_attempt_at"):
+            lines.append(f"- Telegram last attempt: {heartbeats.get('telegram_last_attempt_at')}")
+        if heartbeats.get("telegram_last_success_at"):
+            lines.append(f"- Telegram last success: {heartbeats.get('telegram_last_success_at')}")
     lines.append(
         f"- Severity counts: {json.dumps(summary.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}"
     )
@@ -1429,6 +1535,33 @@ def _latest_testnet_status(events: list[dict[str, Any]]) -> str | None:
         if str(event.get("mode") or "") == "TESTNET":
             return str(event.get("category") or event.get("severity") or "TESTNET")
     return None
+
+
+def _extract_testnet_heartbeat(events: list[dict[str, Any]]) -> str | None:
+    for event in events:
+        if str(event.get("mode") or "") != "TESTNET":
+            continue
+        metadata = event.get("metadata") or {}
+        occurred = metadata.get("occurred_at")
+        if occurred:
+            return str(occurred)
+        created = event.get("created_at")
+        if created:
+            return str(created)
+    return None
+
+
+def _telegram_status_from_notify_result(notify_result: dict[str, Any]) -> str | None:
+    if not isinstance(notify_result, dict) or not notify_result:
+        return None
+    severity = str(notify_result.get("severity") or "").upper()
+    if severity == "CRITICAL":
+        return "BLOCKED"
+    if severity == "ERROR":
+        return "ERROR"
+    if severity == "WARNING":
+        return "DEGRADED"
+    return "OK"
 
 
 # --- Local-timezone display helpers ----------------------------------------

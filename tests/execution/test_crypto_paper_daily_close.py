@@ -191,6 +191,13 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
                     {
                         "operational_status": "DEGRADED",
                         "paper_forward_status": "SUCCESS",
+                        "reconciliation_mismatch_count": 2,
+                        "heartbeats": {
+                            "paper_run_id": "20260505-2330",
+                            "semantic_run_id": "semantic-20260505233000",
+                            "testnet_run_id": "testnet-20260505-233000",
+                            "telegram_run_id": "telegram-20260505-233100",
+                        },
                         "events_count_by_severity": {"WARNING": 1},
                         "latest_warning_event": {
                             "category": "DATA_STALE",
@@ -206,6 +213,9 @@ class CryptoPaperDailyCloseTests(unittest.TestCase):
             self.assertIn("Paper-only", report)
             self.assertIn("Operational Health", report)
             self.assertIn("DEGRADED", report)
+            self.assertIn("Paper run_id", report)
+            self.assertIn("Testnet run_id", report)
+            self.assertIn("Reconciliation mismatches: 2", report)
 
     def test_result_is_clearly_paper_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

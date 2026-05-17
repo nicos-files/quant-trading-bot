@@ -120,6 +120,9 @@ def build_crypto_paper_dashboard(
 
     summary = semantic_layer.get("summary") or {}
     events = semantic_layer.get("events") or []
+    notify_result = _load_json(artifacts_root / "semantic" / "telegram_notify_result.json", default={})
+    if not isinstance(notify_result, dict):
+        notify_result = {}
 
     snapshot = summary.get("snapshot") or {}
     performance = summary.get("performance") or {}
@@ -215,6 +218,13 @@ def build_crypto_paper_dashboard(
         "operational_status": summary.get("operational_status") or "OK",
         "paper_forward_status": summary.get("paper_forward_status") or summary.get("forward_run_status"),
         "testnet_status": summary.get("testnet_status"),
+        "telegram_status": _dashboard_telegram_status(summary=summary, notify_result=notify_result),
+        "heartbeats": _dashboard_heartbeats(
+            snapshot=snapshot,
+            summary=summary,
+            notify_result=notify_result,
+            testnet_section=testnet_section,
+        ),
         "latest_critical_event": summary.get("latest_critical_event"),
         "latest_warning_event": summary.get("latest_warning_event"),
         "events_count_by_severity": dict(summary.get("events_count_by_severity") or {}),
@@ -371,6 +381,7 @@ def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
 
     return {
         "present": True,
+        "run_id": last_result.get("run_id"),
         "live_trading": False,
         "testnet": True,
         "ok": bool(last_result.get("ok")),
@@ -389,6 +400,10 @@ def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
         "failure_reason": last_result.get("failure_reason") or last_result.get("reason"),
         "action_taken": last_result.get("action_taken"),
         "submit_attempted": last_result.get("submit_attempted"),
+        "heartbeat": dict(last_result.get("heartbeat") or {}),
+        "last_attempt_at": ((last_result.get("result") or {}).get("metadata") or {}).get("generated_at")
+        or last_result.get("last_attempt_at")
+        or exchange_state.get("checked_at"),
         "operational_status": _testnet_operational_status(last_result),
         "orders_count": int(len(orders)),
         "fills_count": int(len(fills)),
@@ -396,6 +411,7 @@ def _build_testnet_section(testnet_root: Path) -> dict[str, Any]:
         "recent_orders": recent_orders,
         "recent_fills": recent_fills,
         "reconciliation": reconciliation,
+        "reconciliation_summary": dict(last_result.get("reconciliation_summary") or exchange_state.get("reconciliation_summary") or {}),
         "exchange_state": exchange_state,
         "reason": last_result.get("reason"),
         "warnings": list(last_result.get("warnings") or []),
@@ -471,8 +487,32 @@ def _render_index_html(data: dict[str, Any]) -> str:
     parts.append("<h2>Operational health</h2>")
     parts.append(f"<p><strong>Status:</strong> {html.escape(str(data.get('operational_status') or 'OK'))}</p>")
     parts.append(f"<p><strong>Paper forward:</strong> {html.escape(str(data.get('paper_forward_status') or 'n/a'))}</p>")
+    if data.get("telegram_status"):
+        parts.append(f"<p><strong>Telegram notifier:</strong> {html.escape(str(data.get('telegram_status')))}</p>")
     if data.get("testnet_status"):
         parts.append(f"<p><strong>Testnet:</strong> {html.escape(str(data.get('testnet_status')))}</p>")
+    heartbeats = data.get("heartbeats") or {}
+    if isinstance(heartbeats, dict):
+        if heartbeats.get("paper_run_id"):
+            parts.append(f"<p><strong>Paper run_id:</strong> {html.escape(str(heartbeats.get('paper_run_id')))}</p>")
+        parts.append(f"<p><strong>Paper as_of:</strong> {html.escape(str(heartbeats.get('paper_as_of') or 'n/a'))}</p>")
+        if heartbeats.get("paper_run_started_at"):
+            parts.append(f"<p><strong>Paper run started_at:</strong> {html.escape(str(heartbeats.get('paper_run_started_at')))}</p>")
+        if heartbeats.get("paper_run_completed_at"):
+            parts.append(f"<p><strong>Paper run completed_at:</strong> {html.escape(str(heartbeats.get('paper_run_completed_at')))}</p>")
+        if heartbeats.get("semantic_run_id"):
+            parts.append(f"<p><strong>Semantic run_id:</strong> {html.escape(str(heartbeats.get('semantic_run_id')))}</p>")
+        parts.append(f"<p><strong>Semantic generated_at:</strong> {html.escape(str(heartbeats.get('semantic_generated_at') or 'n/a'))}</p>")
+        if heartbeats.get("testnet_run_id"):
+            parts.append(f"<p><strong>Testnet run_id:</strong> {html.escape(str(heartbeats.get('testnet_run_id')))}</p>")
+        if heartbeats.get("testnet_last_attempt_at"):
+            parts.append(f"<p><strong>Testnet last attempt:</strong> {html.escape(str(heartbeats.get('testnet_last_attempt_at')))}</p>")
+        if heartbeats.get("telegram_run_id"):
+            parts.append(f"<p><strong>Telegram run_id:</strong> {html.escape(str(heartbeats.get('telegram_run_id')))}</p>")
+        if heartbeats.get("telegram_last_attempt_at"):
+            parts.append(f"<p><strong>Telegram last attempt:</strong> {html.escape(str(heartbeats.get('telegram_last_attempt_at')))}</p>")
+        if heartbeats.get("telegram_last_success_at"):
+            parts.append(f"<p><strong>Telegram last success:</strong> {html.escape(str(heartbeats.get('telegram_last_success_at')))}</p>")
     parts.append(
         f"<p><strong>Severity counts:</strong> {html.escape(json.dumps(data.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False))}</p>"
     )
@@ -792,6 +832,8 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
     lines.append(f"- Rejected orders: {_format_int(performance.get('rejected_orders_count'))}")
     lines.append(f"- Signal-only: {_format_int(performance.get('signal_only_count'))}")
     lines.append(f"- Operational status: {data.get('operational_status') or 'OK'}")
+    if data.get("telegram_status"):
+        lines.append(f"- Telegram notifier: {data.get('telegram_status')}")
     lines.append(f"- Stale data count: {_format_int(data.get('stale_data_count'))}")
     lines.append(f"- Risk block count: {_format_int(data.get('risk_block_count'))}")
     lines.append(f"- Exchange filter rejects: {_format_int(data.get('exchange_filter_reject_count'))}")
@@ -811,8 +853,32 @@ def _render_summary_markdown(data: dict[str, Any]) -> str:
     lines.append("## Operational health")
     lines.append(f"- Status: {data.get('operational_status') or 'OK'}")
     lines.append(f"- Paper forward: {data.get('paper_forward_status') or 'n/a'}")
+    if data.get("telegram_status"):
+        lines.append(f"- Telegram notifier: {data.get('telegram_status')}")
     if data.get("testnet_status"):
         lines.append(f"- Testnet: {data.get('testnet_status')}")
+    heartbeats = data.get("heartbeats") or {}
+    if isinstance(heartbeats, dict):
+        if heartbeats.get("paper_run_id"):
+            lines.append(f"- Paper run_id: {heartbeats.get('paper_run_id')}")
+        lines.append(f"- Paper as_of: {heartbeats.get('paper_as_of') or 'n/a'}")
+        if heartbeats.get("paper_run_started_at"):
+            lines.append(f"- Paper run started_at: {heartbeats.get('paper_run_started_at')}")
+        if heartbeats.get("paper_run_completed_at"):
+            lines.append(f"- Paper run completed_at: {heartbeats.get('paper_run_completed_at')}")
+        if heartbeats.get("semantic_run_id"):
+            lines.append(f"- Semantic run_id: {heartbeats.get('semantic_run_id')}")
+        lines.append(f"- Semantic generated_at: {heartbeats.get('semantic_generated_at') or 'n/a'}")
+        if heartbeats.get("testnet_run_id"):
+            lines.append(f"- Testnet run_id: {heartbeats.get('testnet_run_id')}")
+        if heartbeats.get("testnet_last_attempt_at"):
+            lines.append(f"- Testnet last attempt: {heartbeats.get('testnet_last_attempt_at')}")
+        if heartbeats.get("telegram_run_id"):
+            lines.append(f"- Telegram run_id: {heartbeats.get('telegram_run_id')}")
+        if heartbeats.get("telegram_last_attempt_at"):
+            lines.append(f"- Telegram last attempt: {heartbeats.get('telegram_last_attempt_at')}")
+        if heartbeats.get("telegram_last_success_at"):
+            lines.append(f"- Telegram last success: {heartbeats.get('telegram_last_success_at')}")
     lines.append(f"- Severity counts: {json.dumps(data.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}")
     if latest_critical:
         lines.append(
@@ -920,6 +986,44 @@ def _testnet_operational_status(last_result: dict[str, Any]) -> str:
     if severity == "WARNING":
         return "DEGRADED"
     return "OK" if last_result.get("ok") else "ERROR"
+
+
+def _dashboard_telegram_status(*, summary: dict[str, Any], notify_result: dict[str, Any]) -> str | None:
+    if isinstance(notify_result, dict) and notify_result:
+        severity = str(notify_result.get("severity") or "").upper()
+        if severity == "CRITICAL":
+            return "BLOCKED"
+        if severity == "ERROR":
+            return "ERROR"
+        if severity == "WARNING":
+            return "DEGRADED"
+        if notify_result.get("ok") is True:
+            return "OK"
+    return summary.get("telegram_status")
+
+
+def _dashboard_heartbeats(
+    *,
+    snapshot: dict[str, Any],
+    summary: dict[str, Any],
+    notify_result: dict[str, Any],
+    testnet_section: dict[str, Any],
+) -> dict[str, Any]:
+    heartbeats = dict(summary.get("heartbeats") or {})
+    heartbeats["paper_as_of"] = snapshot.get("as_of") or heartbeats.get("paper_as_of")
+    heartbeats["semantic_generated_at"] = summary.get("generated_at") or heartbeats.get("semantic_generated_at")
+    if isinstance(testnet_section, dict) and testnet_section.get("last_attempt_at"):
+        heartbeats["testnet_last_attempt_at"] = testnet_section.get("last_attempt_at")
+    if isinstance(testnet_section, dict) and testnet_section.get("run_id"):
+        heartbeats["testnet_run_id"] = testnet_section.get("run_id")
+    if isinstance(notify_result, dict):
+        if notify_result.get("run_id"):
+            heartbeats["telegram_run_id"] = notify_result.get("run_id")
+        if notify_result.get("last_attempt_at"):
+            heartbeats["telegram_last_attempt_at"] = notify_result.get("last_attempt_at")
+        if notify_result.get("last_success_at"):
+            heartbeats["telegram_last_success_at"] = notify_result.get("last_success_at")
+    return heartbeats
 
 
 def main(argv: list[str] | None = None) -> int:

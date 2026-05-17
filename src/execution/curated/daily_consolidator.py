@@ -2,7 +2,7 @@
 
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 from src.utils.execution_context import get_execution_date
 
@@ -11,7 +11,7 @@ MODULOS = ["prices", "fundamentals", "sentiment", "indicadores", "features"]
 LOG_PATH = ROOT / "data" / "processed_daily" / "consolidation_log.parquet"
 
 def now_iso():
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 def clean_numeric_columns(df: pd.DataFrame, modulo: str) -> pd.DataFrame:
     columnas_numericas = [

@@ -119,6 +119,9 @@ class CryptoPaperForwardTests(unittest.TestCase):
                 as_of="2026-04-25T10:20:00+00:00",
             )
             self.assertEqual(result["status"], "SUCCESS")
+            self.assertEqual(result["run_id"], "20260425-1020")
+            self.assertEqual(result["heartbeat"]["run_id"], "20260425-1020")
+            self.assertEqual(result["heartbeat"]["status"], "SUCCESS")
             self.assertTrue((artifacts_dir / "paper_forward" / "crypto_paper_forward_result.json").exists())
             self.assertTrue((artifacts_dir / "paper_forward" / "crypto_paper_forward_report.md").exists())
             self.assertTrue((artifacts_dir / "paper_forward" / "crypto_manual_trade_tickets.json").exists())
@@ -360,6 +363,8 @@ class CryptoPaperForwardTests(unittest.TestCase):
             )
             self.assertEqual(result["status"], "SKIPPED")
             self.assertEqual(result["reason"], "forward_run_locked")
+            self.assertEqual(result["run_id"], "20260425-1020")
+            self.assertEqual(result["heartbeat"]["status"], "SKIPPED")
 
     def test_corrupt_ledger_fails_closed_instead_of_trading(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -377,6 +382,7 @@ class CryptoPaperForwardTests(unittest.TestCase):
             self.assertEqual(result["status"], "FAILED")
             self.assertEqual(result["reason"], "ledger_state_corrupt")
             self.assertIn("ledger_state_corrupt", result["warnings"])
+            self.assertEqual(result["heartbeat"]["status"], "FAILED")
 
 
 if __name__ == "__main__":

@@ -114,6 +114,21 @@ class BuildCryptoPaperDashboardTests(unittest.TestCase):
         (self.artifacts_dir / "history" / "crypto_paper_equity_curve.json").write_text(
             json.dumps(equity_curve), encoding="utf-8"
         )
+        (self.artifacts_dir / "paper_forward" / "crypto_paper_forward_result.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "20260503-1745",
+                    "status": "SUCCESS",
+                    "heartbeat": {
+                        "run_id": "20260503-1745",
+                        "run_started_at": "2026-05-03T17:45:00+00:00",
+                        "run_completed_at": "2026-05-03T17:45:30+00:00",
+                    },
+                    "warnings": ["quote_stale:BTCUSDT"],
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def test_dashboard_writes_index_html(self) -> None:
         self._seed_minimal_artifacts()
@@ -146,6 +161,7 @@ class BuildCryptoPaperDashboardTests(unittest.TestCase):
         self.assertIn("recent_events", payload)
         self.assertIn("operational_status", payload)
         self.assertIn("events_count_by_severity", payload)
+        self.assertIn("heartbeats", payload)
 
     def test_dashboard_writes_latest_summary_markdown(self) -> None:
         self._seed_minimal_artifacts()
@@ -159,6 +175,8 @@ class BuildCryptoPaperDashboardTests(unittest.TestCase):
         content = summary_path.read_text(encoding="utf-8")
         self.assertIn("# Crypto Paper Dashboard Summary", content)
         self.assertIn("Paper-only", content)
+        self.assertIn("Paper run_id", content)
+        self.assertIn("Semantic run_id", content)
 
     def test_dashboard_contains_equity_pnl_and_trade_metrics(self) -> None:
         self._seed_minimal_artifacts()
@@ -347,6 +365,43 @@ class BuildCryptoPaperDashboardSignalOnlyTests(unittest.TestCase):
         md_content = (self.dashboard_dir / "latest_summary.md").read_text(encoding="utf-8")
         self.assertIn("Signal-only", md_content)
 
+    def test_dashboard_surfaces_notify_failure_heartbeat(self) -> None:
+        self._seed_with_signal_only()
+        semantic_dir = self.artifacts_dir / "semantic"
+        semantic_dir.mkdir(parents=True, exist_ok=True)
+        (semantic_dir / "telegram_notify_result.json").write_text(
+            json.dumps(
+                {
+                    "ok": False,
+                    "run_id": "telegram-20260505-233100",
+                    "paper_only": True,
+                    "live_trading": False,
+                    "category": "TELEGRAM_NOTIFY_FAILED",
+                    "severity": "ERROR",
+                    "failure_reason": "send_failed:non_ok_response",
+                    "action_taken": "failed_closed",
+                    "environment": "crypto_paper_telegram",
+                    "last_attempt_at": "2026-05-05T23:31:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = build_crypto_paper_dashboard(
+            artifacts_dir=self.artifacts_dir,
+            dashboard_dir=self.dashboard_dir,
+            rebuild_semantic=True,
+            now=self.now,
+        )
+        self.assertEqual(result["data"]["telegram_status"], "ERROR")
+        self.assertEqual(
+            result["data"]["heartbeats"]["telegram_last_attempt_at"],
+            "2026-05-05T23:31:00+00:00",
+        )
+        self.assertEqual(
+            result["data"]["heartbeats"]["telegram_run_id"],
+            "telegram-20260505-233100",
+        )
+
 
 class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
     """Dashboard surfaces a read-only Binance Spot Testnet section when
@@ -477,6 +532,7 @@ class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
             }
         ]
         result = {
+            "run_id": "testnet-20260505-223000",
             "ok": True,
             "testnet": True,
             "live_trading": False,
@@ -492,6 +548,26 @@ class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
             "warnings": [],
             "api_key_masked": api_key_masked,
             "testnet_artifacts_dir": str(self.testnet_dir),
+            "heartbeat": {
+                "run_id": "testnet-20260505-223000",
+                "phase": "completed",
+                "status": "SUCCESS",
+                "run_started_at": "2026-05-05T22:30:00+00:00",
+                "last_updated_at": "2026-05-05T22:30:00+00:00",
+                "run_completed_at": "2026-05-05T22:30:00+00:00",
+            },
+            "reconciliation_summary": {
+                "count": 0,
+                "blocking_count": 0,
+                "highest_severity": "INFO",
+                "counts_by_severity": {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0},
+                "counts_by_level": {
+                    "tolerable_drift": 0,
+                    "warning": 0,
+                    "error": 0,
+                    "critical_hard_stop": 0,
+                },
+            },
         }
         (self.testnet_dir / "binance_testnet_orders.json").write_text(
             json.dumps(orders), encoding="utf-8"
@@ -539,7 +615,13 @@ class BuildCryptoPaperDashboardTestnetSectionTests(unittest.TestCase):
         self.assertEqual(section["rejected_count"], 1)
         self.assertEqual(section["api_key_masked"], "****abcd")
         self.assertEqual(section["base_url"], "https://testnet.binance.vision")
+        self.assertEqual(section["run_id"], "testnet-20260505-223000")
         self.assertIn("operational_status", section)
+        self.assertEqual(
+            result["data"]["heartbeats"]["testnet_run_id"],
+            "testnet-20260505-223000",
+        )
+        self.assertIn("reconciliation_summary", section)
 
         html_content = (self.dashboard_dir / "index.html").read_text(encoding="utf-8")
         self.assertIn("Binance Spot Testnet", html_content)

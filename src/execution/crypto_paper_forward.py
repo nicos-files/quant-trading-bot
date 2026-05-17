@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
@@ -176,6 +176,9 @@ def run_crypto_paper_forward(
     paper_forward_dir = artifact_root / "paper_forward"
     paper_forward_dir.mkdir(parents=True, exist_ok=True)
     lock_path = paper_forward_dir / ".crypto_paper_forward.lock"
+    effective_as_of = _parse_as_of(as_of)
+    run_id = effective_as_of.strftime("%Y%m%d-%H%M")
+    run_started_at = datetime.now(timezone.utc).isoformat()
 
     candidate_payload = (
         load_crypto_paper_forward_candidate(candidate_config)
@@ -206,7 +209,6 @@ def run_crypto_paper_forward(
         validation["warnings"] = _dedupe(list(validation["warnings"]) + [f"provider_unhealthy:{health.message}"])
 
     validation_path = paper_forward_dir / "crypto_paper_forward_validation.json"
-    effective_as_of = _parse_as_of(as_of)
     try:
         with advisory_file_lock(
             lock_path,
@@ -215,14 +217,25 @@ def run_crypto_paper_forward(
             atomic_write_json(validation_path, validation)
             if not validation["eligible_to_run"]:
                 result = {
+                    "run_id": run_id,
                     "status": "FAILED",
                     "paper_only": True,
                     "dry_run": bool(dry_run),
+                    "as_of": effective_as_of.isoformat(),
+                    "mode": "PAPER",
+                    "environment": "crypto_paper_forward",
                     "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
                     "warnings": list(validation["warnings"]),
                     "validation_errors": list(validation["errors"]),
                     "artifacts": {"crypto_paper_forward_validation.json": str(validation_path)},
                     "live_trading": False,
+                    "heartbeat": _build_forward_heartbeat(
+                        run_id=run_id,
+                        as_of=effective_as_of,
+                        run_started_at=run_started_at,
+                        status="FAILED",
+                        step_status={"validation": "FAILED"},
+                    ),
                 }
                 _write_forward_terminal_artifacts(
                     paper_forward_dir=paper_forward_dir,
@@ -239,6 +252,8 @@ def run_crypto_paper_forward(
                 candidate_config=candidate_config,
                 candidate_payload=candidate_payload,
                 effective_as_of=effective_as_of,
+                run_id=run_id,
+                run_started_at=run_started_at,
                 dry_run=dry_run,
                 active_provider=active_provider,
                 health=health,
@@ -248,9 +263,13 @@ def run_crypto_paper_forward(
             )
     except FileLockActiveError:
         return {
+            "run_id": run_id,
             "status": "SKIPPED",
             "paper_only": True,
             "dry_run": bool(dry_run),
+            "as_of": effective_as_of.isoformat(),
+            "mode": "PAPER",
+            "environment": "crypto_paper_forward",
             "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
             "warnings": ["forward_run_locked"],
             "validation_errors": [],
@@ -258,6 +277,13 @@ def run_crypto_paper_forward(
             "live_trading": False,
             "reason": "forward_run_locked",
             "lock_path": str(lock_path),
+            "heartbeat": _build_forward_heartbeat(
+                run_id=run_id,
+                as_of=effective_as_of,
+                run_started_at=run_started_at,
+                status="SKIPPED",
+                step_status={"validation": "SUCCESS", "lock": "SKIPPED"},
+            ),
         }
 
 def _run_forward_with_lock(
@@ -269,6 +295,8 @@ def _run_forward_with_lock(
     candidate_config: dict[str, Any] | str | Path,
     candidate_payload: dict[str, Any],
     effective_as_of: datetime,
+    run_id: str,
+    run_started_at: str,
     dry_run: bool,
     active_provider: Any,
     health: ProviderHealth,
@@ -308,9 +336,13 @@ def _run_forward_with_lock(
     warnings.extend(ledger_warnings)
     if ledger_degraded:
         result = {
+            "run_id": run_id,
             "status": "FAILED",
             "paper_only": True,
             "dry_run": bool(dry_run),
+            "as_of": effective_as_of.isoformat(),
+            "mode": "PAPER",
+            "environment": "crypto_paper_forward",
             "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
             "warnings": _dedupe(warnings + ["ledger_state_corrupt"]),
             "validation_errors": list(validation["errors"]),
@@ -325,6 +357,20 @@ def _run_forward_with_lock(
                 "history": "SKIPPED",
                 "evaluation": "SKIPPED",
             },
+            "heartbeat": _build_forward_heartbeat(
+                run_id=run_id,
+                as_of=effective_as_of,
+                run_started_at=run_started_at,
+                status="FAILED",
+                step_status={
+                    **step_status,
+                    "signals": "SKIPPED",
+                    "execution": "SKIPPED",
+                    "daily_close": "SKIPPED",
+                    "history": "SKIPPED",
+                    "evaluation": "SKIPPED",
+                },
+            ),
         }
         _write_forward_terminal_artifacts(
             paper_forward_dir=paper_forward_dir,
@@ -345,7 +391,7 @@ def _run_forward_with_lock(
     ]
     context = EngineContext(
         as_of=effective_as_of,
-        run_id=effective_as_of.strftime("%Y%m%d-%H%M"),
+        run_id=run_id,
         mode="crypto_paper_forward",
         universe=enabled_symbols,
         positions=list(ledger.positions.values()),
@@ -521,9 +567,13 @@ def _run_forward_with_lock(
 
     final_snapshot = combined_execution.portfolio_snapshot
     result = {
+        "run_id": run_id,
         "status": "SUCCESS" if all(value == "SUCCESS" for value in step_status.values()) else "PARTIAL",
         "paper_only": True,
         "dry_run": bool(dry_run),
+        "as_of": effective_as_of.isoformat(),
+        "mode": "PAPER",
+        "environment": "crypto_paper_forward",
         "candidate_config_used": str(candidate_config) if isinstance(candidate_config, (str, Path)) else "in_memory",
         "symbols_evaluated": enabled_symbols,
         "recommendations_count": len(engine_result.recommendations.recommendations),
@@ -540,6 +590,13 @@ def _run_forward_with_lock(
         "live_trading": False,
         "provider_health": validation["provider_health"],
         "snapshot_kind": "intraday_run",
+        "heartbeat": _build_forward_heartbeat(
+            run_id=run_id,
+            as_of=effective_as_of,
+            run_started_at=run_started_at,
+            status="SUCCESS" if all(value == "SUCCESS" for value in step_status.values()) else "PARTIAL",
+            step_status=step_status,
+        ),
         "artifacts": {
             "crypto_paper_forward_validation.json": str(validation_path),
             **ticket_artifacts,
@@ -1270,6 +1327,26 @@ def _dedupe(items: list[str]) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _build_forward_heartbeat(
+    *,
+    run_id: str,
+    as_of: datetime,
+    run_started_at: str,
+    status: str,
+    step_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    completed_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "run_id": run_id,
+        "paper_as_of": as_of.isoformat(),
+        "run_started_at": run_started_at,
+        "last_updated_at": completed_at,
+        "run_completed_at": completed_at,
+        "status": status,
+        "step_status": dict(step_status),
+    }
 
 
 def _build_failed_report(result: dict[str, Any]) -> str:

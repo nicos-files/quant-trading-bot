@@ -54,6 +54,7 @@ _DEFAULT_MIN_SEVERITY = "ACTION"
 _SEVERITY_RANK: dict[str, int] = {name: idx for idx, name in enumerate(SEMANTIC_SEVERITIES)}
 _STATE_FILENAME = "telegram_alert_state.json"
 _LOCK_FILENAME = "telegram_alert_state.lock"
+_RESULT_FILENAME = "telegram_notify_result.json"
 _DAILY_SUMMARY_PREFIX = "daily-summary:"
 
 # Default Telegram parse_mode for outbound alert messages.
@@ -264,6 +265,7 @@ def notify_crypto_paper_telegram(
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     semantic_dir = artifacts_root / "semantic"
     semantic_dir.mkdir(parents=True, exist_ok=True)
+    result_path = semantic_dir / _RESULT_FILENAME
     resolved_state_path = (
         Path(state_path) if state_path is not None else semantic_dir / _STATE_FILENAME
     )
@@ -273,7 +275,9 @@ def notify_crypto_paper_telegram(
     # Dry-run and bootstrap-dedupe never contact Telegram, so they bypass it.
     enabled = str(source_env.get(ENABLE_FLAG) or "").strip()
     if enabled != "1" and not dry_run and not bootstrap_dedupe:
-        return {
+        return _finalize_notify_result(
+            result_path,
+            {
             "ok": False,
             "paper_only": True,
             "live_trading": False,
@@ -286,7 +290,14 @@ def notify_crypto_paper_telegram(
             "reason": f"{ENABLE_FLAG}_not_enabled",
             "chat_id_masked": None,
             "state_path": None,
-        }
+            "last_attempt_at": moment.isoformat(),
+            "category": "TELEGRAM_NOTIFY_FAILED",
+            "severity": "ERROR",
+            "failure_reason": f"{ENABLE_FLAG}_not_enabled",
+            "action_taken": "failed_closed",
+            "environment": "crypto_paper_telegram",
+            },
+        )
 
     semantic_layer = _load_or_build_semantic_layer(
         artifacts_root=artifacts_root,
@@ -339,6 +350,7 @@ def notify_crypto_paper_telegram(
                 candidates=candidates,
                 pre_filtered=pre_filtered,
                 resolved_state_path=resolved_state_path,
+                result_path=result_path,
                 semantic_layer=semantic_layer,
                 moment=moment,
                 source_env=source_env,
@@ -353,7 +365,9 @@ def notify_crypto_paper_telegram(
                 min_severity=min_severity,
             )
     except FileLockActiveError:
-        return {
+        return _finalize_notify_result(
+            result_path,
+            {
             "ok": False,
             "paper_only": True,
             "live_trading": False,
@@ -373,7 +387,14 @@ def notify_crypto_paper_telegram(
             "min_severity": min_severity,
             "reason": "notify_locked",
             "lock_path": str(lock_path),
-        }
+            "last_attempt_at": moment.isoformat(),
+            "category": "LOCK_ACTIVE",
+            "severity": "WARNING",
+            "failure_reason": "notify_locked",
+            "action_taken": "skipped",
+            "environment": "crypto_paper_telegram",
+            },
+        )
 
 
 def _dispatch_notifications_with_state(
@@ -381,6 +402,7 @@ def _dispatch_notifications_with_state(
     candidates: list[dict[str, Any]],
     pre_filtered: list[dict[str, Any]],
     resolved_state_path: Path,
+    result_path: Path,
     semantic_layer: dict[str, Any],
     moment: datetime,
     source_env: dict[str, str] | os._Environ[str],
@@ -434,7 +456,18 @@ def _dispatch_notifications_with_state(
                 "bootstrap_dedupe": True,
             },
         )
-        return {
+        return _finalize_notify_result(
+            result_path,
+            {
+            **_notify_status_payload(
+                ok=True,
+                last_attempt_at=bootstrap_now_iso,
+                category="NO_ACTION",
+                severity="INFO",
+                failure_reason=None,
+                action_taken="notified",
+                environment="crypto_paper_telegram",
+            ),
             "ok": True,
             "paper_only": True,
             "live_trading": False,
@@ -450,7 +483,8 @@ def _dispatch_notifications_with_state(
             "chat_id_masked": None,
             "state_path": str(resolved_state_path),
             "min_severity": min_severity,
-        }
+            },
+        )
 
     skipped_payload.extend(pre_filtered)
     will_send_summary = bool(daily_summary or daily_summary_only)
@@ -471,7 +505,9 @@ def _dispatch_notifications_with_state(
         try:
             bot_token, chat_id = resolve_credentials(env=source_env)
         except TelegramConfigError as exc:
-            return {
+            return _finalize_notify_result(
+                result_path,
+                {
                 "ok": False,
                 "paper_only": True,
                 "live_trading": False,
@@ -487,7 +523,14 @@ def _dispatch_notifications_with_state(
                 "reason": str(exc),
                 "chat_id_masked": None,
                 "state_path": str(resolved_state_path),
-            }
+                "last_attempt_at": moment.isoformat(),
+                "category": "TELEGRAM_NOTIFY_FAILED",
+                "severity": "ERROR",
+                "failure_reason": str(exc),
+                "action_taken": "failed_closed",
+                "environment": "crypto_paper_telegram",
+                },
+            )
         chat_id_masked = mask_chat_id(chat_id)
 
     transport = sender if sender is not None else _default_sender
@@ -649,6 +692,7 @@ def _dispatch_notifications_with_state(
     ]
 
     result: dict[str, Any] = {
+        "run_id": f"telegram-{moment.strftime('%Y%m%d-%H%M%S')}",
         "ok": failure_reason is None,
         "paper_only": True,
         "live_trading": False,
@@ -666,10 +710,23 @@ def _dispatch_notifications_with_state(
         "chat_id_masked": chat_id_masked,
         "state_path": str(resolved_state_path),
         "min_severity": min_severity,
+        "last_attempt_at": moment_iso,
     }
     if failure_reason is not None:
         result["reason"] = failure_reason
-    return result
+    status_payload = _notify_status_payload(
+        ok=failure_reason is None,
+        last_attempt_at=moment_iso,
+        category="NO_ACTION" if failure_reason is None else "TELEGRAM_NOTIFY_FAILED",
+        severity="INFO" if failure_reason is None else "ERROR",
+        failure_reason=failure_reason,
+        action_taken="notified" if failure_reason is None else "failed_closed",
+        environment="crypto_paper_telegram",
+    )
+    result.update(status_payload)
+    if sent_payload:
+        result["last_success_at"] = moment_iso
+    return _finalize_notify_result(result_path, result)
 
 
 def format_event_message(
@@ -1183,6 +1240,58 @@ def _load_state(path: Path) -> dict[str, Any]:
 def _save_state(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)
+
+
+def _notify_status_payload(
+    *,
+    ok: bool,
+    last_attempt_at: str,
+    category: str,
+    severity: str,
+    failure_reason: str | None,
+    action_taken: str,
+    environment: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "category": category,
+        "severity": severity,
+        "action_taken": action_taken,
+        "environment": environment,
+        "last_attempt_at": last_attempt_at,
+    }
+    if failure_reason:
+        payload["failure_reason"] = failure_reason
+    if ok:
+        payload["failure_reason"] = None
+    return payload
+
+
+def _finalize_notify_result(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    serialized = dict(payload)
+    serialized.setdefault("paper_only", True)
+    serialized.setdefault("live_trading", False)
+    serialized.setdefault("category", "NO_ACTION" if serialized.get("ok") else "TELEGRAM_NOTIFY_FAILED")
+    serialized.setdefault("severity", "INFO" if serialized.get("ok") else "ERROR")
+    serialized.setdefault("action_taken", "notified" if serialized.get("ok") else "failed_closed")
+    serialized.setdefault("environment", "crypto_paper_telegram")
+    if not serialized.get("run_id"):
+        serialized["run_id"] = _telegram_run_id_from_value(serialized.get("last_attempt_at"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, serialized)
+    serialized["result_path"] = str(path)
+    return serialized
+
+
+def _telegram_run_id_from_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return f"telegram-{parsed.astimezone(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    return f"telegram-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
 
 
 def _load_json(path: Path, *, default: Any) -> Any:

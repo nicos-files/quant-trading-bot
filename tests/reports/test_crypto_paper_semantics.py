@@ -312,6 +312,7 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
             json.dumps(
                 {
                     "ok": False,
+                    "run_id": "testnet-20260505-233000",
                     "testnet": True,
                     "live_trading": False,
                     "environment": "binance_spot_testnet",
@@ -334,7 +335,50 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
         self.assertEqual(len(testnet_events), 1)
         self.assertEqual(testnet_events[0]["event_type"], "ERROR")
         self.assertEqual(testnet_events[0]["mode"], "TESTNET")
+        self.assertEqual(testnet_events[0]["run_id"], "testnet-20260505-233000")
         self.assertFalse(testnet_events[0]["paper_only"])
+        self.assertEqual(
+            result["summary"]["heartbeats"]["testnet_run_id"],
+            "testnet-20260505-233000",
+        )
+
+    def test_notify_failure_artifact_emits_semantic_event_and_heartbeat(self) -> None:
+        semantic_dir = self.artifacts_dir / "semantic"
+        semantic_dir.mkdir(parents=True, exist_ok=True)
+        (semantic_dir / "telegram_notify_result.json").write_text(
+            json.dumps(
+                {
+                    "ok": False,
+                    "run_id": "telegram-20260503-180000",
+                    "paper_only": True,
+                    "live_trading": False,
+                    "category": "TELEGRAM_NOTIFY_FAILED",
+                    "severity": "ERROR",
+                    "failure_reason": "send_failed:non_ok_response",
+                    "action_taken": "failed_closed",
+                    "environment": "crypto_paper_telegram",
+                    "last_attempt_at": "2026-05-03T18:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = self._build()
+        notify_events = [
+            event
+            for event in result["events"]
+            if event.get("category") == "TELEGRAM_NOTIFY_FAILED"
+        ]
+        self.assertEqual(len(notify_events), 1)
+        self.assertEqual(notify_events[0]["run_id"], "telegram-20260503-180000")
+        self.assertEqual(result["summary"]["telegram_status"], "ERROR")
+        self.assertEqual(
+            result["summary"]["heartbeats"]["telegram_last_attempt_at"],
+            "2026-05-03T18:00:00+00:00",
+        )
+        self.assertEqual(
+            result["summary"]["heartbeats"]["telegram_run_id"],
+            "telegram-20260503-180000",
+        )
 
 
 class CryptoPaperSemanticsExitEnrichmentTests(unittest.TestCase):

@@ -135,6 +135,7 @@ def run_binance_testnet_execution(
     """
 
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    run_id = f"testnet-{moment.strftime('%Y%m%d-%H%M%S')}"
     paper_root = Path(paper_artifacts_dir)
     testnet_root = (
         Path(testnet_artifacts_dir)
@@ -148,11 +149,14 @@ def run_binance_testnet_execution(
     config, config_warnings = _resolve_config(source_env)
 
     base_result: dict[str, Any] = {
+        "run_id": run_id,
         "ok": False,
         "paper_only": False,
         "live_trading": False,
         "testnet": True,
+        "mode": "TESTNET",
         "environment": "binance_spot_testnet",
+        "as_of": moment.isoformat(),
         "dry_run": bool(dry_run),
         "order_test_only": config.order_test_only,
         "base_url": config.base_url,
@@ -164,6 +168,12 @@ def run_binance_testnet_execution(
         "rejected_count": 0,
         "skipped_count": 0,
         "testnet_artifacts_dir": str(testnet_root),
+        "heartbeat": _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="initializing",
+            status="PENDING",
+        ),
     }
 
     # ------------------------------------------------------------------
@@ -179,6 +189,12 @@ def run_binance_testnet_execution(
             severity="ERROR",
             action_taken="testnet_submit_blocked",
             submit_attempted=False,
+        )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="enable_gate",
+            status="BLOCKED",
         )
         _write_result(testnet_root, base_result)
         return base_result
@@ -197,6 +213,12 @@ def run_binance_testnet_execution(
             action_taken="testnet_submit_blocked",
             submit_attempted=False,
         )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="base_url_gate",
+            status="BLOCKED",
+        )
         _write_result(testnet_root, base_result)
         return base_result
 
@@ -209,6 +231,12 @@ def run_binance_testnet_execution(
             severity="CRITICAL",
             action_taken="blocked",
             submit_attempted=False,
+        )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="kill_switch_gate",
+            status="BLOCKED",
         )
         _write_result(testnet_root, base_result)
         return base_result
@@ -227,9 +255,15 @@ def run_binance_testnet_execution(
         _annotate_result(
             base_result,
             category="TESTNET_RECONCILIATION_MISMATCH",
-            severity="ERROR",
+            severity=_previous_mismatch_gate_severity(previous_exchange_state),
             action_taken="blocked",
             submit_attempted=False,
+        )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="previous_reconciliation_gate",
+            status="BLOCKED",
         )
         _write_result(testnet_root, base_result)
         return base_result
@@ -249,6 +283,12 @@ def run_binance_testnet_execution(
                 severity="ERROR",
                 action_taken="testnet_submit_blocked",
                 submit_attempted=False,
+            )
+            base_result["heartbeat"] = _build_testnet_heartbeat(
+                run_id=run_id,
+                moment=moment,
+                phase="credentials_gate",
+                status="BLOCKED",
             )
             _write_result(testnet_root, base_result)
             return base_result
@@ -277,6 +317,12 @@ def run_binance_testnet_execution(
             action_taken="blocked",
             submit_attempted=False,
         )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="time_sync_gate",
+            status="BLOCKED",
+        )
         _write_result(testnet_root, base_result)
         return base_result
     open_order_limit_gate = _check_open_order_limit(
@@ -293,6 +339,12 @@ def run_binance_testnet_execution(
             severity="ERROR",
             action_taken="blocked",
             submit_attempted=False,
+        )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="open_orders_gate",
+            status="BLOCKED",
         )
         _write_result(testnet_root, base_result)
         return base_result
@@ -462,6 +514,7 @@ def run_binance_testnet_execution(
         derived_positions=positions,
         moment=moment,
         warnings=warnings,
+        run_id=run_id,
     )
     reconciliation = _build_reconciliation(
         events=actionable_events,
@@ -493,6 +546,7 @@ def run_binance_testnet_execution(
         skipped=skipped,
         warnings=warnings,
         metadata={
+            "run_id": run_id,
             "generated_at": moment.isoformat(),
             "base_url": config.base_url,
             "order_test_only": config.order_test_only,
@@ -503,6 +557,16 @@ def run_binance_testnet_execution(
             "exchange_state": exchange_state,
         },
     )
+    mismatch_summary = dict(exchange_state.get("reconciliation_summary") or {})
+    mismatch_highest = str(mismatch_summary.get("highest_severity") or "")
+    mismatch_count = int(mismatch_summary.get("count") or 0)
+    heartbeat_status = "SUCCESS"
+    if mismatch_highest == "CRITICAL":
+        heartbeat_status = "BLOCKED"
+    elif mismatch_highest == "ERROR":
+        heartbeat_status = "ERROR"
+    elif mismatch_highest in {"WARNING", "INFO"} and mismatch_count > 0:
+        heartbeat_status = "DEGRADED"
 
     base_result.update(
         {
@@ -520,13 +584,24 @@ def run_binance_testnet_execution(
             "open_order_limit": open_order_limit_gate,
             "previous_exchange_state": previous_exchange_state if isinstance(previous_exchange_state, dict) else {},
             "exchange_state": exchange_state,
+            "reconciliation_summary": dict(exchange_state.get("reconciliation_summary") or {}),
+            "heartbeat": _build_testnet_heartbeat(
+                run_id=run_id,
+                moment=moment,
+                phase="completed",
+                status=heartbeat_status,
+            ),
             "result": final_result_obj.to_dict(),
         }
     )
     _annotate_result(
         base_result,
-        category="NO_ACTION" if not accepted_orders and not rejected_orders else None,
-        severity="INFO",
+        category=(
+            "TESTNET_RECONCILIATION_MISMATCH"
+            if mismatch_count > 0
+            else ("NO_ACTION" if not accepted_orders and not rejected_orders else None)
+        ),
+        severity=mismatch_highest or "INFO",
         action_taken="testnet_submit_attempted" if accepted_orders or rejected_orders else "notified",
         submit_attempted=bool(accepted_orders or rejected_orders),
     )
@@ -572,13 +647,22 @@ def _check_previous_exchange_state_gate(
         return None
     if not isinstance(previous_exchange_state, Mapping):
         return None
+    mismatch_details = previous_exchange_state.get("mismatch_details")
+    if isinstance(mismatch_details, list):
+        blocking_items = [
+            item for item in mismatch_details
+            if isinstance(item, Mapping) and str(item.get("message") or "").strip()
+        ]
+        if blocking_items:
+            highest = _highest_severity(item.get("severity") for item in blocking_items)
+            return f"previous_exchange_reconciliation_mismatch:{len(blocking_items)}:{highest}"
     mismatches = previous_exchange_state.get("mismatches")
     if not isinstance(mismatches, list):
         return None
-    critical = [str(item) for item in mismatches if str(item).strip()]
-    if not critical:
+    present = [str(item) for item in mismatches if str(item).strip()]
+    if not present:
         return None
-    return f"previous_exchange_reconciliation_mismatch:{len(critical)}"
+    return f"previous_exchange_reconciliation_mismatch:{len(present)}"
 
 
 def _check_open_order_limit(
@@ -678,8 +762,10 @@ def _reconcile_exchange_state(
     derived_positions: Iterable[BinanceTestnetPosition],
     moment: datetime,
     warnings: list[str],
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
+        "run_id": run_id,
         "checked_at": moment.isoformat(),
         "account_checked": False,
         "open_orders_checked": False,
@@ -687,6 +773,19 @@ def _reconcile_exchange_state(
         "open_order_symbols": [],
         "balance_symbols": [],
         "mismatches": [],
+        "mismatch_details": [],
+        "reconciliation_summary": {
+            "count": 0,
+            "blocking_count": 0,
+            "highest_severity": "INFO",
+            "counts_by_severity": {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0},
+            "counts_by_level": {
+                "tolerable_drift": 0,
+                "warning": 0,
+                "error": 0,
+                "critical_hard_stop": 0,
+            },
+        },
     }
     if client is None:
         warnings.append("exchange_reconciliation_unavailable:no_client")
@@ -725,14 +824,16 @@ def _reconcile_exchange_state(
     else:
         warnings.append("exchange_reconciliation_unavailable:no_open_orders_method")
 
-    mismatches = _find_exchange_reconciliation_mismatches(
+    mismatch_details = _build_exchange_reconciliation_mismatch_details(
         accepted_orders=accepted_orders,
         derived_positions=derived_positions,
         exchange_state=state,
         quote_currency=config.quote_currency,
     )
-    state["mismatches"] = mismatches
-    for mismatch in mismatches:
+    state["mismatch_details"] = mismatch_details
+    state["mismatches"] = [str(item.get("message") or "") for item in mismatch_details]
+    state["reconciliation_summary"] = _summarize_exchange_mismatch_details(mismatch_details)
+    for mismatch in state["mismatches"]:
         warnings.append(f"exchange_reconciliation_mismatch:{mismatch}")
     return state
 
@@ -979,14 +1080,14 @@ def _summarize_open_orders_payload(payload: Any) -> dict[str, Any]:
     }
 
 
-def _find_exchange_reconciliation_mismatches(
+def _build_exchange_reconciliation_mismatch_details(
     *,
     accepted_orders: Iterable[BinanceTestnetOrder],
     derived_positions: Iterable[BinanceTestnetPosition],
     exchange_state: Mapping[str, Any],
     quote_currency: str,
-) -> list[str]:
-    mismatches: list[str] = []
+) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
     open_orders = ((exchange_state.get("open_orders") or {}).get("by_symbol") or {}) if isinstance(exchange_state.get("open_orders"), Mapping) else {}
     balances = ((exchange_state.get("account") or {}).get("balances") or {}) if isinstance(exchange_state.get("account"), Mapping) else {}
 
@@ -994,21 +1095,178 @@ def _find_exchange_reconciliation_mismatches(
         if order.status == "FILLED":
             symbol_open_orders = open_orders.get(order.symbol) or []
             if any(str(item.get("clientOrderId") or "") == order.client_order_id for item in symbol_open_orders):
-                mismatches.append(f"filled_order_still_open:{order.client_order_id}")
+                mismatches.append(
+                    _exchange_mismatch_detail(
+                        code="filled_order_still_open",
+                        severity="CRITICAL",
+                        level="critical_hard_stop",
+                        blocking=True,
+                        message=f"filled_order_still_open:{order.client_order_id}",
+                        symbol=order.symbol,
+                        client_order_id=order.client_order_id,
+                    )
+                )
 
     for position in derived_positions:
         symbol = str(position.symbol or "").upper()
         base_asset = symbol[: -len(quote_currency)] if symbol.endswith(quote_currency) else symbol
         balance = balances.get(base_asset)
         if balance is None:
-            mismatches.append(f"missing_exchange_balance:{base_asset}")
+            mismatches.append(
+                _exchange_mismatch_detail(
+                    code="missing_exchange_balance",
+                    severity="ERROR",
+                    level="error",
+                    blocking=True,
+                    message=f"missing_exchange_balance:{base_asset}",
+                    symbol=symbol,
+                    asset=base_asset,
+                    local_quantity=float(position.quantity),
+                    exchange_quantity=0.0,
+                )
+            )
             continue
         exchange_qty = float(balance.get("total") or 0.0)
-        if abs(exchange_qty - float(position.quantity)) > 1e-9:
+        delta = abs(exchange_qty - float(position.quantity))
+        if delta > 1e-9:
+            severity, level, blocking = _quantity_mismatch_policy(
+                local_quantity=float(position.quantity),
+                exchange_quantity=exchange_qty,
+            )
             mismatches.append(
-                f"position_qty_mismatch:{symbol}:local={float(position.quantity):.12f}:exchange={exchange_qty:.12f}"
+                _exchange_mismatch_detail(
+                    code="position_qty_mismatch",
+                    severity=severity,
+                    level=level,
+                    blocking=blocking,
+                    message=(
+                        f"position_qty_mismatch:{symbol}:"
+                        f"local={float(position.quantity):.12f}:exchange={exchange_qty:.12f}"
+                    ),
+                    symbol=symbol,
+                    local_quantity=float(position.quantity),
+                    exchange_quantity=exchange_qty,
+                    delta=delta,
+                )
             )
     return mismatches
+
+
+def _exchange_mismatch_detail(
+    *,
+    code: str,
+    severity: str,
+    level: str,
+    blocking: bool,
+    message: str,
+    symbol: str | None = None,
+    client_order_id: str | None = None,
+    asset: str | None = None,
+    local_quantity: float | None = None,
+    exchange_quantity: float | None = None,
+    delta: float | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "code": code,
+        "severity": severity,
+        "level": level,
+        "blocking": bool(blocking),
+        "message": message,
+    }
+    if symbol:
+        payload["symbol"] = symbol
+    if client_order_id:
+        payload["client_order_id"] = client_order_id
+    if asset:
+        payload["asset"] = asset
+    if local_quantity is not None:
+        payload["local_quantity"] = float(local_quantity)
+    if exchange_quantity is not None:
+        payload["exchange_quantity"] = float(exchange_quantity)
+    if delta is not None:
+        payload["absolute_delta"] = float(delta)
+        reference = max(abs(float(local_quantity or 0.0)), abs(float(exchange_quantity or 0.0)), 1e-12)
+        payload["relative_delta"] = float(delta / reference)
+    return payload
+
+
+def _quantity_mismatch_policy(
+    *,
+    local_quantity: float,
+    exchange_quantity: float,
+) -> tuple[str, str, bool]:
+    delta = abs(float(local_quantity) - float(exchange_quantity))
+    reference = max(abs(float(local_quantity)), abs(float(exchange_quantity)), 1e-12)
+    relative_delta = delta / reference
+    if delta <= 1e-8 or relative_delta <= 5e-4:
+        return "INFO", "tolerable_drift", False
+    if relative_delta <= 5e-3:
+        return "WARNING", "warning", False
+    if relative_delta <= 5e-2:
+        return "ERROR", "error", True
+    return "CRITICAL", "critical_hard_stop", True
+
+
+def _summarize_exchange_mismatch_details(
+    mismatch_details: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    counts_by_severity: dict[str, int] = {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
+    counts_by_level: dict[str, int] = {
+        "tolerable_drift": 0,
+        "warning": 0,
+        "error": 0,
+        "critical_hard_stop": 0,
+    }
+    highest = "INFO"
+    blocking_count = 0
+    count = 0
+    for item in mismatch_details:
+        if not isinstance(item, Mapping):
+            continue
+        count += 1
+        severity = str(item.get("severity") or "INFO").upper()
+        level = str(item.get("level") or "warning")
+        counts_by_severity[severity] = counts_by_severity.get(severity, 0) + 1
+        counts_by_level[level] = counts_by_level.get(level, 0) + 1
+        if bool(item.get("blocking")):
+            blocking_count += 1
+        highest = _highest_severity([highest, severity])
+    return {
+        "count": count,
+        "blocking_count": blocking_count,
+        "highest_severity": highest,
+        "counts_by_severity": counts_by_severity,
+        "counts_by_level": counts_by_level,
+    }
+
+
+def _highest_severity(values: Iterable[Any]) -> str:
+    order = {"INFO": 0, "WARNING": 1, "ERROR": 2, "CRITICAL": 3}
+    highest = "INFO"
+    for value in values:
+        candidate = str(value or "").upper()
+        if order.get(candidate, -1) > order.get(highest, -1):
+            highest = candidate
+    return highest
+
+
+def _previous_mismatch_gate_severity(previous_exchange_state: Any) -> str:
+    if isinstance(previous_exchange_state, Mapping):
+        summary = previous_exchange_state.get("reconciliation_summary")
+        if isinstance(summary, Mapping):
+            highest = str(summary.get("highest_severity") or "").upper()
+            if highest in {"WARNING", "ERROR", "CRITICAL"}:
+                return highest
+        details = previous_exchange_state.get("mismatch_details")
+        if isinstance(details, list):
+            highest = _highest_severity(
+                item.get("severity")
+                for item in details
+                if isinstance(item, Mapping)
+            )
+            if highest:
+                return highest
+    return "ERROR"
 
 
 def _resolve_config(env: Mapping[str, str]) -> tuple[BinanceTestnetExecutionConfig, list[str]]:
@@ -1091,6 +1349,24 @@ def _annotate_result(
     payload["failure_reason"] = str(payload.get("reason") or category or "")
     payload["action_taken"] = action_taken
     payload["submit_attempted"] = bool(submit_attempted)
+
+
+def _build_testnet_heartbeat(
+    *,
+    run_id: str,
+    moment: datetime,
+    phase: str,
+    status: str,
+) -> dict[str, Any]:
+    stamp = moment.isoformat()
+    return {
+        "run_id": run_id,
+        "run_started_at": stamp,
+        "last_updated_at": stamp,
+        "run_completed_at": stamp if status != "PENDING" else None,
+        "phase": phase,
+        "status": status,
+    }
 
 
 def build_client_order_id(event: Mapping[str, Any]) -> str:

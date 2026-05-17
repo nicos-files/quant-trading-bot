@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
 import json
@@ -7,12 +7,12 @@ import os
 def get_execution_date(date_str: Optional[str] = None) -> datetime:
     if date_str:
         return datetime.strptime(date_str, "%Y-%m-%d")
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def get_execution_hour(hour_str: Optional[str] = None) -> Optional[str]:
     if hour_str:
         return hour_str
-    return datetime.utcnow().strftime("%H%M")
+    return datetime.now(timezone.utc).replace(tzinfo=None).strftime("%H%M")
 
 
 def ensure_date_dir(base: Path, date: datetime, hour: Optional[str] = None) -> Path:

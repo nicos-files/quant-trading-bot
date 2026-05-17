@@ -230,6 +230,12 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "notify_locked")
         self.assertEqual(sender.calls, [])
+        payload = json.loads(
+            (self.artifacts_dir / "semantic" / "telegram_notify_result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["category"], "LOCK_ACTIVE")
+        self.assertEqual(payload["severity"], "WARNING")
+        self.assertEqual(payload["run_id"], "telegram-20260503-180000")
 
     def test_force_resends_already_sent_events(self) -> None:
         self._seed_take_profit_exit()
@@ -345,6 +351,13 @@ class NotifyCryptoPaperTelegramTests(unittest.TestCase):
         )
         self.assertFalse(result["ok"])
         self.assertNotIn(BOT_TOKEN, result["reason"])
+        payload = json.loads(
+            (self.artifacts_dir / "semantic" / "telegram_notify_result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["category"], "TELEGRAM_NOTIFY_FAILED")
+        self.assertEqual(payload["severity"], "ERROR")
+        self.assertEqual(payload["run_id"], "telegram-20260503-180000")
+        self.assertIn("boom token=", payload["failure_reason"])
 
     def test_critical_testnet_event_formats_as_blocked_testnet_card(self) -> None:
         event = {

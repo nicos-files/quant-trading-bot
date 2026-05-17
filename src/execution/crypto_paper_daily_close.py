@@ -226,11 +226,38 @@ def build_crypto_paper_daily_report(result: CryptoPaperDailyCloseResult) -> str:
     else:
         lines.append(f"- Operational status: {operational_summary.get('operational_status') or 'OK'}")
         lines.append(f"- Paper forward status: {operational_summary.get('paper_forward_status') or operational_summary.get('forward_run_status') or 'n/a'}")
+        if operational_summary.get("telegram_status"):
+            lines.append(f"- Telegram notifier status: {operational_summary.get('telegram_status')}")
         if operational_summary.get("testnet_status"):
             lines.append(f"- Testnet status: {operational_summary.get('testnet_status')}")
+        heartbeats = operational_summary.get("heartbeats") or {}
+        if isinstance(heartbeats, dict):
+            if heartbeats.get("paper_run_id"):
+                lines.append(f"- Paper run_id: {heartbeats.get('paper_run_id')}")
+            lines.append(f"- Paper as_of: {heartbeats.get('paper_as_of') or 'n/a'}")
+            if heartbeats.get("paper_run_started_at"):
+                lines.append(f"- Paper run started_at: {heartbeats.get('paper_run_started_at')}")
+            if heartbeats.get("paper_run_completed_at"):
+                lines.append(f"- Paper run completed_at: {heartbeats.get('paper_run_completed_at')}")
+            if heartbeats.get("semantic_run_id"):
+                lines.append(f"- Semantic run_id: {heartbeats.get('semantic_run_id')}")
+            lines.append(f"- Semantic generated_at: {heartbeats.get('semantic_generated_at') or 'n/a'}")
+            if heartbeats.get("testnet_run_id"):
+                lines.append(f"- Testnet run_id: {heartbeats.get('testnet_run_id')}")
+            if heartbeats.get("testnet_last_attempt_at"):
+                lines.append(f"- Testnet last attempt: {heartbeats.get('testnet_last_attempt_at')}")
+            if heartbeats.get("telegram_run_id"):
+                lines.append(f"- Telegram run_id: {heartbeats.get('telegram_run_id')}")
+            if heartbeats.get("telegram_last_attempt_at"):
+                lines.append(f"- Telegram last attempt: {heartbeats.get('telegram_last_attempt_at')}")
+            if heartbeats.get("telegram_last_success_at"):
+                lines.append(f"- Telegram last success: {heartbeats.get('telegram_last_success_at')}")
         lines.append(
             f"- Severity counts: {json.dumps(operational_summary.get('events_count_by_severity') or {}, sort_keys=True, ensure_ascii=False)}"
         )
+        reconciliation_mismatch_count = int(operational_summary.get("reconciliation_mismatch_count") or 0)
+        if reconciliation_mismatch_count > 0:
+            lines.append(f"- Reconciliation mismatches: {reconciliation_mismatch_count}")
         latest_critical = operational_summary.get("latest_critical_event") or {}
         latest_warning = operational_summary.get("latest_warning_event") or {}
         if latest_critical:
