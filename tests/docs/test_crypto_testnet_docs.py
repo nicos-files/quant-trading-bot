@@ -28,6 +28,15 @@ class CryptoTestnetDocsTests(unittest.TestCase):
         self.assertIn("reconciliation mismatch", text)
         self.assertIn("no live trading", text)
 
+    def test_dry_run_procedure_exists_and_forbids_live_mainnet(self) -> None:
+        path = REPO_ROOT / "docs" / "crypto_testnet_dry_run_procedure.md"
+        self.assertTrue(path.exists())
+        text = path.read_text(encoding="utf-8").lower()
+        self.assertIn("no live trading", text)
+        self.assertIn("no mainnet", text)
+        self.assertIn("run_crypto_testnet_dry_run", text)
+        self.assertNotIn("api.binance.com", text)
+
 
 if __name__ == "__main__":
     unittest.main()
