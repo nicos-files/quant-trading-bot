@@ -53,6 +53,11 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         dashboard_recent: str | None = None,
         paper_recent: str | None = None,
         telegram_severity: str = "INFO",
+        forward_warnings: list[str] | None = None,
+        semantic_warnings: list[str] | None = None,
+        dashboard_warnings: list[str] | None = None,
+        readiness_warnings: list[str] | None = None,
+        testnet_result: dict[str, object] | None = None,
     ) -> None:
         recent = (self.now - timedelta(minutes=5)).isoformat()
         readiness_stamp = readiness_recent or recent
@@ -62,7 +67,7 @@ class CryptoOperationalStatusTests(unittest.TestCase):
             self.paper_dir / "paper_forward" / "crypto_paper_forward_result.json",
             {
                 "status": "SUCCESS",
-                "warnings": [],
+                "warnings": list(forward_warnings or []),
                 "heartbeat": {"last_updated_at": paper_stamp},
             },
         )
@@ -70,7 +75,7 @@ class CryptoOperationalStatusTests(unittest.TestCase):
             self.paper_dir / "semantic" / "crypto_semantic_summary.json",
             {
                 "operational_status": semantic_status,
-                "warnings": [],
+                "warnings": list(semantic_warnings or []),
                 "heartbeats": {"semantic_generated_at": recent},
             },
         )
@@ -79,7 +84,7 @@ class CryptoOperationalStatusTests(unittest.TestCase):
             {
                 "generated_at": dashboard_stamp,
                 "operational_status": dashboard_status,
-                "warnings": [],
+                "warnings": list(dashboard_warnings or []),
             },
         )
         self._write(
@@ -99,15 +104,17 @@ class CryptoOperationalStatusTests(unittest.TestCase):
                 "submit_ready": submit_ready,
                 "next_allowed_mode": next_allowed_mode,
                 "max_heartbeat_age_minutes": 30,
-                "warnings": [] if readiness_status == "READY" else ["not ready"],
+                "warnings": list(readiness_warnings or ([] if readiness_status == "READY" else ["not ready"])),
             },
         )
         self._write(
             self.testnet_dir / "binance_testnet_execution_result.json",
-            {
+            testnet_result
+            or {
                 "ok": True,
                 "severity": "INFO",
                 "warnings": [],
+                "base_url": "https://testnet.binance.vision",
             },
         )
 
@@ -137,6 +144,8 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         )
         self.assertEqual(result["overall_status"], "DEGRADED")
         self.assertEqual(result["final_decision"], "PAPER_ONLY")
+        self.assertEqual(result["blocking_reasons"], [])
+        self.assertIn("testnet_not_ready_paper_only", result["degraded_reasons"])
 
     def test_dry_run_ready_only_allows_testnet_dry_run(self) -> None:
         self._seed_base(
@@ -153,6 +162,7 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         )
         self.assertEqual(result["overall_status"], "DEGRADED")
         self.assertEqual(result["final_decision"], "TESTNET_DRY_RUN_ALLOWED")
+        self.assertEqual(result["blocking_reasons"], [])
 
     def test_submit_ready_allows_controlled_submit(self) -> None:
         self._seed_base(
@@ -169,6 +179,110 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         )
         self.assertEqual(result["overall_status"], "OK")
         self.assertEqual(result["final_decision"], "TESTNET_SUBMIT_ALLOWED")
+
+    def test_benign_paper_warnings_do_not_block_ready_testnet(self) -> None:
+        self._seed_base(
+            semantic_status="DEGRADED",
+            dashboard_status="DEGRADED",
+            readiness_status="READY",
+            dry_run_ready=True,
+            submit_ready=True,
+            next_allowed_mode="controlled_submit",
+            forward_warnings=[
+                "Risk rejected BTCUSDT: symbol_position_exists",
+                "Crypto strategy produced no trade candidates.",
+            ],
+            semantic_warnings=["Limited symbol attribution: no realized per-symbol exit data available."],
+        )
+        result = evaluate_crypto_operational_status(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            ops_artifacts_dir=self.ops_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["overall_status"], "DEGRADED")
+        self.assertEqual(result["final_decision"], "TESTNET_SUBMIT_ALLOWED")
+        self.assertEqual(result["blocking_reasons"], [])
+        self.assertIn("semantic_degraded", result["degraded_reasons"])
+        self.assertIn("dashboard_degraded", result["degraded_reasons"])
+        self.assertIn("Risk rejected BTCUSDT: symbol_position_exists", result["warnings"])
+        self.assertIn("Crypto strategy produced no trade candidates.", result["warnings"])
+        self.assertIn("Limited symbol attribution: no realized per-symbol exit data available.", result["warnings"])
+
+    def test_analytic_paper_warnings_remain_visible_but_do_not_block_ready_testnet(self) -> None:
+        self._seed_base(
+            semantic_status="DEGRADED",
+            dashboard_status="DEGRADED",
+            readiness_status="READY",
+            dry_run_ready=True,
+            submit_ready=False,
+            next_allowed_mode="order_test_only_or_dry_run",
+            forward_warnings=[
+                "Risk rejected BTCUSDT: symbol_position_exists",
+                "Crypto strategy produced no trade candidates.",
+                "Small sample size: fewer than 30 closed trades.",
+                "Paper-only results; no real execution occurred.",
+                "Fees and slippage are simulated.",
+            ],
+            semantic_warnings=[
+                "Limited symbol attribution: no realized per-symbol exit data available.",
+                "No closed trades available; strategy metrics are limited.",
+                "Open trades are excluded from closed-trade expectancy.",
+            ],
+        )
+        result = evaluate_crypto_operational_status(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            ops_artifacts_dir=self.ops_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["overall_status"], "DEGRADED")
+        self.assertEqual(result["final_decision"], "TESTNET_DRY_RUN_ALLOWED")
+        self.assertEqual(result["blocking_reasons"], [])
+        self.assertIn("semantic_degraded", result["degraded_reasons"])
+        self.assertIn("dashboard_degraded", result["degraded_reasons"])
+        self.assertIn("Small sample size: fewer than 30 closed trades.", result["warnings"])
+        self.assertIn("Paper-only results; no real execution occurred.", result["warnings"])
+        self.assertIn("Fees and slippage are simulated.", result["warnings"])
+
+    def test_active_id_collision_blocks_testnet(self) -> None:
+        self._seed_base(
+            readiness_status="READY",
+            dry_run_ready=True,
+            submit_ready=True,
+            forward_warnings=["id_collision_with_diff_content:order_id=crypto-paper-order-0001"],
+        )
+        result = evaluate_crypto_operational_status(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            ops_artifacts_dir=self.ops_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["overall_status"], "BLOCKED")
+        self.assertEqual(result["final_decision"], "DO_NOT_RUN")
+        self.assertTrue(any(reason.startswith("hard_warning:") for reason in result["blocking_reasons"]))
+
+    def test_wrong_testnet_base_url_blocks(self) -> None:
+        self._seed_base(
+            readiness_status="READY",
+            dry_run_ready=True,
+            submit_ready=True,
+            testnet_result={
+                "ok": True,
+                "severity": "INFO",
+                "base_url": "https://api.binance.com",
+                "warnings": [],
+            },
+        )
+        result = evaluate_crypto_operational_status(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            ops_artifacts_dir=self.ops_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["overall_status"], "BLOCKED")
+        self.assertEqual(result["final_decision"], "DO_NOT_RUN")
+        self.assertIn("testnet_result_base_url_not_testnet", result["blocking_reasons"])
 
     def test_stale_heartbeat_blocks_testnet(self) -> None:
         stale = (self.now - timedelta(hours=2)).isoformat()
@@ -212,7 +326,7 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         )
         serialized = json.dumps(result)
         self.assertNotIn("secret-should-not-appear", serialized)
-        self.assertNotIn("\"api_key\"", serialized)
+        self.assertNotIn('"api_key"', serialized)
 
     def test_markdown_summary_includes_final_decision(self) -> None:
         self._seed_base(
@@ -229,6 +343,7 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         )
         md = (self.ops_dir / "crypto_operational_status.md").read_text(encoding="utf-8")
         self.assertIn("Final decision: TESTNET_DRY_RUN_ALLOWED", md)
+        self.assertIn("## Degraded Reasons", md)
         self.assertEqual(
             result["artifacts"]["crypto_operational_status.md"],
             str(self.ops_dir / "crypto_operational_status.md"),
@@ -237,3 +352,4 @@ class CryptoOperationalStatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

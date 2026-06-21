@@ -14,6 +14,16 @@ _READINESS_FILENAME = "crypto_testnet_readiness.json"
 _STATUS_JSON_FILENAME = "crypto_operational_status.json"
 _STATUS_MD_FILENAME = "crypto_operational_status.md"
 
+_BENIGN_PAPER_WARNING_TOKENS: tuple[str, ...] = (
+    "symbol_position_exists",
+    "no trade candidates",
+    "limited symbol attribution",
+    "small sample size",
+    "paper-only results",
+    "fees and slippage are simulated",
+    "open trades are excluded from closed-trade expectancy",
+    "no closed trades available",
+)
 
 def evaluate_crypto_operational_status(
     *,
@@ -49,9 +59,7 @@ def evaluate_crypto_operational_status(
     notify_result = _load_json(
         paper_root / "semantic" / "telegram_notify_result.json", default={}
     )
-    readiness = _load_json(
-        testnet_root / _READINESS_FILENAME, default={}
-    )
+    readiness = _load_json(testnet_root / _READINESS_FILENAME, default={})
     testnet_result = _load_json(
         testnet_root / "binance_testnet_execution_result.json", default={}
     )
@@ -61,7 +69,8 @@ def evaluate_crypto_operational_status(
         if max_heartbeat_age_minutes is not None
         else (
             readiness.get("max_heartbeat_age_minutes")
-            if isinstance(readiness, dict) and readiness.get("max_heartbeat_age_minutes") is not None
+            if isinstance(readiness, dict)
+            and readiness.get("max_heartbeat_age_minutes") is not None
             else 30
         )
     )
@@ -94,14 +103,41 @@ def evaluate_crypto_operational_status(
         ),
     }
 
-    paper_forward_status = str(forward_result.get("status") or "UNKNOWN") if isinstance(forward_result, dict) and forward_result else "UNKNOWN"
-    semantic_status = str(semantic_summary.get("operational_status") or "UNKNOWN") if isinstance(semantic_summary, dict) and semantic_summary else "UNKNOWN"
-    dashboard_status = str(dashboard_data.get("operational_status") or "UNKNOWN") if isinstance(dashboard_data, dict) and dashboard_data else "UNKNOWN"
+    paper_forward_status = (
+        str(forward_result.get("status") or "UNKNOWN")
+        if isinstance(forward_result, dict) and forward_result
+        else "UNKNOWN"
+    )
+    semantic_status = (
+        str(semantic_summary.get("operational_status") or "UNKNOWN")
+        if isinstance(semantic_summary, dict) and semantic_summary
+        else "UNKNOWN"
+    )
+    dashboard_status = (
+        str(dashboard_data.get("operational_status") or "UNKNOWN")
+        if isinstance(dashboard_data, dict) and dashboard_data
+        else "UNKNOWN"
+    )
     telegram_status = _telegram_status(notify_result)
-    testnet_readiness_status = str(readiness.get("status") or "UNKNOWN") if isinstance(readiness, dict) and readiness else "UNKNOWN"
+    testnet_readiness_status = (
+        str(readiness.get("status") or "UNKNOWN")
+        if isinstance(readiness, dict) and readiness
+        else "UNKNOWN"
+    )
     dry_run_ready = bool(readiness.get("dry_run_ready")) if isinstance(readiness, dict) else False
     submit_ready = bool(readiness.get("submit_ready")) if isinstance(readiness, dict) else False
-    next_allowed_mode = str(readiness.get("next_allowed_mode") or "blocked") if isinstance(readiness, dict) and readiness else "blocked"
+    next_allowed_mode = (
+        str(readiness.get("next_allowed_mode") or "blocked")
+        if isinstance(readiness, dict) and readiness
+        else "blocked"
+    )
+    warnings = _dedupe(
+        (list(forward_result.get("warnings") or []) if isinstance(forward_result, dict) else [])
+        + (list(semantic_summary.get("warnings") or []) if isinstance(semantic_summary, dict) else [])
+        + (list(dashboard_data.get("warnings") or []) if isinstance(dashboard_data, dict) else [])
+        + (list(readiness.get("warnings") or []) if isinstance(readiness, dict) else [])
+        + (list(testnet_result.get("warnings") or []) if isinstance(testnet_result, dict) else [])
+    )
 
     missing_reasons = _missing_artifact_reasons(artifact_inputs)
     stale_reasons = _stale_reasons(
@@ -116,6 +152,9 @@ def evaluate_crypto_operational_status(
         semantic_status=semantic_status,
         dashboard_status=dashboard_status,
         testnet_readiness_status=testnet_readiness_status,
+        telegram_status=telegram_status,
+        testnet_result=testnet_result,
+        warnings=warnings,
     )
     degraded_reasons = _degraded_reasons(
         paper_forward_status=paper_forward_status,
@@ -131,40 +170,35 @@ def evaluate_crypto_operational_status(
         overall_status = "UNKNOWN"
         final_decision = "DO_NOT_RUN"
         blocking_reasons = missing_reasons
+        visible_degraded_reasons: list[str] = []
     elif stale_reasons:
         overall_status = "STALE"
         final_decision = "DO_NOT_RUN"
         blocking_reasons = stale_reasons
+        visible_degraded_reasons = []
     elif blocked_reasons:
         overall_status = "BLOCKED"
         final_decision = "DO_NOT_RUN"
         blocking_reasons = blocked_reasons
+        visible_degraded_reasons = degraded_reasons
     elif degraded_reasons:
         overall_status = "DEGRADED"
-        if dry_run_ready and not submit_ready:
-            final_decision = "TESTNET_DRY_RUN_ALLOWED"
-        elif submit_ready:
-            final_decision = "PAPER_ONLY"
-        else:
-            final_decision = "PAPER_ONLY"
-        blocking_reasons = degraded_reasons
+        final_decision = _allowed_decision(
+            testnet_readiness_status=testnet_readiness_status,
+            dry_run_ready=dry_run_ready,
+            submit_ready=submit_ready,
+        )
+        blocking_reasons = []
+        visible_degraded_reasons = degraded_reasons
     else:
         overall_status = "OK"
-        if submit_ready:
-            final_decision = "TESTNET_SUBMIT_ALLOWED"
-        elif dry_run_ready:
-            final_decision = "TESTNET_DRY_RUN_ALLOWED"
-        else:
-            final_decision = "PAPER_ONLY"
+        final_decision = _allowed_decision(
+            testnet_readiness_status=testnet_readiness_status,
+            dry_run_ready=dry_run_ready,
+            submit_ready=submit_ready,
+        )
         blocking_reasons = []
-
-    warnings = _dedupe(
-        list(forward_result.get("warnings") or []) if isinstance(forward_result, dict) else []
-        + list(semantic_summary.get("warnings") or []) if isinstance(semantic_summary, dict) else []
-        + list(dashboard_data.get("warnings") or []) if isinstance(dashboard_data, dict) else []
-        + list(readiness.get("warnings") or []) if isinstance(readiness, dict) else []
-        + list(testnet_result.get("warnings") or []) if isinstance(testnet_result, dict) else []
-    )
+        visible_degraded_reasons = []
 
     result = {
         "generated_at_utc": moment.isoformat(),
@@ -179,6 +213,7 @@ def evaluate_crypto_operational_status(
         "submit_ready": bool(submit_ready),
         "next_allowed_mode": next_allowed_mode,
         "blocking_reasons": list(blocking_reasons),
+        "degraded_reasons": list(visible_degraded_reasons),
         "warnings": warnings,
         "artifact_inputs": artifact_inputs,
         "live_trading_enabled": False,
@@ -245,6 +280,9 @@ def _blocked_reasons(
     semantic_status: str,
     dashboard_status: str,
     testnet_readiness_status: str,
+    telegram_status: str,
+    testnet_result: Any,
+    warnings: list[str],
 ) -> list[str]:
     reasons: list[str] = []
     if paper_forward_status != "SUCCESS":
@@ -253,9 +291,13 @@ def _blocked_reasons(
         reasons.append(f"semantic_status:{semantic_status}")
     if dashboard_status in {"ERROR", "BLOCKED", "UNKNOWN"}:
         reasons.append(f"dashboard_status:{dashboard_status}")
+    if telegram_status in {"ERROR", "BLOCKED"}:
+        reasons.append(f"telegram_status:{telegram_status}")
     if testnet_readiness_status == "UNKNOWN":
         reasons.append("testnet_readiness_unknown")
-    return reasons
+    reasons.extend(_hard_warning_reasons(warnings))
+    reasons.extend(_testnet_result_blockers(testnet_result))
+    return _dedupe(reasons)
 
 
 def _degraded_reasons(
@@ -275,15 +317,82 @@ def _degraded_reasons(
         reasons.append("semantic_degraded")
     if dashboard_status == "DEGRADED":
         reasons.append("dashboard_degraded")
-    if telegram_status in {"ERROR", "DEGRADED"}:
+    if telegram_status == "DEGRADED":
         reasons.append(f"telegram_status:{telegram_status}")
     if testnet_readiness_status == "NOT_READY" and dry_run_ready and not submit_ready:
         reasons.append("testnet_submit_not_ready_dry_run_only")
     elif testnet_readiness_status == "NOT_READY":
         reasons.append("testnet_not_ready_paper_only")
-    if submit_ready and (semantic_status == "DEGRADED" or dashboard_status == "DEGRADED"):
-        reasons.append("testnet_blocked_by_degraded_paper_plane")
     return _dedupe(reasons)
+
+
+def _allowed_decision(
+    *,
+    testnet_readiness_status: str,
+    dry_run_ready: bool,
+    submit_ready: bool,
+) -> str:
+    if submit_ready:
+        return "TESTNET_SUBMIT_ALLOWED"
+    if dry_run_ready:
+        return "TESTNET_DRY_RUN_ALLOWED"
+    if testnet_readiness_status == "NOT_READY":
+        return "PAPER_ONLY"
+    return "PAPER_ONLY"
+
+
+def _hard_warning_reasons(warnings: list[str]) -> list[str]:
+    reasons: list[str] = []
+    for warning in warnings:
+        raw = str(warning or "").strip()
+        normalized = raw.lower()
+        if not normalized:
+            continue
+        if _is_benign_paper_warning(normalized):
+            continue
+        if "id_collision_with_diff_content" in normalized:
+            reasons.append(f"hard_warning:{raw}")
+            continue
+        if any(
+            token in normalized
+            for token in (
+                "ledger_state_corrupt",
+                "artifact_unreadable",
+                "quote_stale",
+                "stale market data",
+                "exchange_reconciliation_mismatch",
+                "previous_exchange_reconciliation_mismatch",
+                "open_order_limit_exceeded",
+                "exchange_filter",
+                "min_notional_violation",
+                "quantity_step_mismatch",
+                "price_tick_mismatch",
+                "symbol_not_allowed",
+                "kill switch",
+                "kill_switch",
+            )
+        ):
+            reasons.append(f"hard_warning:{raw}")
+    return _dedupe(reasons)
+
+
+def _is_benign_paper_warning(normalized_warning: str) -> bool:
+    return any(token in normalized_warning for token in _BENIGN_PAPER_WARNING_TOKENS)
+
+
+def _testnet_result_blockers(testnet_result: Any) -> list[str]:
+    if not isinstance(testnet_result, dict) or not testnet_result:
+        return []
+    reasons: list[str] = []
+    severity = str(testnet_result.get("severity") or "").upper()
+    if severity in {"ERROR", "CRITICAL"}:
+        reasons.append(f"testnet_result_severity:{severity}")
+    if testnet_result.get("ok") is False:
+        reasons.append("testnet_result_not_ok")
+    base_url = str(testnet_result.get("base_url") or "").strip().lower()
+    if base_url and "testnet.binance.vision" not in base_url:
+        reasons.append("testnet_result_base_url_not_testnet")
+    return reasons
 
 
 def _telegram_status(notify_result: Any) -> str:
@@ -380,6 +489,13 @@ def _render_operational_status_markdown(result: dict[str, Any]) -> str:
     else:
         for reason in reasons:
             lines.append(f"- {reason}")
+    lines.extend(["", "## Degraded Reasons"])
+    degraded = list(result.get("degraded_reasons") or [])
+    if not degraded:
+        lines.append("- None.")
+    else:
+        for reason in degraded:
+            lines.append(f"- {reason}")
     lines.extend(["", "## Warnings"])
     warnings = list(result.get("warnings") or [])
     if not warnings:
@@ -409,3 +525,5 @@ def _render_operational_status_markdown(result: dict[str, Any]) -> str:
 
 
 __all__ = ["evaluate_crypto_operational_status"]
+
+
