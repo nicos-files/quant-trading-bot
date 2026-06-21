@@ -916,7 +916,7 @@ def _emit_testnet_events(
                 )
             )
             sources.append("../crypto_testnet/binance_testnet_execution_result.json")
-    for order in testnet_orders:
+    for order in _latest_testnet_orders_for_current_run(testnet_orders=testnet_orders, testnet_result=testnet_result):
         if not isinstance(order, dict):
             continue
         if str(order.get("status") or "").upper() != "REJECTED":
@@ -962,6 +962,68 @@ def _emit_testnet_events(
         )
         sources.append("../crypto_testnet/binance_testnet_orders.json")
     return sources
+
+
+def _latest_testnet_orders_for_current_run(
+    *,
+    testnet_orders: list[dict[str, Any]],
+    testnet_result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    orders = [order for order in testnet_orders if isinstance(order, dict)]
+    if not orders:
+        return []
+    if not isinstance(testnet_result, dict) or not testnet_result:
+        return orders
+
+    run_id = str(
+        testnet_result.get("run_id")
+        or ((testnet_result.get("heartbeat") or {}).get("run_id"))
+        or ""
+    ).strip()
+    if run_id:
+        by_run_id = [
+            order for order in orders
+            if str((order.get("metadata") or {}).get("run_id") or "").strip() == run_id
+        ]
+        if by_run_id:
+            return by_run_id
+
+    heartbeat = testnet_result.get("heartbeat") or {}
+    started_at = _parse_semantic_iso(
+        heartbeat.get("run_started_at")
+        or heartbeat.get("last_updated_at")
+    )
+    completed_at = _parse_semantic_iso(
+        heartbeat.get("run_completed_at")
+        or heartbeat.get("last_updated_at")
+    )
+    if started_at is None and completed_at is None:
+        return orders
+
+    filtered: list[dict[str, Any]] = []
+    for order in orders:
+        created_at = _parse_semantic_iso(order.get("created_at"))
+        if created_at is None:
+            continue
+        if started_at is not None and created_at < started_at:
+            continue
+        if completed_at is not None and created_at > completed_at:
+            continue
+        filtered.append(order)
+    return filtered
+
+
+def _parse_semantic_iso(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _emit_notify_events(

@@ -31,11 +31,23 @@ class EvaluateCryptoOperationalStatusToolTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (paper_dir / "semantic" / "crypto_semantic_summary.json").write_text(
-                json.dumps({"operational_status": "OK", "heartbeats": {"semantic_generated_at": recent}}),
+                json.dumps({
+                    "operational_status": "DEGRADED",
+                    "warnings": ["Crypto strategy produced no trade candidates."],
+                    "heartbeats": {"semantic_generated_at": recent},
+                }),
                 encoding="utf-8",
             )
             (paper_dir / "dashboard" / "dashboard_data.json").write_text(
-                json.dumps({"generated_at": recent, "operational_status": "OK"}),
+                json.dumps({
+                    "generated_at": recent,
+                    "operational_status": "DEGRADED",
+                    "warnings": ["Limited symbol attribution: no realized per-symbol exit data available."],
+                }),
+                encoding="utf-8",
+            )
+            (paper_dir / "semantic" / "telegram_notify_result.json").write_text(
+                json.dumps({"ok": True, "severity": "INFO", "last_attempt_at": recent}),
                 encoding="utf-8",
             )
             (testnet_dir / "crypto_testnet_readiness.json").write_text(
@@ -49,7 +61,7 @@ class EvaluateCryptoOperationalStatusToolTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (testnet_dir / "binance_testnet_execution_result.json").write_text(
-                json.dumps({"ok": True, "severity": "INFO"}),
+                json.dumps({"ok": True, "severity": "INFO", "base_url": "https://testnet.binance.vision"}),
                 encoding="utf-8",
             )
             rc = main(
@@ -65,6 +77,10 @@ class EvaluateCryptoOperationalStatusToolTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue((ops_dir / "crypto_operational_status.json").exists())
             self.assertTrue((ops_dir / "crypto_operational_status.md").exists())
+            payload = json.loads((ops_dir / "crypto_operational_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["overall_status"], "DEGRADED")
+            self.assertEqual(payload["final_decision"], "TESTNET_SUBMIT_ALLOWED")
+            self.assertEqual(payload["blocking_reasons"], [])
 
 
 if __name__ == "__main__":

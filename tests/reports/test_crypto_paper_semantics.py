@@ -342,6 +342,63 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
             "testnet-20260505-233000",
         )
 
+    def test_historical_testnet_rejections_do_not_pollute_current_semantic_status(self) -> None:
+        testnet_dir = self.artifacts_dir.parent / "crypto_testnet"
+        testnet_dir.mkdir(parents=True, exist_ok=True)
+        (testnet_dir / "binance_testnet_execution_result.json").write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "run_id": "testnet-20260505-233000",
+                    "testnet": True,
+                    "live_trading": False,
+                    "environment": "binance_spot_testnet",
+                    "severity": "INFO",
+                    "category": "NO_ACTION",
+                    "action_taken": "notified",
+                    "submit_attempted": False,
+                    "heartbeat": {
+                        "run_id": "testnet-20260505-233000",
+                        "run_started_at": "2026-05-05T23:30:00+00:00",
+                        "run_completed_at": "2026-05-05T23:30:01+00:00",
+                        "last_updated_at": "2026-05-05T23:30:01+00:00",
+                        "status": "SUCCESS",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (testnet_dir / "binance_testnet_orders.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "client_order_id": "old-reject-1",
+                        "symbol": "BTCUSDT",
+                        "status": "REJECTED",
+                        "reason": "notional_exceeds_max:25.00>10.00",
+                        "created_at": "2026-05-05T20:00:00+00:00",
+                        "metadata": {
+                            "category": "EXCHANGE_FILTER_REJECT",
+                            "severity": "ERROR",
+                            "failure_reason": "notional_exceeds_max:25.00>10.00",
+                            "action_taken": "testnet_submit_blocked",
+                            "submit_attempted": False,
+                            "environment": "binance_spot_testnet",
+                        },
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result = self._build()
+        self.assertEqual(result["summary"]["events_count_by_severity"]["ERROR"], 0)
+        self.assertIsNone(result["summary"]["latest_critical_event"])
+        reject_events = [
+            event for event in result["events"]
+            if event.get("category") == "EXCHANGE_FILTER_REJECT"
+        ]
+        self.assertEqual(reject_events, [])
+
     def test_notify_failure_artifact_emits_semantic_event_and_heartbeat(self) -> None:
         semantic_dir = self.artifacts_dir / "semantic"
         semantic_dir.mkdir(parents=True, exist_ok=True)

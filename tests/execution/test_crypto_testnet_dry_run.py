@@ -147,6 +147,37 @@ class CryptoTestnetDryRunTests(unittest.TestCase):
         self.assertEqual(result["operational_final_decision"], "DO_NOT_RUN")
 
     def test_refuses_dry_run_when_operational_status_paper_only(self) -> None:
+        self._seed_common_artifacts()
+        with mock.patch(
+            "src.execution.crypto_testnet_dry_run.evaluate_crypto_testnet_readiness",
+            return_value={
+                "status": "NOT_READY",
+                "dry_run_ready": False,
+                "submit_ready": False,
+                "next_allowed_mode": "blocked",
+                "warnings": ["paper only"],
+            },
+        ), mock.patch(
+            "src.execution.crypto_testnet_dry_run.evaluate_crypto_operational_status",
+            return_value={
+                "overall_status": "DEGRADED",
+                "final_decision": "PAPER_ONLY",
+                "next_allowed_mode": "blocked",
+                "blocking_reasons": [],
+                "warnings": ["paper only"],
+            },
+        ):
+            result = run_crypto_testnet_dry_run(
+                paper_artifacts_dir=self.paper_dir,
+                testnet_artifacts_dir=self.testnet_dir,
+                ops_artifacts_dir=self.ops_dir,
+                now=self.now,
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["operational_final_decision"], "PAPER_ONLY")
+        self.assertIn("operational_status_blocked:PAPER_ONLY", result["reason"])
+
+    def test_stale_market_data_blocks_dry_run(self) -> None:
         self._seed_common_artifacts(
             semantic_stale_data_count=1,
         )
@@ -157,13 +188,11 @@ class CryptoTestnetDryRunTests(unittest.TestCase):
             now=self.now,
         )
         self.assertFalse(result["ok"])
-        self.assertEqual(result["operational_final_decision"], "PAPER_ONLY")
-        self.assertIn("operational_status_blocked:PAPER_ONLY", result["reason"])
+        self.assertEqual(result["operational_final_decision"], "DO_NOT_RUN")
+        self.assertIn("operational_status_blocked:DO_NOT_RUN", result["reason"])
 
     def test_allows_dry_run_when_testnet_dry_run_allowed(self) -> None:
-        self._seed_common_artifacts(
-            telegram_severity="ERROR",
-        )
+        self._seed_common_artifacts()
         captured: dict[str, Any] = {}
 
         def _fake_executor(**kwargs: Any) -> dict[str, Any]:
@@ -179,6 +208,24 @@ class CryptoTestnetDryRunTests(unittest.TestCase):
             }
 
         with mock.patch(
+            "src.execution.crypto_testnet_dry_run.evaluate_crypto_testnet_readiness",
+            return_value={
+                "status": "READY",
+                "dry_run_ready": True,
+                "submit_ready": False,
+                "next_allowed_mode": "order_test_only_or_dry_run",
+                "warnings": [],
+            },
+        ), mock.patch(
+            "src.execution.crypto_testnet_dry_run.evaluate_crypto_operational_status",
+            return_value={
+                "overall_status": "DEGRADED",
+                "final_decision": "TESTNET_DRY_RUN_ALLOWED",
+                "next_allowed_mode": "order_test_only_or_dry_run",
+                "blocking_reasons": [],
+                "warnings": ["Crypto strategy produced no trade candidates."],
+            },
+        ), mock.patch(
             "src.execution.crypto_testnet_dry_run.run_binance_testnet_execution",
             side_effect=_fake_executor,
         ):
