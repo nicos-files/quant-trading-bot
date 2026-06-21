@@ -22,6 +22,7 @@ ALPHAV_URL = "https://www.alphavantage.co/query"
 ALPHAV_API_KEY_ENV = "ALPHAV_API_KEY"
 BINANCE_SPOT_URL = "https://api.binance.com"
 BINANCE_INTERVALS = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "1d": "1d"}
+MAX_FUTURE_QUOTE_SKEW_SECONDS = 2.0
 
 
 def normalize_utc_datetime(value: datetime) -> datetime:

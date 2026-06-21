@@ -9,6 +9,7 @@ from src.decision_intel.contracts.recommendations.recommendation_models import R
 from src.market_data.crypto_symbols import enabled_crypto_symbols, is_crypto_symbol, load_crypto_universe, normalize_crypto_symbol
 from src.market_data.providers import (
     BinanceSpotMarketDataProvider,
+    MAX_FUTURE_QUOTE_SKEW_SECONDS,
     parse_quote_timestamp,
     quote_age_seconds,
 )
@@ -299,7 +300,7 @@ class IntradayCryptoEngine:
         age_seconds = quote_age_seconds(latest_quote, as_of=as_of)
         if age_seconds is None:
             return "quote_invalid:timestamp_missing"
-        if age_seconds < -1.0:
+        if age_seconds < -float(MAX_FUTURE_QUOTE_SKEW_SECONDS):
             return f"quote_invalid:timestamp_in_future:{age_seconds:.3f}s"
         if age_seconds > float(max_quote_age_seconds):
             return f"quote_stale:{age_seconds:.3f}s"
