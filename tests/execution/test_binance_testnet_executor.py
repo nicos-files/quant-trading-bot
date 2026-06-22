@@ -215,6 +215,31 @@ class _ExecutorTestCase(unittest.TestCase):
         summary_path = self.paper_dir / "semantic" / "crypto_semantic_summary.json"
         summary_path.write_text(json.dumps({"paper_only": True}), encoding="utf-8")
 
+    def _write_forward_result(
+        self,
+        *,
+        run_started_at: str = "2026-05-03T17:58:00+00:00",
+        run_completed_at: str = "2026-05-03T18:00:00+00:00",
+        run_id: str = "20260503-1800",
+    ) -> None:
+        paper_forward_dir = self.paper_dir / "paper_forward"
+        paper_forward_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "run_id": run_id,
+            "status": "SUCCESS",
+            "heartbeat": {
+                "run_id": run_id,
+                "status": "SUCCESS",
+                "run_started_at": run_started_at,
+                "last_updated_at": run_completed_at,
+                "run_completed_at": run_completed_at,
+            },
+        }
+        (paper_forward_dir / "crypto_paper_forward_result.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+
     def _buy_event(
         self,
         *,
@@ -520,6 +545,56 @@ class CredentialGateTests(_ExecutorTestCase):
 # ---------------------------------------------------------------------------
 # Mode dispatch
 # ---------------------------------------------------------------------------
+
+
+class CurrentPaperRunFilteringTests(_ExecutorTestCase):
+    def test_historical_paper_events_outside_current_run_window_are_ignored(self) -> None:
+        self._write_events([self._buy_event(), self._take_profit_event(), self._stop_loss_event()])
+        self._write_forward_result()
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["considered_count"], 0)
+        self.assertEqual(result["rejected_count"], 0)
+        self.assertEqual(result["test_ok_count"], 0)
+        self.assertEqual(client.order_test_calls, [])
+        self.assertTrue(
+            any(
+                warning.startswith("ignored_historical_paper_semantic_events:")
+                for warning in result["warnings"]
+            )
+        )
+
+    def test_current_run_event_inside_window_is_still_actioned(self) -> None:
+        fresh = self._buy_event(event_id="buy:fill-2:2026-05-03T17:59:30", fill_price=76026.5)
+        fresh["metadata"]["occurred_at"] = "2026-05-03T17:59:30+00:00"
+        stale = self._take_profit_event()
+        self._write_events([stale, fresh])
+        self._write_forward_result()
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["considered_count"], 1)
+        self.assertEqual(len(client.order_test_calls), 1)
+        self.assertEqual(client.order_test_calls[0]["side"], "BUY")
+        self.assertTrue(
+            any(
+                warning.startswith("ignored_historical_paper_semantic_events:")
+                for warning in result["warnings"]
+            )
+        )
 
 
 class OrderTestModeTests(_ExecutorTestCase):

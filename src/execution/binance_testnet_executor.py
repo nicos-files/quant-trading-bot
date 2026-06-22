@@ -373,12 +373,11 @@ def run_binance_testnet_execution(
     )
     enforce_exchange_filters = client is not None
 
-    actionable_events: list[dict[str, Any]] = [
-        event
-        for event in events
-        if isinstance(event, dict)
-        and str(event.get("event_type") or "") in _ACTIONABLE_EVENT_TYPES
-    ]
+    actionable_events = _select_actionable_events_for_current_paper_run(
+        events=events,
+        paper_root=paper_root,
+        warnings=warnings,
+    )
     base_result["considered_count"] = len(actionable_events)
 
     for event in actionable_events:
@@ -1333,6 +1332,93 @@ def _load_semantic_layer(
         write=True,
         now=moment,
     )
+
+
+def _select_actionable_events_for_current_paper_run(
+    *,
+    events: Iterable[Mapping[str, Any]],
+    paper_root: Path,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    actionable_events: list[dict[str, Any]] = [
+        dict(event)
+        for event in events
+        if isinstance(event, Mapping)
+        and str(event.get("event_type") or "") in _ACTIONABLE_EVENT_TYPES
+    ]
+    window = _load_current_paper_run_window(paper_root)
+    if window is None:
+        return actionable_events
+
+    started_at, completed_at = window
+    filtered: list[dict[str, Any]] = []
+    ignored_outside_window = 0
+    ignored_missing_timestamp = 0
+    for event in actionable_events:
+        occurred_at = _event_occurred_at(event)
+        if occurred_at is None:
+            ignored_missing_timestamp += 1
+            continue
+        if started_at <= occurred_at <= completed_at:
+            filtered.append(event)
+            continue
+        ignored_outside_window += 1
+
+    if ignored_outside_window:
+        warnings.append(
+            f"ignored_historical_paper_semantic_events:{ignored_outside_window}"
+        )
+    if ignored_missing_timestamp:
+        warnings.append(
+            f"ignored_undated_paper_semantic_events:{ignored_missing_timestamp}"
+        )
+    return filtered
+
+
+def _load_current_paper_run_window(paper_root: Path) -> tuple[datetime, datetime] | None:
+    forward_result = _load_json_safe(
+        paper_root / "paper_forward" / "crypto_paper_forward_result.json",
+        default={},
+    )
+    if not isinstance(forward_result, Mapping):
+        return None
+    heartbeat = forward_result.get("heartbeat")
+    if not isinstance(heartbeat, Mapping):
+        return None
+    started_at = _parse_timestamp_utc(heartbeat.get("run_started_at"))
+    completed_at = (
+        _parse_timestamp_utc(heartbeat.get("run_completed_at"))
+        or _parse_timestamp_utc(heartbeat.get("last_updated_at"))
+        or _parse_timestamp_utc(forward_result.get("as_of"))
+    )
+    if started_at is None or completed_at is None:
+        return None
+    if completed_at < started_at:
+        return None
+    return started_at, completed_at
+
+
+def _event_occurred_at(event: Mapping[str, Any]) -> datetime | None:
+    metadata = event.get("metadata")
+    if isinstance(metadata, Mapping):
+        occurred_at = _parse_timestamp_utc(metadata.get("occurred_at"))
+        if occurred_at is not None:
+            return occurred_at
+    return _parse_timestamp_utc(event.get("created_at"))
+
+
+def _parse_timestamp_utc(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _annotate_result(
