@@ -12,6 +12,12 @@ from src.utils.atomic_io import atomic_write_json
 _TESTNET_DIRNAME = "crypto_testnet"
 _READINESS_FILENAME = "crypto_testnet_readiness.json"
 
+_NO_CLIENT_UNAVAILABLE_PREFIXES: tuple[str, ...] = (
+    "server_time_unavailable:no_client",
+    "exchange_filters_unavailable:no_client",
+    "exchange_reconciliation_unavailable:no_client",
+)
+
 
 def evaluate_crypto_testnet_readiness(
     *,
@@ -49,6 +55,10 @@ def evaluate_crypto_testnet_readiness(
     )
     reconciliation = _load_json(
         testnet_root / "binance_testnet_reconciliation.json", default=[]
+    )
+    run_context = _derive_testnet_run_context(
+        testnet_result=testnet_result,
+        exchange_state=exchange_state,
     )
 
     checks: list[dict[str, Any]] = []
@@ -164,6 +174,24 @@ def evaluate_crypto_testnet_readiness(
     )
     _append_check(
         checks,
+        check_id="testnet_client_context_valid",
+        ok=bool(
+            run_context["local_dry_run_no_client"]
+            or run_context["connected_client_available"]
+        ),
+        message=(
+            "Latest testnet run must be either a local dry-run without client "
+            "or a connected Binance Spot Testnet run with client validation."
+        ),
+        required_for=("dry_run", "submit"),
+        details={
+            "local_dry_run_no_client": run_context["local_dry_run_no_client"],
+            "connected_client_available": run_context["connected_client_available"],
+            "mode": run_context["mode"],
+        },
+    )
+    _append_check(
+        checks,
         check_id="testnet_heartbeat_fresh",
         ok=_is_fresh(
             ((testnet_result.get("heartbeat") or {}).get("last_updated_at"))
@@ -177,10 +205,49 @@ def evaluate_crypto_testnet_readiness(
     )
     _append_check(
         checks,
+        check_id="submit_requires_connected_client",
+        ok=bool(run_context["connected_client_available"]),
+        message="Controlled submit requires a connected Binance Spot Testnet client.",
+        required_for=("submit",),
+        details={
+            "connected_client_available": run_context["connected_client_available"],
+            "mode": run_context["mode"],
+        },
+    )
+    _append_check(
+        checks,
+        check_id="submit_requires_server_time_validation",
+        ok=bool(run_context["server_time_available"]),
+        message="Controlled submit requires real server time validation.",
+        required_for=("submit",),
+        details={"server_time_available": run_context["server_time_available"]},
+    )
+    _append_check(
+        checks,
+        check_id="submit_requires_exchange_filters",
+        ok=bool(run_context["exchange_filters_available"]),
+        message="Controlled submit requires real exchange filters validation.",
+        required_for=("submit",),
+        details={"exchange_filters_available": run_context["exchange_filters_available"]},
+    )
+    _append_check(
+        checks,
         check_id="exchange_state_present",
         ok=isinstance(exchange_state, dict) and bool(exchange_state),
         message="crypto_testnet/binance_testnet_exchange_state.json must exist.",
         required_for=("dry_run", "submit"),
+    )
+    _append_check(
+        checks,
+        check_id="submit_requires_exchange_reconciliation",
+        ok=bool(run_context["exchange_reconciliation_available"]),
+        message="Controlled submit requires real exchange reconciliation.",
+        required_for=("submit",),
+        details={
+            "exchange_reconciliation_available": run_context["exchange_reconciliation_available"],
+            "account_checked": exchange_state.get("account_checked"),
+            "open_orders_checked": exchange_state.get("open_orders_checked"),
+        },
     )
     _append_check(
         checks,
@@ -224,7 +291,7 @@ def evaluate_crypto_testnet_readiness(
         "paper_only": True,
         "live_trading": False,
         "testnet": True,
-        "status": "READY" if submit_ready else "NOT_READY",
+        "status": "READY" if dry_run_ready else "NOT_READY",
         "dry_run_ready": bool(dry_run_ready),
         "submit_ready": bool(submit_ready),
         "next_allowed_mode": (
@@ -251,6 +318,11 @@ def evaluate_crypto_testnet_readiness(
             "testnet_status": testnet_result.get("severity") or testnet_result.get("category"),
             "reconciliation_mismatch_count": mismatch_count,
             "testnet_order_test_only": testnet_result.get("order_test_only"),
+            "testnet_run_mode": run_context["mode"],
+            "connected_client_available": run_context["connected_client_available"],
+            "server_time_available": run_context["server_time_available"],
+            "exchange_filters_available": run_context["exchange_filters_available"],
+            "exchange_reconciliation_available": run_context["exchange_reconciliation_available"],
         },
         "warnings": [
             check["message"]
@@ -268,6 +340,51 @@ def evaluate_crypto_testnet_readiness(
     atomic_write_json(target_path, readiness)
     readiness["artifact_path"] = str(target_path)
     return readiness
+
+
+def _derive_testnet_run_context(
+    *,
+    testnet_result: Any,
+    exchange_state: Any,
+) -> dict[str, Any]:
+    result = testnet_result if isinstance(testnet_result, dict) else {}
+    state = exchange_state if isinstance(exchange_state, dict) else {}
+    warnings = [str(item or "").strip().lower() for item in list(result.get("warnings") or [])]
+    time_sync = result.get("time_sync") or {}
+    server_time_available = bool(isinstance(time_sync, dict) and time_sync.get("checked"))
+    exchange_filters_available = not any(
+        warning.startswith("exchange_filters_unavailable:")
+        for warning in warnings
+    )
+    exchange_reconciliation_available = bool(
+        state.get("account_checked") and state.get("open_orders_checked")
+    ) and str(state.get("reason") or "").strip().lower() != "no_client"
+    connected_client_available = bool(
+        server_time_available
+        or exchange_reconciliation_available
+        or str(result.get("api_key_masked") or "").strip()
+    )
+    local_dry_run_no_client = bool(
+        result.get("dry_run")
+        and not connected_client_available
+        and (
+            any(item in warnings for item in _NO_CLIENT_UNAVAILABLE_PREFIXES)
+            or str(state.get("reason") or "").strip().lower() == "no_client"
+        )
+    )
+    mode = (
+        "TESTNET_DRY_RUN_LOCAL"
+        if local_dry_run_no_client
+        else ("TESTNET_CONNECTED" if connected_client_available else "TESTNET_UNKNOWN")
+    )
+    return {
+        "mode": mode,
+        "local_dry_run_no_client": local_dry_run_no_client,
+        "connected_client_available": connected_client_available,
+        "server_time_available": server_time_available,
+        "exchange_filters_available": exchange_filters_available,
+        "exchange_reconciliation_available": exchange_reconciliation_available,
+    }
 
 
 def _append_check(

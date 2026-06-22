@@ -284,6 +284,81 @@ class CryptoOperationalStatusTests(unittest.TestCase):
         self.assertEqual(result["final_decision"], "DO_NOT_RUN")
         self.assertIn("testnet_result_base_url_not_testnet", result["blocking_reasons"])
 
+    def test_local_dry_run_no_client_warnings_do_not_block(self) -> None:
+        recent = (self.now - timedelta(minutes=5)).isoformat()
+        self._seed_base(
+            semantic_status="DEGRADED",
+            dashboard_status="DEGRADED",
+            readiness_status="READY",
+            dry_run_ready=True,
+            submit_ready=False,
+            next_allowed_mode="order_test_only_or_dry_run",
+            readiness_warnings=[
+                "Controlled submit requires a connected Binance Spot Testnet client.",
+                "Controlled submit requires real server time validation.",
+                "Controlled submit requires real exchange filters validation.",
+                "Controlled submit requires real exchange reconciliation.",
+            ],
+            testnet_result={
+                "ok": True,
+                "severity": "INFO",
+                "base_url": "https://testnet.binance.vision",
+                "dry_run": True,
+                "submit_attempted": False,
+                "warnings": [
+                    "server_time_unavailable:no_client",
+                    "exchange_filters_unavailable:no_client",
+                    "exchange_reconciliation_unavailable:no_client",
+                ],
+                "time_sync": {"checked": False, "warnings": ["server_time_unavailable:no_client"]},
+                "heartbeat": {"last_updated_at": recent, "status": "SUCCESS"},
+            },
+        )
+        result = evaluate_crypto_operational_status(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            ops_artifacts_dir=self.ops_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["overall_status"], "DEGRADED")
+        self.assertEqual(result["final_decision"], "TESTNET_DRY_RUN_ALLOWED")
+        self.assertEqual(result["blocking_reasons"], [])
+        self.assertIn("server_time_unavailable:no_client", result["warnings"])
+        self.assertIn("exchange_filters_unavailable:no_client", result["warnings"])
+        self.assertIn("exchange_reconciliation_unavailable:no_client", result["warnings"])
+
+    def test_connected_mode_no_client_warnings_block(self) -> None:
+        recent = (self.now - timedelta(minutes=5)).isoformat()
+        self._seed_base(
+            readiness_status="NOT_READY",
+            dry_run_ready=False,
+            submit_ready=False,
+            next_allowed_mode="blocked",
+            testnet_result={
+                "ok": True,
+                "severity": "INFO",
+                "base_url": "https://testnet.binance.vision",
+                "dry_run": False,
+                "submit_attempted": False,
+                "warnings": [
+                    "server_time_unavailable:no_client",
+                    "exchange_filters_unavailable:no_client",
+                    "exchange_reconciliation_unavailable:no_client",
+                ],
+                "time_sync": {"checked": False, "warnings": ["server_time_unavailable:no_client"]},
+                "heartbeat": {"last_updated_at": recent, "status": "SUCCESS"},
+            },
+        )
+        result = evaluate_crypto_operational_status(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            ops_artifacts_dir=self.ops_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["overall_status"], "BLOCKED")
+        self.assertEqual(result["final_decision"], "DO_NOT_RUN")
+        self.assertTrue(any(reason.startswith("hard_warning:exchange_filters_unavailable:no_client") for reason in result["blocking_reasons"]))
+
     def test_stale_heartbeat_blocks_testnet(self) -> None:
         stale = (self.now - timedelta(hours=2)).isoformat()
         self._seed_base(readiness_recent=stale)

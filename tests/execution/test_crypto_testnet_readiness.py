@@ -84,7 +84,9 @@ class CryptoTestnetReadinessTests(unittest.TestCase):
                 "severity": "INFO",
                 "category": "NO_ACTION",
                 "base_url": "https://testnet.binance.vision",
+                "api_key_masked": "****abcd",
                 "order_test_only": True,
+                "time_sync": {"checked": True, "skew_ms": 0, "warnings": []},
                 "heartbeat": {
                     "run_id": "testnet-20260517-145500",
                     "last_updated_at": recent,
@@ -96,6 +98,8 @@ class CryptoTestnetReadinessTests(unittest.TestCase):
             self.testnet_dir / "binance_testnet_exchange_state.json",
             {
                 "checked_at": recent,
+                "account_checked": True,
+                "open_orders_checked": True,
                 "mismatches": [],
                 "mismatch_details": [],
                 "reconciliation_summary": {
@@ -208,6 +212,132 @@ class CryptoTestnetReadinessTests(unittest.TestCase):
         self.assertTrue(result["submit_ready"])
         self.assertEqual(result["next_allowed_mode"], "controlled_submit")
         self.assertTrue((self.testnet_dir / "crypto_testnet_readiness.json").exists())
+
+    def test_local_dry_run_no_client_allows_dry_run_but_not_submit(self) -> None:
+        self._seed_healthy()
+        recent = (self.now - timedelta(minutes=5)).isoformat()
+        self._write(
+            self.testnet_dir / "binance_testnet_execution_result.json",
+            {
+                "run_id": "testnet-20260517-145500",
+                "ok": True,
+                "severity": "INFO",
+                "category": "NO_ACTION",
+                "base_url": "https://testnet.binance.vision",
+                "order_test_only": True,
+                "dry_run": True,
+                "submit_attempted": False,
+                "warnings": [
+                    "server_time_unavailable:no_client",
+                    "exchange_filters_unavailable:no_client",
+                    "exchange_reconciliation_unavailable:no_client",
+                ],
+                "time_sync": {"checked": False, "warnings": ["server_time_unavailable:no_client"]},
+                "heartbeat": {
+                    "run_id": "testnet-20260517-145500",
+                    "last_updated_at": recent,
+                    "status": "SUCCESS",
+                },
+            },
+        )
+        self._write(
+            self.testnet_dir / "binance_testnet_exchange_state.json",
+            {
+                "checked_at": recent,
+                "reason": "no_client",
+                "account_checked": False,
+                "open_orders_checked": False,
+                "mismatches": [],
+                "mismatch_details": [],
+                "reconciliation_summary": {
+                    "count": 0,
+                    "blocking_count": 0,
+                    "highest_severity": "INFO",
+                    "counts_by_severity": {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0},
+                    "counts_by_level": {
+                        "tolerable_drift": 0,
+                        "warning": 0,
+                        "error": 0,
+                        "critical_hard_stop": 0,
+                    },
+                },
+            },
+        )
+        result = evaluate_crypto_testnet_readiness(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["dry_run_ready"])
+        self.assertFalse(result["submit_ready"])
+        self.assertEqual(result["next_allowed_mode"], "order_test_only_or_dry_run")
+        failed = {item["check_id"] for item in result["checks"] if not item["ok"]}
+        self.assertIn("submit_requires_connected_client", failed)
+        self.assertIn("submit_requires_server_time_validation", failed)
+        self.assertIn("submit_requires_exchange_filters", failed)
+        self.assertIn("submit_requires_exchange_reconciliation", failed)
+
+    def test_connected_mode_without_client_blocks_readiness(self) -> None:
+        self._seed_healthy()
+        recent = (self.now - timedelta(minutes=5)).isoformat()
+        self._write(
+            self.testnet_dir / "binance_testnet_execution_result.json",
+            {
+                "run_id": "testnet-20260517-145500",
+                "ok": True,
+                "severity": "INFO",
+                "category": "NO_ACTION",
+                "base_url": "https://testnet.binance.vision",
+                "order_test_only": True,
+                "dry_run": False,
+                "submit_attempted": False,
+                "warnings": [
+                    "server_time_unavailable:no_client",
+                    "exchange_filters_unavailable:no_client",
+                    "exchange_reconciliation_unavailable:no_client",
+                ],
+                "time_sync": {"checked": False, "warnings": ["server_time_unavailable:no_client"]},
+                "heartbeat": {
+                    "run_id": "testnet-20260517-145500",
+                    "last_updated_at": recent,
+                    "status": "SUCCESS",
+                },
+            },
+        )
+        self._write(
+            self.testnet_dir / "binance_testnet_exchange_state.json",
+            {
+                "checked_at": recent,
+                "reason": "no_client",
+                "account_checked": False,
+                "open_orders_checked": False,
+                "mismatches": [],
+                "mismatch_details": [],
+                "reconciliation_summary": {
+                    "count": 0,
+                    "blocking_count": 0,
+                    "highest_severity": "INFO",
+                    "counts_by_severity": {"INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0},
+                    "counts_by_level": {
+                        "tolerable_drift": 0,
+                        "warning": 0,
+                        "error": 0,
+                        "critical_hard_stop": 0,
+                    },
+                },
+            },
+        )
+        result = evaluate_crypto_testnet_readiness(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            now=self.now,
+        )
+        self.assertEqual(result["status"], "NOT_READY")
+        self.assertFalse(result["dry_run_ready"])
+        self.assertFalse(result["submit_ready"])
+        failed = {item["check_id"] for item in result["checks"] if not item["ok"]}
+        self.assertIn("testnet_client_context_valid", failed)
 
     def test_readiness_output_does_not_include_secrets(self) -> None:
         self._seed_healthy()

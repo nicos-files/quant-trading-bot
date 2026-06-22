@@ -97,13 +97,17 @@ class CryptoTestnetDryRunTests(unittest.TestCase):
                 "severity": "INFO",
                 "category": "NO_ACTION",
                 "base_url": "https://testnet.binance.vision",
+                "api_key_masked": "****abcd",
                 "order_test_only": True,
+                "time_sync": {"checked": True, "skew_ms": 0, "warnings": []},
                 "heartbeat": {"last_updated_at": recent, "status": "SUCCESS"},
             },
         )
         self._write(
             self.testnet_dir / "binance_testnet_exchange_state.json",
             {
+                "account_checked": True,
+                "open_orders_checked": True,
                 "reconciliation_summary": {
                     "count": 0,
                     "blocking_count": 0,

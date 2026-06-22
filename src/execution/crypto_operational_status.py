@@ -25,6 +25,12 @@ _BENIGN_PAPER_WARNING_TOKENS: tuple[str, ...] = (
     "no closed trades available",
 )
 
+_NO_CLIENT_UNAVAILABLE_PREFIXES: tuple[str, ...] = (
+    "server_time_unavailable:no_client",
+    "exchange_filters_unavailable:no_client",
+    "exchange_reconciliation_unavailable:no_client",
+)
+
 def evaluate_crypto_operational_status(
     *,
     paper_artifacts_dir: str | Path,
@@ -295,7 +301,7 @@ def _blocked_reasons(
         reasons.append(f"telegram_status:{telegram_status}")
     if testnet_readiness_status == "UNKNOWN":
         reasons.append("testnet_readiness_unknown")
-    reasons.extend(_hard_warning_reasons(warnings))
+    reasons.extend(_hard_warning_reasons(warnings, testnet_result=testnet_result))
     reasons.extend(_testnet_result_blockers(testnet_result))
     return _dedupe(reasons)
 
@@ -319,7 +325,7 @@ def _degraded_reasons(
         reasons.append("dashboard_degraded")
     if telegram_status == "DEGRADED":
         reasons.append(f"telegram_status:{telegram_status}")
-    if testnet_readiness_status == "NOT_READY" and dry_run_ready and not submit_ready:
+    if dry_run_ready and not submit_ready:
         reasons.append("testnet_submit_not_ready_dry_run_only")
     elif testnet_readiness_status == "NOT_READY":
         reasons.append("testnet_not_ready_paper_only")
@@ -341,14 +347,24 @@ def _allowed_decision(
     return "PAPER_ONLY"
 
 
-def _hard_warning_reasons(warnings: list[str]) -> list[str]:
+def _hard_warning_reasons(
+    warnings: list[str],
+    *,
+    testnet_result: Any,
+) -> list[str]:
     reasons: list[str] = []
+    local_dry_run_no_client = _is_local_testnet_dry_run_no_client(testnet_result)
     for warning in warnings:
         raw = str(warning or "").strip()
         normalized = raw.lower()
         if not normalized:
             continue
         if _is_benign_paper_warning(normalized):
+            continue
+        if (
+            local_dry_run_no_client
+            and any(normalized.startswith(prefix) for prefix in _NO_CLIENT_UNAVAILABLE_PREFIXES)
+        ):
             continue
         if "id_collision_with_diff_content" in normalized:
             reasons.append(f"hard_warning:{raw}")
@@ -378,6 +394,25 @@ def _hard_warning_reasons(warnings: list[str]) -> list[str]:
 
 def _is_benign_paper_warning(normalized_warning: str) -> bool:
     return any(token in normalized_warning for token in _BENIGN_PAPER_WARNING_TOKENS)
+
+
+def _is_local_testnet_dry_run_no_client(testnet_result: Any) -> bool:
+    if not isinstance(testnet_result, dict) or not testnet_result:
+        return False
+    warnings = [
+        str(item or "").strip().lower()
+        for item in list(testnet_result.get("warnings") or [])
+    ]
+    time_sync = testnet_result.get("time_sync") or {}
+    connected_client_available = bool(
+        (isinstance(time_sync, dict) and time_sync.get("checked"))
+        or str(testnet_result.get("api_key_masked") or "").strip()
+    )
+    return bool(
+        testnet_result.get("dry_run")
+        and not connected_client_available
+        and any(item in warnings for item in _NO_CLIENT_UNAVAILABLE_PREFIXES)
+    )
 
 
 def _testnet_result_blockers(testnet_result: Any) -> list[str]:
