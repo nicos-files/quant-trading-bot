@@ -182,6 +182,40 @@ class CryptoPaperSemanticsTests(unittest.TestCase):
         self.assertIn("small_sample_size:closed_trades=3_below_min_30", " ".join(result["summary"]["warnings"]))
         self.assertIn("WARNING", self._types(result["events"]))
 
+    def test_small_future_quote_skew_stays_warning(self) -> None:
+        self._write(
+            "paper_forward/crypto_paper_forward_result.json",
+            {
+                "status": "SUCCESS",
+                "warnings": ["quote_invalid:timestamp_in_future:-4.696s:BTCUSDT"],
+            },
+        )
+        result = self._build()
+        event = next(
+            e for e in result["events"]
+            if e.get("failure_reason") == "quote_invalid:timestamp_in_future:-4.696s:BTCUSDT"
+        )
+        self.assertEqual(event["severity"], "WARNING")
+        self.assertEqual(result["summary"]["operational_status"], "DEGRADED")
+        self.assertEqual(result["summary"]["events_count_by_severity"]["ERROR"], 0)
+
+    def test_large_future_quote_skew_remains_error(self) -> None:
+        self._write(
+            "paper_forward/crypto_paper_forward_result.json",
+            {
+                "status": "SUCCESS",
+                "warnings": ["quote_invalid:timestamp_in_future:-30.000s:BTCUSDT"],
+            },
+        )
+        result = self._build()
+        event = next(
+            e for e in result["events"]
+            if e.get("failure_reason") == "quote_invalid:timestamp_in_future:-30.000s:BTCUSDT"
+        )
+        self.assertEqual(event["severity"], "ERROR")
+        self.assertEqual(result["summary"]["operational_status"], "ERROR")
+        self.assertEqual(result["summary"]["events_count_by_severity"]["ERROR"], 1)
+
     def test_summary_is_json_serializable(self) -> None:
         position = {
             "symbol": "BTCUSDT",

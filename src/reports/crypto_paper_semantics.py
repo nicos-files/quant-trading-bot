@@ -129,6 +129,7 @@ _LOCAL_TZ_ABBREV: dict[str, str] = {
 }
 
 PAPER_DISCLAIMER = "Paper-only / manual-review only. Not auto-executed."
+_BENIGN_FUTURE_QUOTE_SKEW_SECONDS = 10.0
 
 _SUMMARY_FILENAME = "crypto_semantic_summary.json"
 _EVENTS_FILENAME = "crypto_semantic_events.json"
@@ -1511,9 +1512,24 @@ def _classified_warning_severity(text: str) -> str:
     raw = str(text or "").lower()
     if any(token in raw for token in ("ledger_state_corrupt", "snapshot_artifact_unreadable", "positions_artifact_unreadable")):
         return "CRITICAL"
+    future_skew_seconds = _extract_future_quote_skew_seconds(raw)
+    if future_skew_seconds is not None and future_skew_seconds <= _BENIGN_FUTURE_QUOTE_SKEW_SECONDS:
+        return "WARNING"
     if any(token in raw for token in ("quote_invalid", "data_invalid", "server_time_skew_exceeds_recv_window", "previous_exchange_reconciliation_mismatch", "open_order_limit_exceeded", "exchange_filter", "min_notional_violation", "quantity_step_mismatch", "price_tick_mismatch", "broker_error", "insufficient balance", "insufficient_balance")):
         return "ERROR"
     return "WARNING"
+
+
+def _extract_future_quote_skew_seconds(text: str) -> float | None:
+    prefix = "quote_invalid:timestamp_in_future:"
+    if not text.startswith(prefix):
+        return None
+    remainder = text[len(prefix) :]
+    seconds_text = remainder.split(":", 1)[0].rstrip("s")
+    try:
+        return abs(float(seconds_text))
+    except (TypeError, ValueError):
+        return None
 
 
 def _classified_warning_category(text: str) -> str:
