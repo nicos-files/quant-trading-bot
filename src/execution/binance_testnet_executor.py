@@ -68,6 +68,7 @@ from src.utils.atomic_io import atomic_write_json
 
 ENABLE_FLAG = "ENABLE_BINANCE_TESTNET_EXECUTION"
 ORDER_TEST_ONLY_FLAG = "BINANCE_TESTNET_ORDER_TEST_ONLY"
+CONFIRM_SUBMIT_ENV = "BINANCE_TESTNET_CONFIRM_SUBMIT"
 BASE_URL_ENV = "BINANCE_TESTNET_BASE_URL"
 MAX_NOTIONAL_ENV = "BINANCE_TESTNET_MAX_NOTIONAL"
 ALLOWED_SYMBOLS_ENV = "BINANCE_TESTNET_ALLOWED_SYMBOLS"
@@ -89,6 +90,9 @@ _EXCHANGE_STATE_FILENAME = "binance_testnet_exchange_state.json"
 _RESULT_FILENAME = "binance_testnet_execution_result.json"
 _STATE_FILENAME = "binance_testnet_state.json"
 _KILL_SWITCH_FILENAME = "binance_testnet_kill_switch.json"
+_READINESS_FILENAME = "crypto_testnet_readiness.json"
+_OPS_SUBDIR = "crypto_ops"
+_OPS_STATUS_FILENAME = "crypto_operational_status.json"
 
 _ACTIONABLE_EVENT_TYPES: frozenset[str] = frozenset(
     {"BUY_FILLED_PAPER", "TAKE_PROFIT", "STOP_LOSS"}
@@ -263,6 +267,31 @@ def run_binance_testnet_execution(
             run_id=run_id,
             moment=moment,
             phase="previous_reconciliation_gate",
+            status="BLOCKED",
+        )
+        _write_result(testnet_root, base_result)
+        return base_result
+
+    submit_guard_block = _check_submit_guard_gate(
+        source_env=source_env,
+        paper_root=paper_root,
+        testnet_root=testnet_root,
+        order_test_only=config.order_test_only,
+        dry_run=bool(dry_run),
+    )
+    if submit_guard_block is not None:
+        base_result["reason"] = submit_guard_block
+        _annotate_result(
+            base_result,
+            category="TESTNET_SUBMIT_FAILED",
+            severity="CRITICAL",
+            action_taken="testnet_submit_blocked",
+            submit_attempted=False,
+        )
+        base_result["heartbeat"] = _build_testnet_heartbeat(
+            run_id=run_id,
+            moment=moment,
+            phase="submit_guard_gate",
             status="BLOCKED",
         )
         _write_result(testnet_root, base_result)
@@ -708,6 +737,39 @@ def _check_open_order_limit(
         result["reason"] = f"open_order_limit_exceeded:{count}>{limit}"
         result["warnings"].append(result["reason"])
     return result
+
+
+def _check_submit_guard_gate(
+    *,
+    source_env: Mapping[str, str],
+    paper_root: Path,
+    testnet_root: Path,
+    order_test_only: bool,
+    dry_run: bool,
+) -> str | None:
+    if order_test_only or dry_run:
+        return None
+    if str(source_env.get(CONFIRM_SUBMIT_ENV) or "").strip() != "YES":
+        return f"missing_{CONFIRM_SUBMIT_ENV.lower()}:require_exact_value_YES"
+
+    readiness = _load_json_safe(testnet_root / _READINESS_FILENAME, default={})
+    if not isinstance(readiness, Mapping):
+        return "submit_readiness_artifact_missing_or_invalid"
+    if str(readiness.get("status") or "").upper() != "READY":
+        return f"submit_readiness_not_ready:{readiness.get('status')}"
+
+    operational = _load_json_safe(
+        paper_root.parent / _OPS_SUBDIR / _OPS_STATUS_FILENAME,
+        default={},
+    )
+    if not isinstance(operational, Mapping):
+        return "submit_operational_status_missing_or_invalid"
+    if str(operational.get("final_decision") or "").upper() != "TESTNET_SUBMIT_ALLOWED":
+        return f"submit_operational_decision_blocked:{operational.get('final_decision')}"
+    blocking_reasons = operational.get("blocking_reasons")
+    if isinstance(blocking_reasons, list) and blocking_reasons:
+        return f"submit_operational_blocking_reasons_present:{len(blocking_reasons)}"
+    return None
 
 
 def _perform_time_sync(
@@ -1885,6 +1947,7 @@ __all__ = [
     "KILL_SWITCH_ENV",
     "KILL_SWITCH_PATH_ENV",
     "MAX_NOTIONAL_ENV",
+    "CONFIRM_SUBMIT_ENV",
     "MAX_OPEN_ORDERS_ENV",
     "ORDER_TEST_ONLY_FLAG",
     "build_client_order_id",

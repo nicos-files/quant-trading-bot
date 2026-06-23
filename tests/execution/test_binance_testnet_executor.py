@@ -31,6 +31,7 @@ from src.execution.binance_testnet_executor import (
     ARTIFACTS_SUBDIR,
     BASE_URL_ENV,
     BLOCK_ON_PREVIOUS_MISMATCH_ENV,
+    CONFIRM_SUBMIT_ENV,
     DEFAULT_ALLOWED_SYMBOLS,
     DEFAULT_MAX_NOTIONAL,
     ENABLE_FLAG,
@@ -239,6 +240,34 @@ class _ExecutorTestCase(unittest.TestCase):
             json.dumps(payload),
             encoding="utf-8",
         )
+
+    def _write_submit_ready_artifacts(self) -> None:
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        (self.testnet_dir / "crypto_testnet_readiness.json").write_text(
+            json.dumps({
+                "status": "READY",
+                "dry_run_ready": True,
+                "submit_ready": True,
+                "warnings": [],
+            }),
+            encoding="utf-8",
+        )
+        ops_dir = self.paper_dir.parent / "crypto_ops"
+        ops_dir.mkdir(parents=True, exist_ok=True)
+        (ops_dir / "crypto_operational_status.json").write_text(
+            json.dumps({
+                "final_decision": "TESTNET_SUBMIT_ALLOWED",
+                "blocking_reasons": [],
+                "dry_run_ready": True,
+                "submit_ready": True,
+            }),
+            encoding="utf-8",
+        )
+
+    def _submit_env(self, **overrides: str) -> dict[str, str]:
+        base = _testnet_env(**{ORDER_TEST_ONLY_FLAG: "0", CONFIRM_SUBMIT_ENV: "YES"})
+        base.update(overrides)
+        return base
 
     def _buy_event(
         self,
@@ -597,6 +626,102 @@ class CurrentPaperRunFilteringTests(_ExecutorTestCase):
         )
 
 
+class SubmitGuardGateTests(_ExecutorTestCase):
+    def test_real_submit_mode_requires_explicit_confirm_flag(self) -> None:
+        self._write_events([self._buy_event()])
+        self._write_submit_ready_artifacts()
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("missing_binance_testnet_confirm_submit", result["reason"])
+        self.assertEqual(result["category"], "TESTNET_SUBMIT_FAILED")
+        self.assertEqual(result["heartbeat"]["phase"], "submit_guard_gate")
+        self.assertEqual(client.place_order_calls, [])
+
+    def test_real_submit_mode_allows_progress_with_confirm_and_ready_state(self) -> None:
+        self._write_events([self._buy_event()])
+        self._write_submit_ready_artifacts()
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=self._submit_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(client.place_order_calls), 1)
+
+    def test_order_test_only_mode_does_not_require_confirm(self) -> None:
+        self._write_events([self._buy_event()])
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_testnet_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(client.order_test_calls), 1)
+
+    def test_real_submit_mode_blocks_when_readiness_not_ready(self) -> None:
+        self._write_events([self._buy_event()])
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        (self.testnet_dir / "crypto_testnet_readiness.json").write_text(
+            json.dumps({"status": "NOT_READY", "dry_run_ready": True, "submit_ready": False, "warnings": ["not ready"]}),
+            encoding="utf-8",
+        )
+        ops_dir = self.paper_dir.parent / "crypto_ops"
+        ops_dir.mkdir(parents=True, exist_ok=True)
+        (ops_dir / "crypto_operational_status.json").write_text(
+            json.dumps({"final_decision": "TESTNET_SUBMIT_ALLOWED", "blocking_reasons": []}),
+            encoding="utf-8",
+        )
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=self._submit_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("submit_readiness_not_ready", result["reason"])
+        self.assertEqual(client.place_order_calls, [])
+
+    def test_real_submit_mode_blocks_when_operational_decision_not_ready(self) -> None:
+        self._write_events([self._buy_event()])
+        self.testnet_dir.mkdir(parents=True, exist_ok=True)
+        (self.testnet_dir / "crypto_testnet_readiness.json").write_text(
+            json.dumps({"status": "READY", "dry_run_ready": True, "submit_ready": True, "warnings": []}),
+            encoding="utf-8",
+        )
+        ops_dir = self.paper_dir.parent / "crypto_ops"
+        ops_dir.mkdir(parents=True, exist_ok=True)
+        (ops_dir / "crypto_operational_status.json").write_text(
+            json.dumps({"final_decision": "DO_NOT_RUN", "blocking_reasons": ["semantic_status:ERROR"]}),
+            encoding="utf-8",
+        )
+        client = _FakeClient()
+        result = run_binance_testnet_execution(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=self._submit_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("submit_operational_decision_blocked", result["reason"])
+        self.assertEqual(client.place_order_calls, [])
+
+
 class OrderTestModeTests(_ExecutorTestCase):
     def test_buy_event_in_order_test_mode_calls_order_test_only(self) -> None:
         self._write_events([self._buy_event()])
@@ -645,11 +770,12 @@ class OrderTestModeTests(_ExecutorTestCase):
 class RealPlaceOrderModeTests(_ExecutorTestCase):
     def test_real_mode_calls_place_order_and_records_fill(self) -> None:
         self._write_events([self._buy_event()])
+        self._write_submit_ready_artifacts()
         client = _FakeClient()
         result = run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client,
             now=self.now,
         )
@@ -796,12 +922,13 @@ class ExchangeFilterValidationTests(_ExecutorTestCase):
 class IdempotencyTests(_ExecutorTestCase):
     def test_same_event_id_is_skipped_on_second_run(self) -> None:
         events = [self._buy_event()]
+        self._write_submit_ready_artifacts()
         self._write_events(events)
         client_a = _FakeClient()
         run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client_a,
             now=self.now,
         )
@@ -812,7 +939,7 @@ class IdempotencyTests(_ExecutorTestCase):
         result = run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client_b,
             now=self.now,
         )
@@ -822,12 +949,13 @@ class IdempotencyTests(_ExecutorTestCase):
 
     def test_new_event_after_dedupe_state_still_runs(self) -> None:
         # First run: BUY only.
+        self._write_submit_ready_artifacts()
         self._write_events([self._buy_event()])
         client_a = _FakeClient()
         run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client_a,
             now=self.now,
         )
@@ -839,7 +967,7 @@ class IdempotencyTests(_ExecutorTestCase):
         result = run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client_b,
             now=self.now,
         )
@@ -868,11 +996,12 @@ class IdempotencyTests(_ExecutorTestCase):
 class ArtifactIsolationTests(_ExecutorTestCase):
     def test_testnet_artifacts_written_to_separate_dir(self) -> None:
         self._write_events([self._buy_event()])
+        self._write_submit_ready_artifacts()
         client = _FakeClient()
         run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client,
             now=self.now,
         )
@@ -943,6 +1072,7 @@ class ReconciliationTests(_ExecutorTestCase):
 
     def test_exchange_state_artifact_captures_account_and_open_orders(self) -> None:
         self._write_events([self._buy_event()])
+        self._write_submit_ready_artifacts()
         client = _FakeClient(
             open_orders_response=[
                 {
@@ -959,7 +1089,7 @@ class ReconciliationTests(_ExecutorTestCase):
         result = run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client,
             now=self.now,
         )
@@ -974,6 +1104,7 @@ class ReconciliationTests(_ExecutorTestCase):
 
     def test_reconciliation_flags_filled_order_still_open_mismatch(self) -> None:
         self._write_events([self._buy_event()])
+        self._write_submit_ready_artifacts()
         open_client_order_id = build_client_order_id(self._buy_event())
         client = _FakeClient(
             open_orders_response=[
@@ -991,7 +1122,7 @@ class ReconciliationTests(_ExecutorTestCase):
         result = run_binance_testnet_execution(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
-            env=_testnet_env(**{ORDER_TEST_ONLY_FLAG: "0"}),
+            env=self._submit_env(),
             client=client,
             now=self.now,
         )
