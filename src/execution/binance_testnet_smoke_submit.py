@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,10 +20,7 @@ from src.execution.binance_testnet_executor import (
     ARTIFACTS_SUBDIR,
     BASE_URL_ENV,
     CONFIRM_SUBMIT_ENV,
-    DEFAULT_QUOTE,
     ENABLE_FLAG,
-    KILL_SWITCH_ENV,
-    KILL_SWITCH_PATH_ENV,
     MAX_NOTIONAL_ENV,
     MAX_OPEN_ORDERS_ENV,
     ORDER_TEST_ONLY_FLAG,
@@ -33,13 +31,13 @@ from src.execution.binance_testnet_executor import (
     _check_open_order_limit,
     _check_previous_exchange_state_gate,
     _check_submit_guard_gate,
-    _derive_positions,
     _load_exchange_filters,
     _load_json_safe,
     _perform_time_sync,
     _previous_mismatch_gate_severity,
     _reconcile_exchange_state,
     _resolve_config,
+    _summarize_exchange_mismatch_details,
     _validate_order_against_exchange_filters,
     _with_confirmed_status,
     _write_json,
@@ -106,10 +104,17 @@ def run_binance_testnet_smoke_submit(
         },
     }
 
-    def _block(reason: str, *, category: str = "TESTNET_SUBMIT_FAILED", severity: str = "CRITICAL", phase: str = "blocked") -> dict[str, Any]:
+    def _block(
+        reason: str,
+        *,
+        category: str = "TESTNET_SUBMIT_FAILED",
+        severity: str = "CRITICAL",
+        phase: str = "blocked",
+    ) -> dict[str, Any]:
         result["reason"] = reason
         result["status"] = "BLOCKED"
         result["blocking_reasons"] = [reason]
+        result["warnings"] = _dedupe_warnings(list(result.get("warnings") or []))
         _annotate_result(
             result,
             category=category,
@@ -127,15 +132,31 @@ def run_binance_testnet_smoke_submit(
         return result
 
     if str(source_env.get(ENABLE_FLAG) or "").strip() != "1":
-        return _block(f"{ENABLE_FLAG} is not '1'. Testnet execution disabled.", severity="ERROR", phase="enable_gate")
+        return _block(
+            f"{ENABLE_FLAG} is not '1'. Testnet execution disabled.",
+            severity="ERROR",
+            phase="enable_gate",
+        )
     if not is_testnet_base_url(config.base_url):
-        return _block(f"Refusing non-testnet base URL: {config.base_url!r}", phase="base_url_gate")
+        return _block(
+            f"Refusing non-testnet base URL: {config.base_url!r}",
+            phase="base_url_gate",
+        )
     if config.order_test_only:
-        return _block("smoke_submit_requires_order_test_only_zero", phase="order_test_only_gate")
+        return _block(
+            "smoke_submit_requires_order_test_only_zero",
+            phase="order_test_only_gate",
+        )
     if str(source_env.get(CONFIRM_SUBMIT_ENV) or "").strip() != "YES":
-        return _block(f"missing_{CONFIRM_SUBMIT_ENV.lower()}:require_exact_value_YES", phase="confirm_submit_gate")
+        return _block(
+            f"missing_{CONFIRM_SUBMIT_ENV.lower()}:require_exact_value_YES",
+            phase="confirm_submit_gate",
+        )
     if tuple(config.allowed_symbols) != (SMOKE_SYMBOL,):
-        return _block("smoke_submit_requires_allowed_symbols_btcusdt_only", phase="allowed_symbols_gate")
+        return _block(
+            "smoke_submit_requires_allowed_symbols_btcusdt_only",
+            phase="allowed_symbols_gate",
+        )
     if config.max_notional_per_order <= 0 or config.max_notional_per_order > _MAX_ALLOWED_SMOKE_NOTIONAL:
         return _block(
             f"smoke_submit_max_notional_out_of_bounds:{config.max_notional_per_order}>{_MAX_ALLOWED_SMOKE_NOTIONAL}",
@@ -143,11 +164,18 @@ def run_binance_testnet_smoke_submit(
         )
     raw_open_order_limit = str(source_env.get(MAX_OPEN_ORDERS_ENV) or "").strip()
     if raw_open_order_limit != "1":
-        return _block("smoke_submit_requires_max_open_orders_equals_1", phase="open_order_limit_gate")
+        return _block(
+            "smoke_submit_requires_max_open_orders_equals_1",
+            phase="open_order_limit_gate",
+        )
 
     kill_switch_block = _check_kill_switch(source_env=source_env, testnet_root=testnet_root)
     if kill_switch_block is not None:
-        return _block(kill_switch_block, category="TESTNET_KILL_SWITCH", phase="kill_switch_gate")
+        return _block(
+            kill_switch_block,
+            category="TESTNET_KILL_SWITCH",
+            phase="kill_switch_gate",
+        )
 
     previous_exchange_state = _load_json_safe(
         testnet_root / "binance_testnet_exchange_state.json",
@@ -235,6 +263,7 @@ def run_binance_testnet_smoke_submit(
         warnings=result["warnings"],
         run_id=run_id,
     )
+    result["pre_submit_exchange_state"] = deepcopy(pre_exchange_state)
     result["pre_reconciliation_summary"] = dict(pre_exchange_state.get("reconciliation_summary") or {})
     result["pre_open_orders_count"] = int(((pre_exchange_state.get("open_orders") or {}).get("count") or 0))
     if result["pre_open_orders_count"] != 0:
@@ -260,7 +289,10 @@ def run_binance_testnet_smoke_submit(
         )
 
     try:
-        requested_notional = _resolve_smoke_notional(symbol_filters=symbol_filters, max_notional=config.max_notional_per_order)
+        requested_notional = _resolve_smoke_notional(
+            symbol_filters=symbol_filters,
+            max_notional=config.max_notional_per_order,
+        )
     except ValueError as exc:
         return _block(str(exc), category="EXCHANGE_FILTER_REJECT", severity="ERROR", phase="notional_gate")
     result["requested_notional"] = requested_notional
@@ -291,7 +323,12 @@ def run_binance_testnet_smoke_submit(
         symbol_filters=symbol_filters,
     )
     if filter_rejection is not None:
-        return _block(filter_rejection, category="EXCHANGE_FILTER_REJECT", severity="ERROR", phase="exchange_filters_gate")
+        return _block(
+            filter_rejection,
+            category="EXCHANGE_FILTER_REJECT",
+            severity="ERROR",
+            phase="exchange_filters_gate",
+        )
 
     try:
         broker_response, mode, fill = _call_broker(client=client, config=config, order=order)
@@ -302,48 +339,96 @@ def run_binance_testnet_smoke_submit(
         return _block(str(exc), category="TESTNET_SUBMIT_FAILED", severity="ERROR", phase="submit_attempt")
 
     accepted_order = _with_confirmed_status(order, broker_response, mode)
-    fills = [fill] if fill is not None else []
-    positions = _derive_positions(fills=fills, moment=moment)
+    result["submit_attempted"] = True
+    result["placed_count"] = 1
+    result["order_summary"] = {
+        "client_order_id": accepted_order.client_order_id,
+        "status": accepted_order.status,
+        "mode": accepted_order.mode,
+        "binance_order_id": broker_response.get("orderId") if isinstance(broker_response, Mapping) else None,
+    }
+
     post_exchange_state = _reconcile_exchange_state(
         client=client,
         config=config,
         accepted_orders=[accepted_order],
-        derived_positions=positions,
+        derived_positions=[],
         moment=moment,
         warnings=result["warnings"],
         run_id=run_id,
     )
-    _write_json(testnet_root / "binance_testnet_exchange_state.json", post_exchange_state)
+    result["post_submit_exchange_state"] = deepcopy(post_exchange_state)
+    result["post_open_orders_count"] = int(((post_exchange_state.get("open_orders") or {}).get("count") or 0))
 
-    post_open_orders_count = int(((post_exchange_state.get("open_orders") or {}).get("count") or 0))
-    reconciliation_summary = dict(post_exchange_state.get("reconciliation_summary") or {})
-    mismatch_count = int(reconciliation_summary.get("count") or 0)
-    highest_severity = str(reconciliation_summary.get("highest_severity") or "INFO")
-
+    delta_payload = _build_smoke_delta_payload(
+        pre_exchange_state=pre_exchange_state,
+        post_exchange_state=post_exchange_state,
+        fill=fill,
+        broker_response=broker_response,
+        symbol=SMOKE_SYMBOL,
+        quote_asset=config.quote_currency,
+    )
     result.update(
         {
-            "ok": mismatch_count == 0 and post_open_orders_count == 0,
-            "status": "SUCCESS" if mismatch_count == 0 and post_open_orders_count == 0 else "ERROR",
-            "submit_attempted": True,
-            "placed_count": 1,
-            "rejected_count": 0,
-            "post_open_orders_count": post_open_orders_count,
-            "order_summary": {
-                "client_order_id": accepted_order.client_order_id,
-                "status": accepted_order.status,
-                "mode": accepted_order.mode,
-                "binance_order_id": broker_response.get("orderId") if isinstance(broker_response, Mapping) else None,
-            },
+            "baseline_balances": delta_payload["baseline_balances"],
+            "expected_delta": delta_payload["expected_delta"],
+            "observed_delta": delta_payload["observed_delta"],
+            "delta_reconciliation_summary": delta_payload["delta_reconciliation_summary"],
+            "delta_reconciliation_mismatch_details": delta_payload["delta_reconciliation_mismatch_details"],
+            "preexisting_balance_detected": delta_payload["preexisting_balance_detected"],
             "fill_summary": fill.to_dict() if fill is not None else None,
-            "reconciliation_summary": reconciliation_summary,
-            "exchange_state": post_exchange_state,
-            "warnings": _dedupe_warnings(list(result.get("warnings") or [])),
         }
     )
+    if delta_payload["baseline_warning"]:
+        result["warnings"].append(delta_payload["baseline_warning"])
+
+    combined_details = list(post_exchange_state.get("mismatch_details") or []) + list(
+        delta_payload["delta_reconciliation_mismatch_details"]
+    )
+    combined_summary = _summarize_exchange_mismatch_details(combined_details)
+    combined_messages = [str(item.get("message") or "") for item in combined_details if str(item.get("message") or "").strip()]
+
+    shared_exchange_state = deepcopy(post_exchange_state)
+    shared_exchange_state["pre_submit_exchange_state"] = deepcopy(pre_exchange_state)
+    shared_exchange_state["post_submit_exchange_state"] = deepcopy(post_exchange_state)
+    shared_exchange_state["baseline_balances"] = delta_payload["baseline_balances"]
+    shared_exchange_state["expected_delta"] = delta_payload["expected_delta"]
+    shared_exchange_state["observed_delta"] = delta_payload["observed_delta"]
+    shared_exchange_state["delta_reconciliation_summary"] = delta_payload["delta_reconciliation_summary"]
+    shared_exchange_state["delta_reconciliation_mismatch_details"] = delta_payload["delta_reconciliation_mismatch_details"]
+    shared_exchange_state["preexisting_balance_detected"] = delta_payload["preexisting_balance_detected"]
+    shared_exchange_state["mismatch_details"] = combined_details
+    shared_exchange_state["mismatches"] = combined_messages
+    shared_exchange_state["reconciliation_summary"] = combined_summary
+    _write_json(testnet_root / "binance_testnet_exchange_state.json", shared_exchange_state)
+    _write_json(testnet_root / "binance_testnet_reconciliation.json", [])
+
+    mismatch_count = int(combined_summary.get("count") or 0)
+    highest_severity = str(combined_summary.get("highest_severity") or "INFO")
+    result["reconciliation_summary"] = combined_summary
+    result["exchange_state"] = shared_exchange_state
+    result["warnings"] = _dedupe_warnings(
+        list(result.get("warnings") or []) + [f"exchange_reconciliation_mismatch:{msg}" for msg in combined_messages]
+    )
+
+    if fill is None:
+        result["reason"] = "smoke_submit_missing_fill"
+        result["blocking_reasons"] = [result["reason"]]
+    elif result["post_open_orders_count"] != 0:
+        result["reason"] = f"unexpected_open_orders_after_submit:{result['post_open_orders_count']}"
+        result["blocking_reasons"] = [result["reason"]]
+    elif mismatch_count != 0:
+        result["reason"] = f"post_submit_reconciliation_mismatch:{mismatch_count}:{highest_severity}"
+        result["blocking_reasons"] = [result["reason"]]
+    else:
+        result["blocking_reasons"] = []
+
+    result["ok"] = fill is not None and result["post_open_orders_count"] == 0 and mismatch_count == 0
+    result["status"] = "SUCCESS" if result["ok"] else "ERROR"
     _annotate_result(
         result,
         category=None if result["ok"] else "TESTNET_RECONCILIATION_MISMATCH",
-        severity="INFO" if result["ok"] else highest_severity,
+        severity="INFO" if result["ok"] else ("CRITICAL" if fill is None else highest_severity),
         action_taken="testnet_submit_attempted",
         submit_attempted=True,
     )
@@ -353,14 +438,6 @@ def run_binance_testnet_smoke_submit(
         phase="completed",
         status="SUCCESS" if result["ok"] else "ERROR",
     )
-    if post_open_orders_count != 0:
-        result["reason"] = f"unexpected_open_orders_after_submit:{post_open_orders_count}"
-        result["blocking_reasons"] = [result["reason"]]
-    elif mismatch_count != 0:
-        result["reason"] = f"post_submit_reconciliation_mismatch:{mismatch_count}:{highest_severity}"
-        result["blocking_reasons"] = [result["reason"]]
-    else:
-        result["blocking_reasons"] = []
     _write_json(testnet_root / _SMOKE_RESULT_FILENAME, result)
     return result
 
@@ -392,6 +469,197 @@ def _resolve_smoke_notional(*, symbol_filters: Mapping[str, dict[str, Any]], max
 def _build_smoke_client_order_id(run_id: str) -> str:
     digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
     return f"tnsmk-{digest}"
+
+
+def _build_smoke_delta_payload(
+    *,
+    pre_exchange_state: Mapping[str, Any],
+    post_exchange_state: Mapping[str, Any],
+    fill: Any,
+    broker_response: Mapping[str, Any] | Any,
+    symbol: str,
+    quote_asset: str,
+) -> dict[str, Any]:
+    base_asset = symbol[: -len(quote_asset)] if symbol.endswith(quote_asset) else symbol
+    pre_base = _balance_total(pre_exchange_state, base_asset)
+    post_base = _balance_total(post_exchange_state, base_asset)
+    pre_quote = _balance_total(pre_exchange_state, quote_asset)
+    post_quote = _balance_total(post_exchange_state, quote_asset)
+
+    baseline_balances = {
+        base_asset: {"pre_total": pre_base, "post_total": post_base},
+        quote_asset: {"pre_total": pre_quote, "post_total": post_quote},
+    }
+    observed_delta = {
+        "base_asset": base_asset,
+        "quote_asset": quote_asset,
+        "base_qty": None if pre_base is None or post_base is None else (post_base - pre_base),
+        "quote_qty": None if pre_quote is None or post_quote is None else (post_quote - pre_quote),
+    }
+
+    details: list[dict[str, Any]] = []
+    baseline_warning: str | None = None
+    preexisting_balance_detected = bool(pre_base is not None and abs(pre_base) > 1e-12)
+    if preexisting_balance_detected:
+        baseline_warning = f"baseline_external_balance_detected:{base_asset}:{pre_base:.12f}"
+
+    if fill is None:
+        details.append(
+            _delta_mismatch_detail(
+                code="missing_fill",
+                message="smoke_submit_missing_fill",
+                expected=None,
+                observed=None,
+            )
+        )
+        return {
+            "baseline_balances": baseline_balances,
+            "expected_delta": {
+                "base_asset": base_asset,
+                "quote_asset": quote_asset,
+                "base_qty": None,
+                "quote_qty": None,
+            },
+            "observed_delta": observed_delta,
+            "delta_reconciliation_summary": _summarize_exchange_mismatch_details(details),
+            "delta_reconciliation_mismatch_details": details,
+            "preexisting_balance_detected": preexisting_balance_detected,
+            "baseline_warning": baseline_warning,
+        }
+
+    fill_quantity = float(getattr(fill, "quantity", 0.0) or 0.0)
+    fill_price = float(getattr(fill, "price", 0.0) or 0.0)
+    commission = float(getattr(fill, "commission", 0.0) or 0.0)
+    commission_asset = str(getattr(fill, "commission_asset", "") or "").upper()
+    executed_quote = _safe_float((broker_response or {}).get("cummulativeQuoteQty")) if isinstance(broker_response, Mapping) else None
+    if executed_quote is None or executed_quote <= 0:
+        executed_quote = fill_quantity * fill_price if fill_quantity > 0 and fill_price > 0 else None
+
+    expected_base_delta = fill_quantity - commission if commission_asset == base_asset and fill_quantity > 0 else fill_quantity
+    expected_quote_delta = None
+    if executed_quote is not None:
+        expected_quote_delta = -executed_quote
+        if commission_asset == quote_asset:
+            expected_quote_delta -= commission
+
+    expected_delta = {
+        "base_asset": base_asset,
+        "quote_asset": quote_asset,
+        "base_qty": expected_base_delta,
+        "quote_qty": expected_quote_delta,
+        "commission_asset": commission_asset or None,
+        "commission": commission,
+    }
+
+    if observed_delta["base_qty"] is None:
+        details.append(
+            _delta_mismatch_detail(
+                code="missing_base_balance_snapshot",
+                message=f"missing_base_balance_snapshot:{base_asset}",
+                expected=expected_base_delta,
+                observed=None,
+            )
+        )
+    elif not _delta_matches(expected_base_delta, observed_delta["base_qty"]):
+        details.append(
+            _delta_mismatch_detail(
+                code="base_delta_mismatch",
+                message=(
+                    f"base_delta_mismatch:{base_asset}:"
+                    f"expected={expected_base_delta:.12f}:observed={observed_delta['base_qty']:.12f}"
+                ),
+                expected=expected_base_delta,
+                observed=observed_delta["base_qty"],
+            )
+        )
+
+    if expected_quote_delta is None:
+        details.append(
+            _delta_mismatch_detail(
+                code="missing_executed_quote",
+                message="missing_executed_quote",
+                expected=None,
+                observed=observed_delta["quote_qty"],
+            )
+        )
+    elif observed_delta["quote_qty"] is None:
+        details.append(
+            _delta_mismatch_detail(
+                code="missing_quote_balance_snapshot",
+                message=f"missing_quote_balance_snapshot:{quote_asset}",
+                expected=expected_quote_delta,
+                observed=None,
+            )
+        )
+    elif not _delta_matches(expected_quote_delta, observed_delta["quote_qty"]):
+        details.append(
+            _delta_mismatch_detail(
+                code="quote_delta_mismatch",
+                message=(
+                    f"quote_delta_mismatch:{quote_asset}:"
+                    f"expected={expected_quote_delta:.12f}:observed={observed_delta['quote_qty']:.12f}"
+                ),
+                expected=expected_quote_delta,
+                observed=observed_delta["quote_qty"],
+            )
+        )
+
+    return {
+        "baseline_balances": baseline_balances,
+        "expected_delta": expected_delta,
+        "observed_delta": observed_delta,
+        "delta_reconciliation_summary": _summarize_exchange_mismatch_details(details),
+        "delta_reconciliation_mismatch_details": details,
+        "preexisting_balance_detected": preexisting_balance_detected,
+        "baseline_warning": baseline_warning,
+    }
+
+
+def _delta_mismatch_detail(*, code: str, message: str, expected: float | None, observed: float | None) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "code": code,
+        "severity": "CRITICAL",
+        "level": "critical_hard_stop",
+        "blocking": True,
+        "message": message,
+    }
+    if expected is not None:
+        detail["expected"] = float(expected)
+    if observed is not None:
+        detail["observed"] = float(observed)
+        if expected is not None:
+            absolute_delta = abs(float(observed) - float(expected))
+            detail["absolute_delta"] = absolute_delta
+            reference = max(abs(float(expected)), abs(float(observed)), 1e-12)
+            detail["relative_delta"] = absolute_delta / reference
+    return detail
+
+
+def _balance_total(exchange_state: Mapping[str, Any], asset: str) -> float | None:
+    account = exchange_state.get("account") if isinstance(exchange_state, Mapping) else None
+    balances = account.get("balances") if isinstance(account, Mapping) else None
+    if not isinstance(balances, Mapping):
+        return None
+    payload = balances.get(str(asset).upper())
+    if not isinstance(payload, Mapping):
+        return None
+    return _safe_float(payload.get("total"))
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _delta_matches(expected: float, observed: float) -> bool:
+    absolute_delta = abs(float(expected) - float(observed))
+    reference = max(abs(float(expected)), abs(float(observed)), 1e-12)
+    relative_delta = absolute_delta / reference
+    return absolute_delta <= 1e-8 or relative_delta <= 5e-4
 
 
 def _dedupe_warnings(items: list[str]) -> list[str]:

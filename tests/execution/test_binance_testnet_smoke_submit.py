@@ -31,7 +31,9 @@ class _FakeClient:
         exchange_info_response: dict[str, Any] | None = None,
         server_time_response: dict[str, Any] | None = None,
         account_response: dict[str, Any] | None = None,
+        account_sequence: list[dict[str, Any]] | None = None,
         open_orders_response: list[dict[str, Any]] | None = None,
+        open_orders_sequence: list[list[dict[str, Any]]] | None = None,
         place_order_response: dict[str, Any] | None = None,
         exchange_info_raises: BaseException | None = None,
         server_time_raises: BaseException | None = None,
@@ -53,7 +55,7 @@ class _FakeClient:
                         {'filterType': 'PRICE_FILTER', 'minPrice': '0.01', 'maxPrice': '1000000', 'tickSize': '0.01'},
                         {'filterType': 'LOT_SIZE', 'minQty': '0.000001', 'maxQty': '1000', 'stepSize': '0.000001'},
                         {'filterType': 'MARKET_LOT_SIZE', 'minQty': '0.000001', 'maxQty': '1000', 'stepSize': '0.000001'},
-                        {'filterType': 'MIN_NOTIONAL', 'minNotional': '10.0'},
+                        {'filterType': 'MIN_NOTIONAL', 'minNotional': '5.0'},
                     ],
                 }
             ]
@@ -63,24 +65,26 @@ class _FakeClient:
         }
         self._account_response = account_response or {
             'balances': [
-                {'asset': 'BTC', 'free': '0.0003', 'locked': '0.0'},
-                {'asset': 'USDT', 'free': '990.0', 'locked': '0.0'},
+                {'asset': 'BTC', 'free': '1.0', 'locked': '0.0'},
+                {'asset': 'USDT', 'free': '10000.0', 'locked': '0.0'},
             ]
         }
+        self._account_sequence = [dict(item) for item in account_sequence] if account_sequence is not None else None
         self._open_orders_response = open_orders_response or []
+        self._open_orders_sequence = [list(item) for item in open_orders_sequence] if open_orders_sequence is not None else None
         self._place_order_response = place_order_response or {
-            'orderId': 123456,
+            'orderId': 8339739,
             'clientOrderId': 'tnsmk-from-broker',
             'status': 'FILLED',
-            'transactTime': int(datetime(2026, 6, 23, 17, 10, tzinfo=timezone.utc).timestamp() * 1000),
-            'executedQty': '0.0003',
-            'cummulativeQuoteQty': '10.0',
+            'transactTime': int(datetime(2026, 6, 23, 18, 9, tzinfo=timezone.utc).timestamp() * 1000),
+            'executedQty': '0.00008',
+            'cummulativeQuoteQty': '4.98416',
             'fills': [
                 {
-                    'price': '33333.33',
-                    'qty': '0.0003',
-                    'commission': '0.0100',
-                    'commissionAsset': 'USDT',
+                    'price': '62302.0',
+                    'qty': '0.00008',
+                    'commission': '0.0',
+                    'commissionAsset': 'BTC',
                 }
             ],
         }
@@ -107,15 +111,26 @@ class _FakeClient:
         if self._account_raises is not None:
             raise self._account_raises
         self.account_calls += 1
+        if self._account_sequence is not None and self._account_sequence:
+            if len(self._account_sequence) > 1:
+                return dict(self._account_sequence.pop(0))
+            return dict(self._account_sequence[0])
         return dict(self._account_response)
 
     def open_orders(self, *, symbol: str | None = None) -> list[dict[str, Any]]:
         if self._open_orders_raises is not None:
             raise self._open_orders_raises
         self.open_orders_calls += 1
+        if self._open_orders_sequence is not None and self._open_orders_sequence:
+            if len(self._open_orders_sequence) > 1:
+                payload = self._open_orders_sequence.pop(0)
+            else:
+                payload = self._open_orders_sequence[0]
+        else:
+            payload = self._open_orders_response
         if symbol is None:
-            return [dict(item) for item in self._open_orders_response]
-        return [dict(item) for item in self._open_orders_response if str(item.get('symbol') or '').upper() == str(symbol).upper()]
+            return [dict(item) for item in payload]
+        return [dict(item) for item in payload if str(item.get('symbol') or '').upper() == str(symbol).upper()]
 
     def place_order(self, *, params: Mapping[str, Any]) -> dict[str, Any]:
         if self._place_order_raises is not None:
@@ -191,6 +206,22 @@ class BinanceTestnetSmokeSubmitTests(unittest.TestCase):
                 },
             },
         )
+
+    def _baseline_account_sequence(self) -> list[dict[str, Any]]:
+        return [
+            {
+                'balances': [
+                    {'asset': 'BTC', 'free': '1.0', 'locked': '0.0'},
+                    {'asset': 'USDT', 'free': '10000.0', 'locked': '0.0'},
+                ]
+            },
+            {
+                'balances': [
+                    {'asset': 'BTC', 'free': '1.00008', 'locked': '0.0'},
+                    {'asset': 'USDT', 'free': '9995.01584', 'locked': '0.0'},
+                ]
+            },
+        ]
 
     def test_blocks_without_confirm_yes(self) -> None:
         result = run_binance_testnet_smoke_submit(
@@ -294,8 +325,121 @@ class BinanceTestnetSmokeSubmitTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertEqual(result['reason'], 'smoke_submit_requires_max_open_orders_equals_1')
 
-    def test_successful_smoke_submit_reconciles_cleanly(self) -> None:
-        client = _FakeClient()
+    def test_preexisting_btc_balance_uses_delta_reconciliation_not_absolute_balance(self) -> None:
+        client = _FakeClient(
+            account_sequence=self._baseline_account_sequence(),
+            open_orders_sequence=[[], [], []],
+        )
+        result = run_binance_testnet_smoke_submit(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_smoke_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['preexisting_balance_detected'])
+        self.assertEqual(result['delta_reconciliation_summary']['count'], 0)
+        self.assertEqual(result['reconciliation_summary']['count'], 0)
+        self.assertEqual(result['blocking_reasons'], [])
+        self.assertAlmostEqual(result['expected_delta']['base_qty'], 0.00008, places=12)
+        self.assertAlmostEqual(result['observed_delta']['base_qty'], 0.00008, places=12)
+        self.assertIn('baseline_external_balance_detected:BTC:1.000000000000', result['warnings'])
+
+    def test_delta_mismatch_is_critical(self) -> None:
+        client = _FakeClient(
+            account_sequence=[
+                self._baseline_account_sequence()[0],
+                {
+                    'balances': [
+                        {'asset': 'BTC', 'free': '1.00009', 'locked': '0.0'},
+                        {'asset': 'USDT', 'free': '9995.01584', 'locked': '0.0'},
+                    ]
+                },
+            ],
+            open_orders_sequence=[[], [], []],
+        )
+        result = run_binance_testnet_smoke_submit(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_smoke_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('post_submit_reconciliation_mismatch', result['reason'])
+        self.assertEqual(result['severity'], 'CRITICAL')
+        self.assertTrue(any(item['code'] == 'base_delta_mismatch' for item in result['delta_reconciliation_mismatch_details']))
+
+    def test_open_order_unexpected_after_submit_is_critical(self) -> None:
+        client = _FakeClient(
+            account_sequence=self._baseline_account_sequence(),
+            open_orders_sequence=[
+                [],
+                [],
+                [{'symbol': 'BTCUSDT', 'clientOrderId': 'tnsmk-x', 'status': 'NEW', 'side': 'BUY', 'type': 'MARKET', 'origQty': '0.00008', 'executedQty': '0.0'}],
+            ],
+        )
+        result = run_binance_testnet_smoke_submit(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_smoke_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('unexpected_open_orders_after_submit', result['reason'])
+
+    def test_rejected_order_is_critical(self) -> None:
+        client = _FakeClient(
+            account_sequence=self._baseline_account_sequence(),
+            open_orders_sequence=[[], [], []],
+            place_order_response={
+                'orderId': 8339739,
+                'clientOrderId': 'tnsmk-from-broker',
+                'status': 'REJECTED',
+                'fills': [],
+            },
+        )
+        result = run_binance_testnet_smoke_submit(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_smoke_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['reason'], 'smoke_submit_missing_fill')
+        self.assertEqual(result['severity'], 'CRITICAL')
+
+    def test_missing_fill_is_critical(self) -> None:
+        client = _FakeClient(
+            account_sequence=self._baseline_account_sequence(),
+            open_orders_sequence=[[], [], []],
+            place_order_response={
+                'orderId': 8339739,
+                'clientOrderId': 'tnsmk-from-broker',
+                'status': 'FILLED',
+                'cummulativeQuoteQty': '4.98416',
+                'fills': [],
+            },
+        )
+        result = run_binance_testnet_smoke_submit(
+            paper_artifacts_dir=self.paper_dir,
+            testnet_artifacts_dir=self.testnet_dir,
+            env=_smoke_env(),
+            client=client,
+            now=self.now,
+        )
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['reason'], 'smoke_submit_missing_fill')
+        self.assertEqual(result['severity'], 'CRITICAL')
+
+    def test_successful_smoke_submit_writes_redacted_artifact(self) -> None:
+        client = _FakeClient(
+            account_sequence=self._baseline_account_sequence(),
+            open_orders_sequence=[[], [], []],
+        )
         result = run_binance_testnet_smoke_submit(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
@@ -307,24 +451,30 @@ class BinanceTestnetSmokeSubmitTests(unittest.TestCase):
         self.assertEqual(result['placed_count'], 1)
         self.assertEqual(result['rejected_count'], 0)
         self.assertTrue(result['submit_attempted'])
-        self.assertEqual(result['reconciliation_summary']['count'], 0)
         self.assertEqual(len(client.place_order_calls), 1)
         self.assertEqual(client.place_order_calls[0]['symbol'], 'BTCUSDT')
         self.assertEqual(client.place_order_calls[0]['side'], 'BUY')
         self.assertIn('quoteOrderQty', client.place_order_calls[0])
         self.assertEqual(client.exchange_info_calls, [('BTCUSDT',)])
-        self.assertGreaterEqual(client.account_calls, 2)
-        self.assertGreaterEqual(client.open_orders_calls, 3)
         persisted = json.loads((self.testnet_dir / 'binance_testnet_smoke_submit_result.json').read_text(encoding='utf-8'))
         self.assertTrue(persisted['ok'])
         self.assertNotIn('secret', json.dumps(persisted).lower())
+        self.assertIn('pre_submit_exchange_state', persisted)
+        self.assertIn('post_submit_exchange_state', persisted)
+        self.assertIn('baseline_balances', persisted)
+        self.assertIn('expected_delta', persisted)
+        self.assertIn('observed_delta', persisted)
+        self.assertIn('delta_reconciliation_summary', persisted)
 
     def test_smoke_submit_does_not_depend_on_semantic_events(self) -> None:
         semantic_dir = self.paper_dir / 'semantic'
         semantic_dir.mkdir(parents=True, exist_ok=True)
         (semantic_dir / 'crypto_semantic_events.json').write_text('[{"event_type":"BUY_FILLED_PAPER"}]', encoding='utf-8')
         (semantic_dir / 'crypto_semantic_summary.json').write_text('{"operational_status":"ERROR"}', encoding='utf-8')
-        client = _FakeClient()
+        client = _FakeClient(
+            account_sequence=self._baseline_account_sequence(),
+            open_orders_sequence=[[], [], []],
+        )
         result = run_binance_testnet_smoke_submit(
             paper_artifacts_dir=self.paper_dir,
             testnet_artifacts_dir=self.testnet_dir,
