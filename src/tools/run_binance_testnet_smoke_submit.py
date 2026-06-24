@@ -25,8 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Execute one explicit Binance Spot Testnet smoke submit without "
             "using strategy or semantic events. Requires ORDER_TEST_ONLY=0, "
-            "BINANCE_TESTNET_CONFIRM_SUBMIT=YES, readiness READY, and "
-            "operational TESTNET_SUBMIT_ALLOWED."
+            "BINANCE_TESTNET_CONFIRM_SUBMIT=YES passed inline for that one "
+            "command only and never export globally, readiness READY, "
+            "and operational "
+            "TESTNET_SUBMIT_ALLOWED."
         )
     )
     parser.add_argument(
@@ -78,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         "env_flags": {
             ENABLE_FLAG: "must be '1' to enable testnet execution",
             ORDER_TEST_ONLY_FLAG: "must be '0' for the smoke submit command",
-            CONFIRM_SUBMIT_ENV: "required exact value YES",
+            CONFIRM_SUBMIT_ENV: "required exact value YES; pass inline only and never export globally",
             BASE_URL_ENV: "must be a testnet host",
             MAX_NOTIONAL_ENV: "must be <= 25 for smoke submit",
             ALLOWED_SYMBOLS_ENV: "must be BTCUSDT",

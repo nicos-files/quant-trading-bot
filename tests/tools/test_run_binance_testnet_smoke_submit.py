@@ -31,6 +31,12 @@ class BinanceTestnetSmokeSubmitCLITests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args([])
 
+    def test_help_mentions_inline_confirmation_requirement(self) -> None:
+        help_text = cli.build_parser().format_help()
+        self.assertIn('BINANCE_TESTNET_CONFIRM_SUBMIT=YES', help_text)
+        self.assertIn('inline', help_text.lower())
+        self.assertIn('never export globally', help_text.lower())
+
     def test_cli_emits_redacted_audit_and_exit_zero_on_success(self) -> None:
         payload = {
             'run_id': 'testnet-smoke-20260623-171000',
@@ -66,6 +72,7 @@ class BinanceTestnetSmokeSubmitCLITests(unittest.TestCase):
         self.assertTrue(audit['ok'])
         self.assertEqual(audit['api_key_masked'], '****abcd')
         self.assertIn('BINANCE_TESTNET_CONFIRM_SUBMIT', audit['env_flags'])
+        self.assertIn('inline only', audit['env_flags']['BINANCE_TESTNET_CONFIRM_SUBMIT'])
 
     def test_cli_exit_one_on_blocked(self) -> None:
         payload = {

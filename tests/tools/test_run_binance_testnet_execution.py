@@ -33,6 +33,12 @@ class CLIArgParsingTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args([])
 
+    def test_help_mentions_core_safety_flags(self) -> None:
+        help_text = cli.build_parser().format_help()
+        self.assertIn('--dry-run', help_text)
+        self.assertIn('--rebuild-semantic', help_text)
+        self.assertIn('ENABLE_BINANCE_TESTNET_EXECUTION', help_text)
+
     def test_parser_accepts_dry_run_and_rebuild_flags(self) -> None:
         parser = cli.build_parser()
         args = parser.parse_args(
@@ -109,6 +115,7 @@ class CLIExitCodeTests(unittest.TestCase):
         self.assertIn("BINANCE_TESTNET_ORDER_TEST_ONLY", audit["env_flags"])
         self.assertIn("BINANCE_TESTNET_KILL_SWITCH", audit["env_flags"])
         self.assertIn("BINANCE_TESTNET_BLOCK_ON_PREVIOUS_RECONCILIATION_MISMATCH", audit["env_flags"])
+        self.assertIn("inline only", audit["env_flags"]["BINANCE_TESTNET_CONFIRM_SUBMIT"])
 
     def test_exit_one_on_ok_false(self) -> None:
         code, audit = self._run_with_fake_executor(

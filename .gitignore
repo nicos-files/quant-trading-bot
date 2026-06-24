@@ -77,3 +77,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+artifacts/crypto_testnet/
+artifacts/crypto_ops/

@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         "env_flags": {
             ENABLE_FLAG: "must be '1' to enable testnet execution",
             ORDER_TEST_ONLY_FLAG: "default '1' (order/test); set '0' to place",
-            CONFIRM_SUBMIT_ENV: "required exact value YES when ORDER_TEST_ONLY=0",
+            CONFIRM_SUBMIT_ENV: "required exact value YES when ORDER_TEST_ONLY=0; pass inline only and never export globally",
             BASE_URL_ENV: "must be a testnet host",
             MAX_NOTIONAL_ENV: "default 25.0 USDT",
             ALLOWED_SYMBOLS_ENV: "comma-separated allowlist",

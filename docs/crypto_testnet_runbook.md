@@ -2,92 +2,274 @@
 
 Paper and Binance Spot Testnet only. No live trading. No mainnet.
 
-## Primary Inspection Points
+## Current State
 
-- Latest paper-forward result:
-  `artifacts/crypto_paper/paper_forward/crypto_paper_forward_result.json`
-- Latest semantic summary:
-  `artifacts/crypto_paper/semantic/crypto_semantic_summary.json`
-- Latest dashboard health:
-  `artifacts/crypto_paper/dashboard/dashboard_data.json`
-- Latest notifier result:
-  `artifacts/crypto_paper/semantic/telegram_notify_result.json`
-- Latest testnet result:
-  `artifacts/crypto_testnet/binance_testnet_execution_result.json`
-- Latest testnet exchange state:
-  `artifacts/crypto_testnet/binance_testnet_exchange_state.json`
-- Latest testnet reconciliation rows:
-  `artifacts/crypto_testnet/binance_testnet_reconciliation.json`
-- Latest readiness summary:
-  `artifacts/crypto_testnet/crypto_testnet_readiness.json`
+The repository is currently ready for controlled Binance Spot Testnet operation.
 
-## How To Inspect Latest Run Status
+Confirmed state:
+- `readiness.status = READY`
+- `operational.final_decision = TESTNET_SUBMIT_ALLOWED`
+- `blocking_reasons = []`
+- Binance Spot Testnet connected and validated
+- controlled smoke submit path validated
+- post-submit reconciliation validated using exchange deltas
+- no live trading and no mainnet support enabled
 
-- Read `paper_forward.status`, `paper_forward.run_id`, and `paper_forward.heartbeat`
-- Read `semantic.operational_status`
-- Read `dashboard.operational_status`
-- Read `testnet_result.ok`, `testnet_result.severity`, `testnet_result.category`, and `testnet_result.heartbeat`
+This is a controlled testnet package, not a live-trading package.
 
-## How To Inspect Reconciliation Status
+## What READY Means
 
-- Read `exchange_state.reconciliation_summary`
-- Read `exchange_state.mismatch_details`
-- Read `exchange_state.mismatches`
-- Do not proceed if mismatch count is non-zero
+`READY` means the current paper, semantic, dashboard, testnet, and reconciliation artifacts are internally consistent enough to permit controlled testnet activity.
 
-## How To Inspect Open Orders State
+It does not mean:
+- strategy edge is proven
+- live execution is allowed
+- mainnet is allowed
+- the system is production-ready for real money
 
-- Read `exchange_state.open_orders`
-- Read `testnet_result.open_order_limit`
-- If the current open-order count is unclear, stop and investigate before any new attempt
+## What TESTNET_SUBMIT_ALLOWED Means
 
-## How To Inspect Dashboard Operational Health
+`TESTNET_SUBMIT_ALLOWED` means the operational aggregator sees no current hard blockers for a controlled Binance Spot Testnet submit.
 
-- Read `dashboard_data.json`
-- Confirm:
-  - `operational_status`
-  - `paper_forward_status`
-  - `telegram_status`
-  - `testnet.operational_status`
-  - `heartbeats`
+It still requires operator discipline:
+- `BINANCE_TESTNET_ORDER_TEST_ONLY=0` only for the exact submit window
+- `BINANCE_TESTNET_CONFIRM_SUBMIT=YES` only inline on the exact smoke submit command
+- post-submit reconciliation is mandatory
+- immediately return to `BINANCE_TESTNET_ORDER_TEST_ONLY=1` after the submit
 
-## Response Rules
+## Why This Is Not Live-Ready
 
-- Kill switch active:
-  Stop immediately. Do not submit. Clear the kill switch only after confirming why it was enabled.
-- Reconciliation mismatch:
-  Stop immediately. Inspect `mismatch_details`, `open_orders`, and `balances`. Do not continue while state is ambiguous.
-- Stale heartbeat:
-  Treat the system as stale. Refresh paper-forward, semantic, dashboard, and readiness artifacts before continuing.
-- Telegram failure:
-  Restore notifier health before relying on alerts. Do not assume silent success.
-- Dashboard stale:
-  Rebuild the dashboard from fresh semantic/paper artifacts. Do not use stale UI state for decisions.
-- Exchange filter reject:
-  Inspect symbol allowlist, price tick, lot size, min notional, and max notional before retrying.
-- Too many open orders:
-  Stop and reconcile open orders intentionally. Do not keep submitting into an unknown working-order set.
-- Unknown or failed run status:
-  Treat as blocked. Do not infer safety from partial artifacts.
+The system is still not approved for live or mainnet use because:
+- strategy research remains small-sample and paper-biased
+- fees and slippage are still simulated on the paper side
+- paper and testnet observability are strong, but live execution controls are intentionally absent
+- operational procedures are for controlled testnet only
+- a successful testnet submit validates plumbing, not profitability or live robustness
 
-## Rollback / Stop Procedure
+## Required Environment Variables
 
-1. Set `BINANCE_TESTNET_KILL_SWITCH=1` or enable the kill-switch file.
-2. Stop new testnet attempts.
-3. Inspect `binance_testnet_execution_result.json` and `binance_testnet_exchange_state.json`.
-4. Confirm reconciliation state and open orders.
-5. Re-run readiness evaluation only after the state is understood.
+Required for connected Binance Spot Testnet preflight:
 
-## Explicit Operator Rule
+```bash
+ENABLE_BINANCE_TESTNET_EXECUTION=1
+BINANCE_TESTNET_BASE_URL=https://testnet.binance.vision
+BINANCE_TESTNET_ALLOWED_SYMBOLS=BTCUSDT
+BINANCE_TESTNET_MAX_OPEN_ORDERS=1
+BINANCE_TESTNET_MAX_NOTIONAL=25
+BINANCE_TESTNET_ORDER_TEST_ONLY=1
+BINANCE_TESTNET_API_KEY=REDACTED
+BINANCE_TESTNET_API_SECRET=REDACTED
+```
 
-Do not continue if state is ambiguous.
+Optional but safety-relevant:
 
-Ambiguous includes:
+```bash
+BINANCE_TESTNET_KILL_SWITCH=0
+BINANCE_TESTNET_KILL_SWITCH_PATH=/path/to/optional/kill_switch.json
+BINANCE_TESTNET_BLOCK_ON_PREVIOUS_RECONCILIATION_MISMATCH=1
+```
 
+Critical rule:
+- Never export `BINANCE_TESTNET_CONFIRM_SUBMIT=YES` globally.
+- Use it only inline on the exact smoke submit command.
+- Unset it immediately after the smoke submit command finishes.
+
+## Safe Normal Flow
+
+### A. Connected preflight in order-test mode
+
+```bash
+timeout 120s env \
+  PYTHONPATH=. \
+  ENABLE_BINANCE_TESTNET_EXECUTION=1 \
+  BINANCE_TESTNET_ORDER_TEST_ONLY=1 \
+  BINANCE_TESTNET_BASE_URL=https://testnet.binance.vision \
+  BINANCE_TESTNET_ALLOWED_SYMBOLS=BTCUSDT \
+  BINANCE_TESTNET_MAX_OPEN_ORDERS=1 \
+  BINANCE_TESTNET_MAX_NOTIONAL=25 \
+  .venv/bin/python -m src.tools.run_binance_testnet_execution \
+  --paper-artifacts-dir artifacts/crypto_paper \
+  --testnet-artifacts-dir artifacts/crypto_testnet \
+  --rebuild-semantic
+```
+
+### B. Readiness evaluation
+
+```bash
+PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_crypto_testnet_readiness \
+  --paper-artifacts-dir artifacts/crypto_paper \
+  --testnet-artifacts-dir artifacts/crypto_testnet
+```
+
+### C. Operational status evaluation
+
+```bash
+PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_crypto_operational_status \
+  --paper-artifacts-dir artifacts/crypto_paper \
+  --testnet-artifacts-dir artifacts/crypto_testnet
+```
+
+### D. Dry-run only
+
+```bash
+PYTHONPATH=. .venv/bin/python -m src.tools.run_crypto_testnet_dry_run \
+  --paper-artifacts-dir artifacts/crypto_paper
+```
+
+### E. Smoke submit only with explicit confirmation
+
+Do this only if `readiness.status = READY` and `final_decision = TESTNET_SUBMIT_ALLOWED` immediately before the command.
+
+```bash
+timeout 120s env \
+  PYTHONPATH=. \
+  ENABLE_BINANCE_TESTNET_EXECUTION=1 \
+  BINANCE_TESTNET_BASE_URL=https://testnet.binance.vision \
+  BINANCE_TESTNET_ALLOWED_SYMBOLS=BTCUSDT \
+  BINANCE_TESTNET_MAX_OPEN_ORDERS=1 \
+  BINANCE_TESTNET_MAX_NOTIONAL=25 \
+  BINANCE_TESTNET_ORDER_TEST_ONLY=0 \
+  BINANCE_TESTNET_CONFIRM_SUBMIT=YES \
+  .venv/bin/python -m src.tools.run_binance_testnet_smoke_submit \
+  --paper-artifacts-dir artifacts/crypto_paper \
+  --testnet-artifacts-dir artifacts/crypto_testnet
+```
+
+### F. Post-submit reconciliation
+
+```bash
+PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_crypto_testnet_readiness \
+  --paper-artifacts-dir artifacts/crypto_paper \
+  --testnet-artifacts-dir artifacts/crypto_testnet
+
+PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_crypto_operational_status \
+  --paper-artifacts-dir artifacts/crypto_paper \
+  --testnet-artifacts-dir artifacts/crypto_testnet
+```
+
+### G. Return immediately to safe mode
+
+```bash
+export BINANCE_TESTNET_ORDER_TEST_ONLY=1
+unset BINANCE_TESTNET_CONFIRM_SUBMIT
+```
+
+## Safe Inspection Commands
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+for path in [
+    "artifacts/crypto_paper/semantic/crypto_semantic_summary.json",
+    "artifacts/crypto_paper/dashboard/dashboard_data.json",
+    "artifacts/crypto_testnet/binance_testnet_execution_result.json",
+    "artifacts/crypto_testnet/binance_testnet_exchange_state.json",
+    "artifacts/crypto_testnet/crypto_testnet_readiness.json",
+    "artifacts/crypto_ops/crypto_operational_status.json",
+]:
+    print(f"\n== {path} ==")
+    p = pathlib.Path(path)
+    if not p.exists():
+        print("MISSING")
+        continue
+    print(p.read_text(encoding="utf-8")[:4000])
+PY
+```
+
+## Benign Warnings That Do Not Block By Themselves
+
+These remain visible and should be reviewed, but do not by themselves block controlled testnet:
+- `Risk rejected BTCUSDT: symbol_position_exists`
+- `Crypto strategy produced no trade candidates.`
+- `small_sample_size:closed_trades=...`
+- `Small sample size: fewer than 30 closed trades.`
+- `Paper-only results; no real execution occurred.`
+- `Fees and slippage are simulated.`
+- `Limited symbol attribution: no realized per-symbol exit data available.`
+- `ignored_historical_paper_semantic_events:...`
+
+These warnings indicate research or reporting limitations, not a broken testnet execution path.
+
+## Warnings And Events That Must Block
+
+Any of the following must block further testnet activity until understood:
+- exchange filter reject
+- reconciliation mismatch
 - stale heartbeat
-- missing artifact
-- missing reconciliation state
-- unknown open orders
-- notifier failure
-- blocked or failed testnet status
-- any unexplained mismatch
+- wrong base URL
+- kill switch active
+- missing or unreadable artifacts
+- semantic `ERROR` or `CRITICAL`
+- unexpected open orders
+- corrupt ledger or artifact corruption
+- ambiguous or partial state
+
+## Explicit Operator Rule`r`n`r`nDo not continue if state is ambiguous.`r`n`r`n## Stop Conditions
+
+Stop immediately and do not continue if any of these is true:
+- `readiness.status != READY`
+- `submit_ready != true`
+- `final_decision != TESTNET_SUBMIT_ALLOWED` for a real smoke submit
+- `blocking_reasons` is not empty
+- `reconciliation_summary.count > 0`
+- base URL is not `https://testnet.binance.vision`
+- kill switch is active
+- open-order count is unknown or non-zero unexpectedly
+- state is stale, partial, or ambiguous
+
+## Recovery Procedure
+
+If anything looks wrong:
+
+1. Return to safe mode immediately.
+
+```bash
+export BINANCE_TESTNET_ORDER_TEST_ONLY=1
+unset BINANCE_TESTNET_CONFIRM_SUBMIT
+```
+
+2. Do not repeat the submit.
+3. Re-evaluate readiness and operational status.
+4. Inspect exchange state, reconciliation, and semantic artifacts.
+5. Do not retry until the cause is understood and the system is back to `READY` plus `TESTNET_SUBMIT_ALLOWED`.
+
+## Checklist Before Any Future Smoke Submit
+
+- `git status --short` reviewed
+- no artifacts staged for commit
+- base URL is Binance Spot Testnet
+- `ENABLE_BINANCE_TESTNET_EXECUTION=1`
+- `BINANCE_TESTNET_ORDER_TEST_ONLY=1` in the resting state
+- `BINANCE_TESTNET_ALLOWED_SYMBOLS=BTCUSDT`
+- `BINANCE_TESTNET_MAX_OPEN_ORDERS=1`
+- `BINANCE_TESTNET_MAX_NOTIONAL<=25`
+- kill switch not active
+- readiness is `READY`
+- operational status is `TESTNET_SUBMIT_ALLOWED`
+- no unexplained warnings or blockers
+- `BINANCE_TESTNET_CONFIRM_SUBMIT=YES` prepared only inline for the exact command
+
+## Checklist After Any Smoke Submit
+
+- return to `BINANCE_TESTNET_ORDER_TEST_ONLY=1`
+- unset `BINANCE_TESTNET_CONFIRM_SUBMIT`
+- inspect smoke submit result artifact
+- inspect exchange state artifact
+- inspect readiness artifact
+- inspect operational status artifact
+- confirm reconciliation count is zero
+- confirm no unexpected open orders
+- stop if anything is ambiguous
+
+## Testnet Closure Criteria
+
+This controlled testnet package can be considered operationally closed when:
+- connected preflight is reproducible
+- readiness and operational status are reproducible
+- dry-run path is reproducible
+- smoke submit path is reproducible
+- post-submit reconciliation stays clean
+- operators follow inline confirmation discipline
+- no one interprets testnet success as live readiness
+
+The package remains testnet-only until a separate live-readiness program is defined and approved.
