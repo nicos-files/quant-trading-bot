@@ -248,17 +248,75 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('mainnet_readonly_artifact_stale', result['blocking_reasons'])
 
-    def test_execute_blocks_when_live_order_already_attempted_today(self) -> None:
+    def test_execute_blocks_when_prior_live_order_consumed_daily_cap(self) -> None:
         self._write(
             self.root / 'binance_live_micro_submit_result.json',
             {
                 'submit_attempted': True,
+                'exchange_order_request_sent': True,
+                'placed_count': 1,
+                'daily_cap_consumed': True,
+                'daily_cap_reason': 'placed_count=1',
                 'heartbeat': {'last_updated_at': self.now.isoformat()},
             },
         )
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), now=self.now, execute=True)
         self.assertFalse(result['ok'])
         self.assertIn('live_daily_order_cap_reached:1>=1', result['blocking_reasons'])
+        self.assertTrue(result['daily_order_cap']['history_consumed_cap'])
+        self.assertEqual(result['daily_order_cap']['history_consumed_reason'], 'placed_count=1')
+
+    def test_execute_does_not_consume_daily_cap_for_prior_pre_exchange_allowlist_failure(self) -> None:
+        self._write(
+            self.root / 'binance_live_micro_submit_result.json',
+            {
+                'submit_attempted': True,
+                'broker_order_request_attempted': True,
+                'exchange_order_request_sent': False,
+                'placed_count': 0,
+                'rejected_count': 0,
+                'failure_stage': 'pre_exchange_client_validation',
+                'blocking_reasons': ["live_submit_failed:Endpoint not in readonly allowlist: '/api/v3/order'"],
+                'heartbeat': {'last_updated_at': self.now.isoformat()},
+            },
+        )
+        client = _FakeClient()
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), client=client, now=self.now, execute=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['status'], 'SUCCESS')
+        self.assertEqual(len(client.place_order_calls), 1)
+        self.assertIn('daily_cap_not_consumed_pre_exchange_failure', ' '.join(result['warnings']))
+        self.assertFalse(result['daily_order_cap']['history_consumed_cap'])
+
+    def test_execute_does_not_consume_daily_cap_for_prior_non_submit_artifact(self) -> None:
+        self._write(
+            self.root / 'binance_live_micro_submit_result.json',
+            {
+                'submit_attempted': False,
+                'placed_count': 0,
+                'rejected_count': 0,
+                'heartbeat': {'last_updated_at': self.now.isoformat()},
+            },
+        )
+        client = _FakeClient()
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), client=client, now=self.now, execute=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['status'], 'SUCCESS')
+        self.assertFalse(result['daily_order_cap']['history_consumed_cap'])
+
+    def test_execute_blocks_when_prior_daily_cap_artifact_is_ambiguous(self) -> None:
+        self._write(
+            self.root / 'binance_live_micro_submit_result.json',
+            {
+                'submit_attempted': True,
+                'placed_count': 0,
+                'rejected_count': 0,
+                'heartbeat': {'last_updated_at': self.now.isoformat()},
+            },
+        )
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), now=self.now, execute=True)
+        self.assertFalse(result['ok'])
+        self.assertIn('live_daily_order_history_ambiguous', result['blocking_reasons'])
 
     def test_execute_blocks_when_exchange_min_notional_exceeds_cap(self) -> None:
         client = _FakeClient(
@@ -290,8 +348,12 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(result['status'], 'SUCCESS')
         self.assertTrue(result['submit_attempted'])
+        self.assertTrue(result['broker_order_request_attempted'])
+        self.assertTrue(result['exchange_order_request_sent'])
         self.assertEqual(result['placed_count'], 1)
         self.assertEqual(result['rejected_count'], 0)
+        self.assertTrue(result['daily_cap_consumed'])
+        self.assertEqual(result['daily_cap_reason'], 'placed_count=1')
         self.assertEqual(len(client.place_order_calls), 1)
         self.assertEqual(result['reconciliation_summary']['count'], 0)
         serialized = json.dumps(result).lower()
@@ -302,6 +364,8 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         client = _FakeClient(place_order_response={'orderId': 1, 'status': 'FILLED', 'cummulativeQuoteQty': '4.98', 'fills': []})
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), client=client, now=self.now, execute=True)
         self.assertFalse(result['ok'])
+        self.assertTrue(result['exchange_order_request_sent'])
+        self.assertTrue(result['daily_cap_consumed'])
         self.assertIn('live_submit_missing_fill', result['blocking_reasons'])
 
     def test_execute_blocks_when_post_submit_open_order_appears(self) -> None:

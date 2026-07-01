@@ -186,7 +186,10 @@ def _run_execute(
 
     daily_guard = _check_daily_order_cap(root=root, moment=moment, max_daily_orders=int(result["max_daily_orders"] or 0))
     result["daily_order_cap"] = daily_guard
+    if daily_guard.get("warning"):
+        result["warnings"] = _dedupe_warnings(list(result["warnings"]) + [str(daily_guard.get("warning"))])
     if daily_guard.get("blocked"):
+        result["failure_stage"] = "daily_cap_gate"
         result["blocking_reasons"].append(str(daily_guard.get("reason") or "live_daily_order_cap_blocked"))
 
     result["blocking_reasons"] = _dedupe_warnings(list(result["blocking_reasons"]))
@@ -258,13 +261,25 @@ def _run_execute(
         "newClientOrderId": _build_live_client_order_id(str(result["run_id"])),
         "newOrderRespType": "FULL",
     }
+    result["placement_stage"] = "ready_to_submit"
     result["submit_attempted"] = True
+    result["broker_order_request_attempted"] = True
+    result["placement_stage"] = "broker_request_attempted"
     try:
         broker_response = client.place_order(params=params)
     except Exception as exc:
-        result["rejected_count"] = 1
+        result["exchange_order_request_sent"] = _exchange_order_request_may_have_been_sent(exc)
+        result["failure_stage"] = _classify_submit_failure_stage(exc)
         result["blocking_reasons"] = [f"live_submit_failed:{_safe_error_text(exc)}"]
         return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="ERROR", phase="submit_attempt")
+
+    result["exchange_order_request_sent"] = True
+    result["placement_stage"] = "broker_response_received"
+    if str((broker_response or {}).get("status") or "").upper() == "REJECTED":
+        result["rejected_count"] = 1
+        result["failure_stage"] = "broker_rejected"
+        result["blocking_reasons"] = ["live_order_rejected"]
+        return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="ERROR", phase="submit_rejected")
 
     fill_summary = _extract_fill(broker_response)
     result["placed_count"] = 1
@@ -274,10 +289,6 @@ def _run_execute(
         "commission": fill_summary.commission,
         "commission_asset": fill_summary.commission_asset,
     }
-    if str((broker_response or {}).get("status") or "").upper() == "REJECTED":
-        result["rejected_count"] = 1
-        result["blocking_reasons"] = ["live_order_rejected"]
-        return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="ERROR", phase="submit_rejected")
 
     warnings = list(result["warnings"])
     post_state = _reconcile_exchange_state(
@@ -353,9 +364,15 @@ def _base_result(
         "prepare_only": bool(prepare_only),
         "execute": bool(execute),
         "submit_attempted": False,
+        "broker_order_request_attempted": False,
+        "exchange_order_request_sent": False,
         "placed_count": 0,
         "rejected_count": 0,
         "requested_notional": None,
+        "daily_cap_consumed": False,
+        "daily_cap_reason": "not_submitted",
+        "placement_stage": "not_started",
+        "failure_stage": None,
         "symbol": LIVE_SYMBOL,
         "order_type": LIVE_ORDER_TYPE,
         "base_url": str(source_env.get(LIVE_BASE_URL_ENV) or DEFAULT_MAINNET_BASE_URL).strip().rstrip("/"),
@@ -450,6 +467,11 @@ def _check_daily_order_cap(*, root: Path, moment: datetime, max_daily_orders: in
         "count_today": 0,
         "max_daily_orders": int(max_daily_orders),
         "history_path": str(root / _RESULT_FILENAME),
+        "history_run_id": None,
+        "history_status": None,
+        "history_consumed_cap": False,
+        "history_consumed_reason": None,
+        "warning": None,
     }
     if max_daily_orders <= 0:
         result["blocked"] = True
@@ -463,19 +485,86 @@ def _check_daily_order_cap(*, root: Path, moment: datetime, max_daily_orders: in
         result["blocked"] = True
         result["reason"] = "live_daily_order_history_unreadable"
         return result
-    if not bool(payload.get("submit_attempted")):
-        return result
+    result["history_run_id"] = payload.get("run_id")
+    result["history_status"] = payload.get("status")
     stamp = _parse_datetime(((payload.get("heartbeat") or {}).get("last_updated_at"))) or _parse_datetime(payload.get("generated_at_utc"))
     if stamp is None:
         result["blocked"] = True
         result["reason"] = "live_daily_order_history_ambiguous"
         return result
-    if stamp.date() == moment.date():
-        result["count_today"] = 1
-        if result["count_today"] >= max_daily_orders:
-            result["blocked"] = True
-            result["reason"] = f"live_daily_order_cap_reached:{result['count_today']}>={max_daily_orders}"
+    if stamp.date() != moment.date():
+        return result
+    classification = _classify_daily_cap_history(payload)
+    result["history_consumed_cap"] = bool(classification.get("consumed"))
+    result["history_consumed_reason"] = classification.get("reason")
+    if classification.get("warning"):
+        result["warning"] = classification.get("warning")
+    if classification.get("blocked"):
+        result["blocked"] = True
+        result["reason"] = str(classification.get("reason") or "live_daily_order_history_ambiguous")
+        return result
+    if not classification.get("consumed"):
+        return result
+    result["count_today"] = 1
+    if result["count_today"] >= max_daily_orders:
+        result["blocked"] = True
+        result["reason"] = f"live_daily_order_cap_reached:{result['count_today']}>={max_daily_orders}"
     return result
+
+
+def _classify_daily_cap_history(payload: Mapping[str, Any]) -> dict[str, Any]:
+    placed_count = _safe_int(payload.get("placed_count"), 0)
+    rejected_count = _safe_int(payload.get("rejected_count"), 0)
+    submit_attempted = bool(payload.get("submit_attempted"))
+    broker_order_request_attempted = payload.get("broker_order_request_attempted")
+    exchange_order_request_sent = payload.get("exchange_order_request_sent")
+    blocking_reasons = [str(item) for item in list(payload.get("blocking_reasons") or []) if str(item).strip()]
+    failure_stage = str(payload.get("failure_stage") or "").strip()
+    run_id = str(payload.get("run_id") or "unknown")
+
+    if bool(payload.get("daily_cap_consumed")):
+        return {"consumed": True, "blocked": False, "reason": str(payload.get("daily_cap_reason") or "daily_cap_consumed_explicit")}
+    if placed_count > 0:
+        return {"consumed": True, "blocked": False, "reason": f"prior_live_order_placed:{placed_count}"}
+    if exchange_order_request_sent is True:
+        if rejected_count > 0:
+            return {"consumed": True, "blocked": False, "reason": f"prior_exchange_rejected_after_submit:{rejected_count}"}
+        return {"consumed": True, "blocked": False, "reason": "prior_exchange_order_request_sent"}
+    if _is_explicit_pre_exchange_history_failure(blocking_reasons=blocking_reasons, failure_stage=failure_stage):
+        return {
+            "consumed": False,
+            "blocked": False,
+            "reason": "pre_exchange_submit_failure_not_counted",
+            "warning": f"daily_cap_not_consumed_pre_exchange_failure:{run_id}",
+        }
+    if not submit_attempted and placed_count == 0 and rejected_count == 0:
+        return {"consumed": False, "blocked": False, "reason": "no_submit_attempt_recorded"}
+    if exchange_order_request_sent is False and broker_order_request_attempted is True:
+        return {
+            "consumed": False,
+            "blocked": False,
+            "reason": "pre_exchange_submit_failure_not_counted",
+            "warning": f"daily_cap_not_consumed_pre_exchange_failure:{run_id}",
+        }
+    return {
+        "consumed": False,
+        "blocked": True,
+        "reason": "live_daily_order_history_ambiguous",
+    }
+
+
+def _derive_current_run_daily_cap_state(payload: Mapping[str, Any]) -> dict[str, Any]:
+    placed_count = _safe_int(payload.get("placed_count"), 0)
+    rejected_count = _safe_int(payload.get("rejected_count"), 0)
+    if placed_count > 0:
+        return {"consumed": True, "reason": f"placed_count={placed_count}"}
+    if bool(payload.get("exchange_order_request_sent")):
+        if rejected_count > 0:
+            return {"consumed": True, "reason": f"exchange_rejected_count={rejected_count}"}
+        return {"consumed": True, "reason": "exchange_order_request_sent"}
+    if bool(payload.get("broker_order_request_attempted")):
+        return {"consumed": False, "reason": "pre_exchange_submit_failure_not_counted"}
+    return {"consumed": False, "reason": "not_submitted"}
 
 
 def _resolve_live_notional(*, symbol_filters: Mapping[str, dict[str, Any]], max_notional: float) -> float:
@@ -544,6 +633,9 @@ def _finalize(*, root: Path, filename: str, payload: dict[str, Any], status: str
     payload["status"] = status
     payload["blocking_reasons"] = _dedupe_warnings(list(payload.get("blocking_reasons") or []))
     payload["warnings"] = _dedupe_warnings(list(payload.get("warnings") or []))
+    current_cap_state = _derive_current_run_daily_cap_state(payload)
+    payload["daily_cap_consumed"] = bool(current_cap_state.get("consumed"))
+    payload["daily_cap_reason"] = str(current_cap_state.get("reason") or "")
     payload["heartbeat"] = _heartbeat(run_id=str(payload.get("run_id") or ""), moment=_parse_datetime(payload.get("generated_at_utc")) or datetime.now(timezone.utc), phase=phase, status=status)
     atomic_write_json(root / filename, payload)
     return payload
@@ -589,6 +681,28 @@ def _parse_datetime(value: Any) -> datetime | None:
 
 def _safe_error_text(exc: Exception) -> str:
     return str(exc).strip() or exc.__class__.__name__
+
+
+def _is_explicit_pre_exchange_history_failure(*, blocking_reasons: list[str], failure_stage: str) -> bool:
+    lowered = [item.lower() for item in blocking_reasons]
+    if failure_stage == "pre_exchange_client_validation":
+        return True
+    return any("endpoint not in readonly allowlist" in item or "endpoint not in live allowlist" in item for item in lowered)
+
+
+def _exchange_order_request_may_have_been_sent(exc: Exception) -> bool:
+    return not _is_known_pre_exchange_submit_failure(exc)
+
+
+def _classify_submit_failure_stage(exc: Exception) -> str:
+    if _is_known_pre_exchange_submit_failure(exc):
+        return "pre_exchange_client_validation"
+    return "broker_submit_exception"
+
+
+def _is_known_pre_exchange_submit_failure(exc: Exception) -> bool:
+    message = _safe_error_text(exc).lower()
+    return "endpoint not in readonly allowlist" in message or "endpoint not in live allowlist" in message
 
 
 __all__ = [
