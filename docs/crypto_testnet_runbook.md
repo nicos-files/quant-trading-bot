@@ -305,3 +305,75 @@ PYTHONPATH=. .venv/bin/python -m src.tools.run_binance_live_micro_submit \
 ```
 
 Live remains blocked in this package even when readiness is healthy.
+## Future Live Micro-Submit Path
+
+This path is implemented but must not be executed casually.
+
+Rules:
+- never export `BINANCE_LIVE_CONFIRM_SUBMIT=YES` globally
+- use separate live API credentials, never the readonly key
+- require a fresh successful mainnet readonly preflight
+- require `binance_live_readiness.json` in `READY_FOR_PREPARE_ONLY`
+- require `BINANCE_LIVE_KILL_SWITCH=0`
+- require `BINANCE_LIVE_ALLOWED_SYMBOLS=BTCUSDT`
+- require `BINANCE_LIVE_MAX_NOTIONAL<=5`
+- require `BINANCE_LIVE_MAX_DAILY_ORDERS=1`
+- require `BINANCE_LIVE_MAX_OPEN_ORDERS=1`
+- stop if `live_min_notional_exceeds_configured_cap` appears
+
+Prepared command only. Do not run automatically from documentation:
+
+```bash
+timeout 120s env \
+  PYTHONPATH=. \
+  BINANCE_LIVE_TRADING_ENABLED=1 \
+  BINANCE_LIVE_CONFIRM_SUBMIT=YES \
+  BINANCE_LIVE_KILL_SWITCH=0 \
+  BINANCE_LIVE_BASE_URL=https://api.binance.com \
+  BINANCE_LIVE_ALLOWED_SYMBOLS=BTCUSDT \
+  BINANCE_LIVE_MAX_NOTIONAL=5 \
+  BINANCE_LIVE_MAX_DAILY_ORDERS=1 \
+  BINANCE_LIVE_MAX_OPEN_ORDERS=1 \
+  BINANCE_LIVE_API_KEY=REDACTED \
+  BINANCE_LIVE_API_SECRET=REDACTED \
+  .venv/bin/python -m src.tools.run_binance_live_micro_submit \
+  --artifacts-dir artifacts/crypto_mainnet \
+  --execute
+```
+
+Immediate post-submit checks:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m src.tools.run_binance_mainnet_readonly_preflight
+
+PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_binance_live_readiness \
+  --artifacts-dir artifacts/crypto_mainnet
+
+python3 - <<'"'"'PY'"'"'
+import json, pathlib
+for path in [
+    "artifacts/crypto_mainnet/binance_mainnet_readonly_preflight.json",
+    "artifacts/crypto_mainnet/binance_live_readiness.json",
+    "artifacts/crypto_mainnet/binance_live_micro_submit_result.json",
+]:
+    print(f"\n== {path} ==")
+    p = pathlib.Path(path)
+    if not p.exists():
+        print("MISSING")
+        continue
+    print(p.read_text(encoding="utf-8")[:4000])
+PY
+```
+
+Stop immediately if any of these appears:
+- wrong base URL
+- kill switch active
+- stale or missing readonly artifact
+- readonly/readiness blocking reasons
+- open orders present before submit
+- open orders present after submit
+- missing fill
+- delta reconciliation mismatch
+- daily cap already consumed
+- min notional exceeds configured cap
+- any ambiguous or partial state
