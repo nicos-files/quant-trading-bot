@@ -163,6 +163,19 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
             },
         )
 
+    def _seed_soak_pass(self) -> None:
+        daily_root = self.root / 'daily_close'
+        daily_root.mkdir(parents=True, exist_ok=True)
+        for offset in range(3):
+            date = (self.now - timedelta(days=offset)).strftime('%Y%m%d')
+            self._write(
+                daily_root / f'binance_live_daily_close_{date}.json',
+                {
+                    'date_utc': date,
+                    'soak_day_status': 'PASS',
+                },
+            )
+
     def test_default_without_execute_stays_prepare_only(self) -> None:
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), now=self.now)
         self.assertTrue(result['ok'])
@@ -203,9 +216,15 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         self.assertIn('live_mode_armed_manual_execute_blocked', result['blocking_reasons'])
 
     def test_execute_blocks_in_scheduled_window_outside_window(self) -> None:
+        self._seed_soak_pass()
         result = run_binance_live_micro_submit(
             artifacts_dir=self.root,
-            env=_live_env(BINANCE_LIVE_MODE='SCHEDULED_WINDOW', BINANCE_LIVE_START_TIME_UTC='13:00', BINANCE_LIVE_END_TIME_UTC='14:00'),
+            env=_live_env(
+                BINANCE_LIVE_MODE='SCHEDULED_WINDOW',
+                BINANCE_LIVE_START_TIME_UTC='13:00',
+                BINANCE_LIVE_END_TIME_UTC='14:00',
+                BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED='1',
+            ),
             now=self.now,
             execute=True,
         )
@@ -213,10 +232,16 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         self.assertIn('live_mode_scheduled_window_execute_blocked', result['blocking_reasons'])
 
     def test_execute_allows_scheduled_window_inside_window(self) -> None:
+        self._seed_soak_pass()
         client = _FakeClient()
         result = run_binance_live_micro_submit(
             artifacts_dir=self.root,
-            env=_live_env(BINANCE_LIVE_MODE='SCHEDULED_WINDOW', BINANCE_LIVE_START_TIME_UTC='11:00', BINANCE_LIVE_END_TIME_UTC='13:00'),
+            env=_live_env(
+                BINANCE_LIVE_MODE='SCHEDULED_WINDOW',
+                BINANCE_LIVE_START_TIME_UTC='11:00',
+                BINANCE_LIVE_END_TIME_UTC='13:00',
+                BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED='1',
+            ),
             client=client,
             now=self.now,
             execute=True,
@@ -224,6 +249,21 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(result['status'], 'SUCCESS')
         self.assertEqual(len(client.place_order_calls), 1)
+
+    def test_execute_blocks_in_scheduled_window_without_soak_pass(self) -> None:
+        result = run_binance_live_micro_submit(
+            artifacts_dir=self.root,
+            env=_live_env(
+                BINANCE_LIVE_MODE='SCHEDULED_WINDOW',
+                BINANCE_LIVE_START_TIME_UTC='11:00',
+                BINANCE_LIVE_END_TIME_UTC='13:00',
+                BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED='1',
+            ),
+            now=self.now,
+            execute=True,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('live_scheduled_window_requires_soak_passed', result['blocking_reasons'])
 
     def test_execute_blocks_when_live_mode_is_halted(self) -> None:
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_MODE='HALTED'), now=self.now, execute=True)

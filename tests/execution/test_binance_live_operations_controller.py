@@ -71,6 +71,19 @@ class BinanceLiveOperationsControllerTests(unittest.TestCase):
             },
         )
 
+    def _seed_soak_pass(self) -> None:
+        daily_root = self.root / 'daily_close'
+        daily_root.mkdir(parents=True, exist_ok=True)
+        for offset in range(3):
+            date = (self.now - timedelta(days=offset)).strftime('%Y%m%d')
+            self._write(
+                daily_root / f'binance_live_daily_close_{date}.json',
+                {
+                    'date_utc': date,
+                    'soak_day_status': 'PASS',
+                },
+            )
+
     def _env(self, **overrides: str) -> dict[str, str]:
         base = {
             'BINANCE_LIVE_MODE': MODE_SINGLE_SHOT,
@@ -117,22 +130,63 @@ class BinanceLiveOperationsControllerTests(unittest.TestCase):
         self.assertEqual(result['effective_order_budget'], 5.0)
 
     def test_scheduled_window_blocks_outside_window(self) -> None:
+        self._seed_soak_pass()
         result = evaluate_binance_live_operations(
             artifacts_dir=self.root,
-            env=self._env(BINANCE_LIVE_MODE=MODE_SCHEDULED_WINDOW, BINANCE_LIVE_START_TIME_UTC='13:00', BINANCE_LIVE_END_TIME_UTC='14:00'),
+            env=self._env(
+                BINANCE_LIVE_MODE=MODE_SCHEDULED_WINDOW,
+                BINANCE_LIVE_START_TIME_UTC='13:00',
+                BINANCE_LIVE_END_TIME_UTC='14:00',
+                BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED='1',
+            ),
             now=self.now,
         )
         self.assertFalse(result['can_scheduled_trade'])
         self.assertIn('scheduled_window_closed', result['warnings'])
 
     def test_scheduled_window_allows_inside_window(self) -> None:
+        self._seed_soak_pass()
         result = evaluate_binance_live_operations(
             artifacts_dir=self.root,
-            env=self._env(BINANCE_LIVE_MODE=MODE_SCHEDULED_WINDOW, BINANCE_LIVE_START_TIME_UTC='11:00', BINANCE_LIVE_END_TIME_UTC='13:00'),
+            env=self._env(
+                BINANCE_LIVE_MODE=MODE_SCHEDULED_WINDOW,
+                BINANCE_LIVE_START_TIME_UTC='11:00',
+                BINANCE_LIVE_END_TIME_UTC='13:00',
+                BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED='1',
+            ),
             now=self.now,
         )
         self.assertTrue(result['ok'])
         self.assertTrue(result['can_scheduled_trade'])
+
+    def test_scheduled_window_blocks_without_soak_pass(self) -> None:
+        result = evaluate_binance_live_operations(
+            artifacts_dir=self.root,
+            env=self._env(
+                BINANCE_LIVE_MODE=MODE_SCHEDULED_WINDOW,
+                BINANCE_LIVE_START_TIME_UTC='11:00',
+                BINANCE_LIVE_END_TIME_UTC='13:00',
+                BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED='1',
+            ),
+            now=self.now,
+        )
+        self.assertFalse(result['can_scheduled_trade'])
+        self.assertIn('live_scheduled_window_requires_soak_passed', result['blocking_reasons'])
+
+    def test_scheduled_window_blocks_without_enable_flag(self) -> None:
+        self._seed_soak_pass()
+        result = evaluate_binance_live_operations(
+            artifacts_dir=self.root,
+            env=self._env(
+                BINANCE_LIVE_MODE=MODE_SCHEDULED_WINDOW,
+                BINANCE_LIVE_START_TIME_UTC='11:00',
+                BINANCE_LIVE_END_TIME_UTC='13:00',
+            ),
+            now=self.now,
+        )
+        self.assertFalse(result['can_scheduled_trade'])
+        self.assertIn('live_scheduled_window_not_enabled', result['blocking_reasons'])
+        self.assertTrue(result['can_prepare'])
 
     def test_halted_blocks_everything(self) -> None:
         halt_binance_live_operations(artifacts_dir=self.root, reason='ops')

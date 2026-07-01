@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from datetime import datetime, time, timezone
@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.execution.binance_live_readiness import evaluate_binance_live_readiness
+from src.execution.binance_live_soak_status import evaluate_binance_live_soak_status
+from src.execution.binance_mainnet_readonly_preflight import ARTIFACTS_SUBDIR, DEFAULT_MAINNET_BASE_URL
+from src.utils.atomic_io import atomic_write_json
 
 LIVE_TRADING_ENABLED_ENV = "BINANCE_LIVE_TRADING_ENABLED"
 LIVE_CONFIRM_SUBMIT_ENV = "BINANCE_LIVE_CONFIRM_SUBMIT"
@@ -16,18 +19,15 @@ LIVE_MAX_NOTIONAL_ENV = "BINANCE_LIVE_MAX_NOTIONAL"
 LIVE_MAX_DAILY_ORDERS_ENV = "BINANCE_LIVE_MAX_DAILY_ORDERS"
 LIVE_MAX_OPEN_ORDERS_ENV = "BINANCE_LIVE_MAX_OPEN_ORDERS"
 LIVE_QUOTE_BALANCE_BUFFER_PCT_ENV = "BINANCE_LIVE_QUOTE_BALANCE_BUFFER_PCT"
-LIVE_SYMBOL = "BTCUSDT"
-LIVE_QUOTE_ASSET = "USDT"
-
-from src.execution.binance_mainnet_readonly_preflight import ARTIFACTS_SUBDIR, DEFAULT_MAINNET_BASE_URL
-from src.utils.atomic_io import atomic_write_json
-
 LIVE_MODE_ENV = "BINANCE_LIVE_MODE"
 LIVE_MAX_DAILY_NOTIONAL_ENV = "BINANCE_LIVE_MAX_DAILY_NOTIONAL"
 LIVE_START_TIME_UTC_ENV = "BINANCE_LIVE_START_TIME_UTC"
 LIVE_END_TIME_UTC_ENV = "BINANCE_LIVE_END_TIME_UTC"
 LIVE_REQUIRE_MANUAL_ARM_ENV = "BINANCE_LIVE_REQUIRE_MANUAL_ARM"
 LIVE_ARM_TOKEN_ENV = "BINANCE_LIVE_ARM_TOKEN"
+LIVE_SCHEDULED_WINDOW_ENABLED_ENV = "BINANCE_LIVE_SCHEDULED_WINDOW_ENABLED"
+LIVE_SYMBOL = "BTCUSDT"
+LIVE_QUOTE_ASSET = "USDT"
 
 MODE_OFF = "OFF"
 MODE_READ_ONLY = "READ_ONLY"
@@ -69,6 +69,7 @@ def evaluate_binance_live_operations(
     readonly_payload = _load_json(readonly_path)
     live_result = _load_json(root / _RESULT_FILENAME)
     halt_state = _load_json(root / _HALT_FILENAME)
+    soak_status = evaluate_binance_live_soak_status(artifacts_dir=root, now=moment)
 
     live_mode = _normalize_mode(source_env.get(LIVE_MODE_ENV))
     max_notional = _safe_float(source_env.get(LIVE_MAX_NOTIONAL_ENV), 0.0)
@@ -80,6 +81,7 @@ def evaluate_binance_live_operations(
     live_trading_enabled = str(source_env.get(LIVE_TRADING_ENABLED_ENV) or "").strip() == "1"
     require_manual_arm = str(source_env.get(LIVE_REQUIRE_MANUAL_ARM_ENV) or "1").strip() != "0"
     arm_token = str(source_env.get(LIVE_ARM_TOKEN_ENV) or "").strip()
+    scheduled_window_enabled = str(source_env.get(LIVE_SCHEDULED_WINDOW_ENABLED_ENV) or "").strip() == "1"
     quote_free_balance = _extract_quote_free_balance_from_readonly(readonly_payload, LIVE_QUOTE_ASSET)
     quote_buffer_pct = _safe_float(source_env.get(LIVE_QUOTE_BALANCE_BUFFER_PCT_ENV), _DEFAULT_QUOTE_BUFFER_PCT)
     daily_usage = _derive_daily_usage(live_result=live_result, moment=moment)
@@ -146,6 +148,10 @@ def evaluate_binance_live_operations(
         )
         if not window_ok:
             warnings.append("scheduled_window_closed")
+        if not scheduled_window_enabled:
+            blocking_reasons.append("live_scheduled_window_not_enabled")
+        if str(soak_status.get("soak_status") or "") != "PASSED":
+            blocking_reasons.append("live_scheduled_window_requires_soak_passed")
 
     if require_manual_arm and live_mode in {MODE_SINGLE_SHOT, MODE_SCHEDULED_WINDOW} and not arm_token:
         blocking_reasons.append("live_manual_arm_token_required")
@@ -159,12 +165,28 @@ def evaluate_binance_live_operations(
         blocking_reasons.append("live_base_url_must_be_api_binance_com")
 
     blocking_reasons = _dedupe(blocking_reasons)
-    warnings = _dedupe(warnings + [str(item) for item in list(readiness.get("warnings") or []) if str(item).strip()])
-
-    can_prepare = (
-        live_mode in {MODE_ARMED_MANUAL, MODE_SINGLE_SHOT, MODE_SCHEDULED_WINDOW}
-        and not _has_hard_blocker(blocking_reasons, ignore={"live_mode_off", "live_mode_halted", "live_max_daily_orders_reached", "live_max_daily_notional_reached", "live_insufficient_quote_balance_precheck", "live_effective_order_budget_unavailable", "live_quote_balance_unavailable", "live_manual_arm_token_required", "live_trading_enabled_flag_required", "live_confirm_submit_yes_required", "live_kill_switch_must_be_zero_for_submit"})
+    warnings = _dedupe(
+        warnings
+        + [str(item) for item in list(readiness.get("warnings") or []) if str(item).strip()]
+        + [str(item) for item in list(soak_status.get("blockers") or []) if str(item).strip()]
     )
+
+    ignored_prepare_blockers = {
+        "live_mode_off",
+        "live_mode_halted",
+        "live_max_daily_orders_reached",
+        "live_max_daily_notional_reached",
+        "live_insufficient_quote_balance_precheck",
+        "live_effective_order_budget_unavailable",
+        "live_quote_balance_unavailable",
+        "live_manual_arm_token_required",
+        "live_trading_enabled_flag_required",
+        "live_confirm_submit_yes_required",
+        "live_kill_switch_must_be_zero_for_submit",
+        "live_scheduled_window_not_enabled",
+        "live_scheduled_window_requires_soak_passed",
+    }
+    can_prepare = live_mode in {MODE_ARMED_MANUAL, MODE_SINGLE_SHOT, MODE_SCHEDULED_WINDOW} and not _has_hard_blocker(blocking_reasons, ignore=ignored_prepare_blockers)
     can_single_shot = live_mode == MODE_SINGLE_SHOT and not blocking_reasons
     can_scheduled_trade = live_mode == MODE_SCHEDULED_WINDOW and window_ok and not blocking_reasons
 
@@ -213,6 +235,10 @@ def evaluate_binance_live_operations(
         "can_prepare": can_prepare,
         "can_single_shot": can_single_shot,
         "can_scheduled_trade": can_scheduled_trade,
+        "scheduled_window_enabled": scheduled_window_enabled,
+        "soak_status": str(soak_status.get("soak_status") or "INCOMPLETE"),
+        "soak_days_required": soak_status.get("days_required"),
+        "soak_days_passed": soak_status.get("days_passed"),
         "next_allowed_mode": next_allowed_mode,
         "blocking_reasons": blocking_reasons,
         "warnings": warnings,
@@ -222,6 +248,7 @@ def evaluate_binance_live_operations(
             "live_readiness": str(root / "binance_live_readiness.json"),
             "live_result": str(root / _RESULT_FILENAME),
             "live_halt_state": str(root / _HALT_FILENAME),
+            "live_soak_status": str(root / "binance_live_soak_status.json"),
         },
         "artifacts": {
             _STATUS_FILENAME: str(root / _STATUS_FILENAME),
@@ -326,7 +353,7 @@ def _is_inside_window(*, moment: datetime, start_raw: str | None, end_raw: str |
     end = _parse_hhmm(end_raw)
     if start is None or end is None:
         return False
-    current = moment.astimezone(timezone.utc).time()
+    current = moment.astimezone(timezone.utc).time().replace(tzinfo=None)
     if start <= end:
         return start <= current <= end
     return current >= start or current <= end
@@ -403,6 +430,7 @@ __all__ = [
     "LIVE_MAX_DAILY_NOTIONAL_ENV",
     "LIVE_MODE_ENV",
     "LIVE_REQUIRE_MANUAL_ARM_ENV",
+    "LIVE_SCHEDULED_WINDOW_ENABLED_ENV",
     "LIVE_START_TIME_UTC_ENV",
     "LIVE_END_TIME_UTC_ENV",
     "MODE_ARMED_MANUAL",
