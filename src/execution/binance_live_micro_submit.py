@@ -43,6 +43,7 @@ LIVE_ALLOWED_SYMBOLS_ENV = "BINANCE_LIVE_ALLOWED_SYMBOLS"
 LIVE_MAX_NOTIONAL_ENV = "BINANCE_LIVE_MAX_NOTIONAL"
 LIVE_MAX_DAILY_ORDERS_ENV = "BINANCE_LIVE_MAX_DAILY_ORDERS"
 LIVE_MAX_OPEN_ORDERS_ENV = "BINANCE_LIVE_MAX_OPEN_ORDERS"
+LIVE_QUOTE_BALANCE_BUFFER_PCT_ENV = "BINANCE_LIVE_QUOTE_BALANCE_BUFFER_PCT"
 MAINNET_API_KEY_ENV = "BINANCE_MAINNET_API_KEY"
 MAINNET_API_SECRET_ENV = "BINANCE_MAINNET_API_SECRET"
 
@@ -50,6 +51,7 @@ LIVE_SYMBOL = "BTCUSDT"
 LIVE_QUOTE_ASSET = "USDT"
 LIVE_ORDER_TYPE = "MARKET"
 _MAX_FIRST_LIVE_NOTIONAL = 5.0
+_DEFAULT_QUOTE_BALANCE_BUFFER_PCT = 0.01
 _PLAN_FILENAME = "binance_live_micro_submit_plan.json"
 _RESULT_FILENAME = "binance_live_micro_submit_result.json"
 
@@ -232,6 +234,10 @@ def _run_execute(
         result["blocking_reasons"] = [str(exc)]
         return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="BLOCKED", phase="notional_gate")
     result["requested_notional"] = requested_notional
+    result["required_quote_balance"] = _required_quote_balance(
+        requested_notional=requested_notional,
+        buffer_pct=_resolve_quote_balance_buffer_pct(source_env),
+    )
 
     warnings = list(result["warnings"])
     pre_state = _reconcile_exchange_state(
@@ -252,6 +258,17 @@ def _run_execute(
     if int(result["pre_open_orders_count"] or 0) != 0:
         result["blocking_reasons"] = [f"unexpected_open_orders_present:{result['pre_open_orders_count']}"]
         return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="BLOCKED", phase="pre_open_orders_gate")
+
+    result["quote_free_balance"] = _extract_quote_free_balance(pre_state, LIVE_QUOTE_ASSET)
+    if result["quote_free_balance"] is None:
+        result["failure_stage"] = "pre_exchange_balance_validation"
+        result["blocking_reasons"] = ["live_quote_balance_precheck_unavailable"]
+        return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="BLOCKED", phase="balance_precheck_gate")
+    result["balance_precheck_ok"] = bool(float(result["quote_free_balance"]) >= float(result["required_quote_balance"] or 0.0))
+    if not result["balance_precheck_ok"]:
+        result["failure_stage"] = "pre_exchange_balance_validation"
+        result["blocking_reasons"] = ["live_insufficient_quote_balance_precheck"]
+        return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="BLOCKED", phase="balance_precheck_gate")
 
     params = {
         "symbol": LIVE_SYMBOL,
@@ -369,6 +386,10 @@ def _base_result(
         "placed_count": 0,
         "rejected_count": 0,
         "requested_notional": None,
+        "quote_asset": LIVE_QUOTE_ASSET,
+        "quote_free_balance": None,
+        "required_quote_balance": None,
+        "balance_precheck_ok": False,
         "daily_cap_consumed": False,
         "daily_cap_reason": "not_submitted",
         "placement_stage": "not_started",
@@ -565,6 +586,31 @@ def _derive_current_run_daily_cap_state(payload: Mapping[str, Any]) -> dict[str,
     if bool(payload.get("broker_order_request_attempted")):
         return {"consumed": False, "reason": "pre_exchange_submit_failure_not_counted"}
     return {"consumed": False, "reason": "not_submitted"}
+
+
+def _resolve_quote_balance_buffer_pct(source_env: Mapping[str, str]) -> float:
+    buffer_pct = _safe_float(source_env.get(LIVE_QUOTE_BALANCE_BUFFER_PCT_ENV), _DEFAULT_QUOTE_BALANCE_BUFFER_PCT)
+    if buffer_pct < 0:
+        return _DEFAULT_QUOTE_BALANCE_BUFFER_PCT
+    return buffer_pct
+
+
+def _required_quote_balance(*, requested_notional: float, buffer_pct: float) -> float:
+    return float(requested_notional) * (1.0 + float(buffer_pct))
+
+
+def _extract_quote_free_balance(exchange_state: Mapping[str, Any], quote_asset: str) -> float | None:
+    account = exchange_state.get("account") if isinstance(exchange_state, Mapping) else None
+    balances = (account or {}).get("balances") if isinstance(account, Mapping) else None
+    if not isinstance(balances, Mapping):
+        return None
+    quote_balance = balances.get(str(quote_asset or "").upper())
+    if not isinstance(quote_balance, Mapping):
+        return None
+    try:
+        return float(quote_balance.get("free"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_live_notional(*, symbol_filters: Mapping[str, dict[str, Any]], max_notional: float) -> float:
