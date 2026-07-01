@@ -19,6 +19,12 @@ from src.brokers.binance_spot_mainnet import (
     mask_api_key,
     resolve_credentials,
 )
+from src.execution.binance_live_operations_controller import (
+    MODE_ARMED_MANUAL,
+    MODE_SCHEDULED_WINDOW,
+    MODE_SINGLE_SHOT,
+    evaluate_binance_live_operations,
+)
 from src.execution.binance_live_readiness import evaluate_binance_live_readiness
 from src.execution.binance_mainnet_readonly_preflight import ARTIFACTS_SUBDIR
 from src.execution.binance_testnet_executor import (
@@ -149,10 +155,14 @@ def _run_prepare_only(
     result["warnings"] = ["prepare_only_no_live_order_executed"]
     readiness = evaluate_binance_live_readiness(artifacts_dir=root, now=moment)
     result["readiness_dependency"] = _summarize_readiness(root=root, readiness=readiness)
+    live_operations = evaluate_binance_live_operations(artifacts_dir=root, env=source_env, now=moment)
+    result["live_operations"] = _summarize_live_operations(root=root, live_operations=live_operations)
 
     if forced_reason is not None:
         result["blocking_reasons"].append(forced_reason)
     result["blocking_reasons"].extend(_preflight_gates(source_env=source_env, readiness=readiness, for_execute=False))
+    if not bool(live_operations.get("can_prepare")):
+        result["blocking_reasons"].extend(_controller_prepare_blockers(live_operations))
     result["blocking_reasons"] = _dedupe_warnings(list(result["blocking_reasons"]))
     if result["blocking_reasons"]:
         return _finalize(root=root, filename=_PLAN_FILENAME, payload=result, status="BLOCKED", phase="prepare_only_gate")
@@ -184,7 +194,10 @@ def _run_execute(
 
     readiness = evaluate_binance_live_readiness(artifacts_dir=root, now=moment)
     result["readiness_dependency"] = _summarize_readiness(root=root, readiness=readiness)
+    live_operations = evaluate_binance_live_operations(artifacts_dir=root, env=source_env, now=moment)
+    result["live_operations"] = _summarize_live_operations(root=root, live_operations=live_operations)
     result["blocking_reasons"].extend(_preflight_gates(source_env=source_env, readiness=readiness, for_execute=True))
+    result["blocking_reasons"].extend(_controller_execute_blockers(live_operations))
 
     daily_guard = _check_daily_order_cap(root=root, moment=moment, max_daily_orders=int(result["max_daily_orders"] or 0))
     result["daily_order_cap"] = daily_guard
@@ -412,6 +425,40 @@ def _base_result(
     }
 
 
+def _summarize_live_operations(*, root: Path, live_operations: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "path": str(root / "binance_live_operations_status.json"),
+        "exists": True,
+        "status": live_operations.get("status"),
+        "live_mode": live_operations.get("live_mode"),
+        "can_prepare": live_operations.get("can_prepare"),
+        "can_single_shot": live_operations.get("can_single_shot"),
+        "can_scheduled_trade": live_operations.get("can_scheduled_trade"),
+        "blocking_reasons": list(live_operations.get("blocking_reasons") or []),
+    }
+
+
+def _controller_prepare_blockers(live_operations: Mapping[str, Any]) -> list[str]:
+    reasons = [str(item) for item in list(live_operations.get("blocking_reasons") or []) if str(item).strip()]
+    if not reasons:
+        reasons.append(f"live_operations_prepare_not_allowed:{live_operations.get('live_mode')}")
+    return reasons
+
+
+def _controller_execute_blockers(live_operations: Mapping[str, Any]) -> list[str]:
+    live_mode = str(live_operations.get("live_mode") or "")
+    reasons = [str(item) for item in list(live_operations.get("blocking_reasons") or []) if str(item).strip()]
+    if live_mode == MODE_ARMED_MANUAL:
+        reasons.append("live_mode_armed_manual_execute_blocked")
+    elif live_mode == MODE_SINGLE_SHOT and not bool(live_operations.get("can_single_shot")):
+        reasons.append("live_mode_single_shot_execute_blocked")
+    elif live_mode == MODE_SCHEDULED_WINDOW and not bool(live_operations.get("can_scheduled_trade")):
+        reasons.append("live_mode_scheduled_window_execute_blocked")
+    elif live_mode not in {MODE_SINGLE_SHOT, MODE_SCHEDULED_WINDOW}:
+        reasons.append(f"live_mode_execute_not_allowed:{live_mode}")
+    return _dedupe_warnings(reasons)
+
+
 def _summarize_readiness(*, root: Path, readiness: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "path": str(root / "binance_live_readiness.json"),
@@ -430,14 +477,14 @@ def _preflight_gates(*, source_env: Mapping[str, str], readiness: Mapping[str, A
     if readiness_blockers:
         reasons.append("live_readiness_has_blocking_reasons")
         reasons.extend(readiness_blockers)
-    if str(source_env.get(LIVE_TRADING_ENABLED_ENV) or "").strip() != "1":
+    if for_execute and str(source_env.get(LIVE_TRADING_ENABLED_ENV) or "").strip() != "1":
         reasons.append("live_trading_enabled_flag_required")
-    if str(source_env.get(LIVE_CONFIRM_SUBMIT_ENV) or "").strip() != "YES":
+    if for_execute and str(source_env.get(LIVE_CONFIRM_SUBMIT_ENV) or "").strip() != "YES":
         reasons.append("live_confirm_submit_yes_required")
     expected_kill_value = "0"
     actual_kill = str(source_env.get(LIVE_KILL_SWITCH_ENV) or "1").strip()
-    if actual_kill != expected_kill_value:
-        reasons.append("live_kill_switch_must_be_zero_for_submit" if for_execute else "live_kill_switch_must_be_zero_for_future_submit")
+    if for_execute and actual_kill != expected_kill_value:
+        reasons.append("live_kill_switch_must_be_zero_for_submit")
     kill_switch_file = _check_kill_switch_file(source_env=source_env)
     if kill_switch_file is not None:
         reasons.append(kill_switch_file)
@@ -453,9 +500,9 @@ def _preflight_gates(*, source_env: Mapping[str, str], readiness: Mapping[str, A
         reasons.append("live_max_daily_orders_must_equal_1")
     if _safe_int(source_env.get(LIVE_MAX_OPEN_ORDERS_ENV), 0) != 1:
         reasons.append("live_max_open_orders_must_equal_1")
-    if not bool(str(source_env.get(LIVE_API_KEY_ENV) or "").strip()):
+    if for_execute and not bool(str(source_env.get(LIVE_API_KEY_ENV) or "").strip()):
         reasons.append("missing_live_api_key")
-    if not bool(str(source_env.get(LIVE_API_SECRET_ENV) or "").strip()):
+    if for_execute and not bool(str(source_env.get(LIVE_API_SECRET_ENV) or "").strip()):
         reasons.append("missing_live_api_secret")
     readonly_key = str(source_env.get(MAINNET_API_KEY_ENV) or "").strip()
     live_key = str(source_env.get(LIVE_API_KEY_ENV) or "").strip()
@@ -492,6 +539,7 @@ def _check_daily_order_cap(*, root: Path, moment: datetime, max_daily_orders: in
         "history_status": None,
         "history_consumed_cap": False,
         "history_consumed_reason": None,
+        "history_requested_notional": None,
         "warning": None,
     }
     if max_daily_orders <= 0:
@@ -518,6 +566,7 @@ def _check_daily_order_cap(*, root: Path, moment: datetime, max_daily_orders: in
     classification = _classify_daily_cap_history(payload)
     result["history_consumed_cap"] = bool(classification.get("consumed"))
     result["history_consumed_reason"] = classification.get("reason")
+    result["history_requested_notional"] = classification.get("requested_notional")
     if classification.get("warning"):
         result["warning"] = classification.get("warning")
     if classification.get("blocked"):
@@ -543,14 +592,15 @@ def _classify_daily_cap_history(payload: Mapping[str, Any]) -> dict[str, Any]:
     failure_stage = str(payload.get("failure_stage") or "").strip()
     run_id = str(payload.get("run_id") or "unknown")
 
+    requested_notional = _safe_float(payload.get("requested_notional"), None)
     if bool(payload.get("daily_cap_consumed")):
-        return {"consumed": True, "blocked": False, "reason": str(payload.get("daily_cap_reason") or "daily_cap_consumed_explicit")}
+        return {"consumed": True, "blocked": False, "reason": str(payload.get("daily_cap_reason") or "daily_cap_consumed_explicit"), "requested_notional": requested_notional}
     if placed_count > 0:
-        return {"consumed": True, "blocked": False, "reason": f"prior_live_order_placed:{placed_count}"}
+        return {"consumed": True, "blocked": False, "reason": f"prior_live_order_placed:{placed_count}", "requested_notional": requested_notional}
     if exchange_order_request_sent is True:
         if rejected_count > 0:
-            return {"consumed": True, "blocked": False, "reason": f"prior_exchange_rejected_after_submit:{rejected_count}"}
-        return {"consumed": True, "blocked": False, "reason": "prior_exchange_order_request_sent"}
+            return {"consumed": True, "blocked": False, "reason": f"prior_exchange_rejected_after_submit:{rejected_count}", "requested_notional": requested_notional}
+        return {"consumed": True, "blocked": False, "reason": "prior_exchange_order_request_sent", "requested_notional": requested_notional}
     if _is_explicit_pre_exchange_history_failure(blocking_reasons=blocking_reasons, failure_stage=failure_stage):
         return {
             "consumed": False,

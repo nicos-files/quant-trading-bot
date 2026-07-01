@@ -109,6 +109,8 @@ def _live_env(**overrides: str) -> dict[str, str]:
         'BINANCE_LIVE_MAX_NOTIONAL': '5',
         'BINANCE_LIVE_MAX_DAILY_ORDERS': '1',
         'BINANCE_LIVE_MAX_OPEN_ORDERS': '1',
+        'BINANCE_LIVE_MODE': 'SINGLE_SHOT',
+        'BINANCE_LIVE_ARM_TOKEN': 'ARMED',
         'BINANCE_LIVE_API_KEY': 'live-key',
         'BINANCE_LIVE_API_SECRET': 'live-secret',
         'BINANCE_MAINNET_API_KEY': 'readonly-key',
@@ -179,6 +181,54 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), now=self.now, prepare_only=True, execute=True)
         self.assertFalse(result['ok'])
         self.assertIn('prepare_only_and_execute_mutually_exclusive', result['blocking_reasons'])
+
+    def test_prepare_only_blocks_when_live_mode_is_off(self) -> None:
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_MODE='OFF'), now=self.now, prepare_only=True)
+        self.assertFalse(result['ok'])
+        self.assertIn('live_mode_off', result['blocking_reasons'])
+
+    def test_prepare_only_blocks_when_live_mode_is_read_only(self) -> None:
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_MODE='READ_ONLY'), now=self.now, prepare_only=True)
+        self.assertFalse(result['ok'])
+        self.assertIn('live_operations_prepare_not_allowed:READ_ONLY', result['blocking_reasons'])
+
+    def test_prepare_only_allowed_in_armed_manual_mode(self) -> None:
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_MODE='ARMED_MANUAL', BINANCE_LIVE_TRADING_ENABLED='0', BINANCE_LIVE_CONFIRM_SUBMIT='NO'), now=self.now, prepare_only=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['status'], 'PREPARED')
+
+    def test_execute_blocks_in_armed_manual_mode(self) -> None:
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_MODE='ARMED_MANUAL'), now=self.now, execute=True)
+        self.assertFalse(result['ok'])
+        self.assertIn('live_mode_armed_manual_execute_blocked', result['blocking_reasons'])
+
+    def test_execute_blocks_in_scheduled_window_outside_window(self) -> None:
+        result = run_binance_live_micro_submit(
+            artifacts_dir=self.root,
+            env=_live_env(BINANCE_LIVE_MODE='SCHEDULED_WINDOW', BINANCE_LIVE_START_TIME_UTC='13:00', BINANCE_LIVE_END_TIME_UTC='14:00'),
+            now=self.now,
+            execute=True,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('live_mode_scheduled_window_execute_blocked', result['blocking_reasons'])
+
+    def test_execute_allows_scheduled_window_inside_window(self) -> None:
+        client = _FakeClient()
+        result = run_binance_live_micro_submit(
+            artifacts_dir=self.root,
+            env=_live_env(BINANCE_LIVE_MODE='SCHEDULED_WINDOW', BINANCE_LIVE_START_TIME_UTC='11:00', BINANCE_LIVE_END_TIME_UTC='13:00'),
+            client=client,
+            now=self.now,
+            execute=True,
+        )
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['status'], 'SUCCESS')
+        self.assertEqual(len(client.place_order_calls), 1)
+
+    def test_execute_blocks_when_live_mode_is_halted(self) -> None:
+        result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_MODE='HALTED'), now=self.now, execute=True)
+        self.assertFalse(result['ok'])
+        self.assertIn('live_mode_halted', result['blocking_reasons'])
 
     def test_execute_blocks_without_live_trading_enabled(self) -> None:
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_TRADING_ENABLED='0'), now=self.now, execute=True)
