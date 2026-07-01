@@ -113,7 +113,7 @@ PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_crypto_operational_status \
 
 ```bash
 PYTHONPATH=. .venv/bin/python -m src.tools.run_crypto_testnet_dry_run \
-  --paper-artifacts-dir artifacts/crypto_paper
+  --paper-artifacts-dir artifacts/crypto_pape
 ```
 
 ### E. Smoke submit only with explicit confirmation
@@ -204,7 +204,11 @@ Any of the following must block further testnet activity until understood:
 - corrupt ledger or artifact corruption
 - ambiguous or partial state
 
-## Explicit Operator Rule`r`n`r`nDo not continue if state is ambiguous.`r`n`r`n## Stop Conditions
+## Explicit Operator Rule
+
+Do not continue if state is ambiguous.
+
+## Stop Conditions
 
 Stop immediately and do not continue if any of these is true:
 - `readiness.status != READY`
@@ -273,3 +277,31 @@ This controlled testnet package can be considered operationally closed when:
 - no one interprets testnet success as live readiness
 
 The package remains testnet-only until a separate live-readiness program is defined and approved.
+## Mainnet Read-Only And Live Readiness
+
+Mainnet read-only preflight does not enable live trading.
+
+Important rules:
+- mainnet read-only OK does not mean live submit is allowed
+- live readiness does not execute orders
+- prepare-only does not execute orders
+- the read-only API key must never be converted into a trading key by reuse
+- `BINANCE_LIVE_CONFIRM_SUBMIT=YES` must never be exported globally in the shell profile or session bootstrap
+- `BINANCE_LIVE_CONFIRM_SUBMIT=YES` is future-use only and must be supplied inline only for a separate, explicitly approved live-submit package
+- future live trading requires a separate API key with Spot Trading enabled, withdrawals disabled, and IP whitelist enabled
+- the first live micro-submit is a separate package and is not implemented here
+
+Safe commands:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m src.tools.run_binance_mainnet_readonly_preflight
+
+PYTHONPATH=. .venv/bin/python -m src.tools.evaluate_binance_live_readiness \
+  --artifacts-dir artifacts/crypto_mainnet
+
+PYTHONPATH=. .venv/bin/python -m src.tools.run_binance_live_micro_submit \
+  --artifacts-dir artifacts/crypto_mainnet \
+  --prepare-only
+```
+
+Live remains blocked in this package even when readiness is healthy.
