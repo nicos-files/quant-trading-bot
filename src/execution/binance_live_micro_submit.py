@@ -295,9 +295,6 @@ def _run_execute(
     if not post_state.get("account_checked") or not post_state.get("open_orders_checked"):
         result["blocking_reasons"] = ["post_submit_exchange_state_unavailable"]
         return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="ERROR", phase="post_exchange_state_gate")
-    if not post_state.get("account_checked") or not post_state.get("open_orders_checked"):
-        result["blocking_reasons"] = ["post_submit_exchange_state_unavailable"]
-        return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="ERROR", phase="post_exchange_state_gate")
 
     delta_payload = _build_smoke_delta_payload(
         pre_exchange_state=pre_state,
@@ -370,7 +367,6 @@ def _base_result(
         "kill_switch_status": "ACTIVE" if str(source_env.get(LIVE_KILL_SWITCH_ENV) or "1").strip() != "0" else "INACTIVE",
         "blocking_reasons": [],
         "warnings": [],
-        "api_key_masked": None,
         "api_key_masked": None,
         "generated_at_utc": moment.isoformat(),
         "heartbeat": _heartbeat(run_id=run_id, moment=moment, phase="initializing", status="PENDING"),
@@ -609,3 +605,5 @@ __all__ = [
     "run_binance_live_micro_submit",
     "run_binance_live_micro_submit_prepare_only",
 ]
+
+

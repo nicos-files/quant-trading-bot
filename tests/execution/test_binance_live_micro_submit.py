@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -219,6 +220,17 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('live_allowed_symbols_must_be_btcusdt_only', result['blocking_reasons'])
 
+    def test_execute_blocks_when_live_credentials_missing(self) -> None:
+        result = run_binance_live_micro_submit(
+            artifacts_dir=self.root,
+            env=_live_env(BINANCE_LIVE_API_KEY='', BINANCE_LIVE_API_SECRET=''),
+            now=self.now,
+            execute=True,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('missing_live_api_key', result['blocking_reasons'])
+        self.assertIn('missing_live_api_secret', result['blocking_reasons'])
+
     def test_execute_blocks_when_reusing_readonly_key(self) -> None:
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(BINANCE_LIVE_API_KEY='readonly-key'), now=self.now, execute=True)
         self.assertFalse(result['ok'])
@@ -259,6 +271,18 @@ class BinanceLiveMicroSubmitTests(unittest.TestCase):
         result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), client=client, now=self.now, execute=True)
         self.assertFalse(result['ok'])
         self.assertIn('live_min_notional_exceeds_configured_cap:10.0>5.0', result['blocking_reasons'])
+
+    def test_execute_constructs_live_trading_client_when_not_injected(self) -> None:
+        fake_client = _FakeClient()
+        with mock.patch('src.execution.binance_live_micro_submit.BinanceSpotMainnetClient', return_value=fake_client) as patched:
+            result = run_binance_live_micro_submit(artifacts_dir=self.root, env=_live_env(), now=self.now, execute=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['status'], 'SUCCESS')
+        patched.assert_called_once()
+        self.assertEqual(patched.call_args.kwargs['api_key'], 'live-key')
+        self.assertEqual(patched.call_args.kwargs['api_secret'], 'live-secret')
+        self.assertEqual(patched.call_args.kwargs['base_url'], 'https://api.binance.com')
+        self.assertEqual(len(fake_client.place_order_calls), 1)
 
     def test_successful_mocked_execute_submits_once_and_reconciles_cleanly(self) -> None:
         client = _FakeClient()

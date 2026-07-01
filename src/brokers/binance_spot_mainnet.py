@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
+from urllib import error, request
 
 from src.brokers.binance_spot_mainnet_readonly import (
     DEFAULT_MAINNET_BASE_URL,
     BinanceMainnetReadonlyConfigError,
     BinanceMainnetReadonlyRequestError,
     BinanceSpotMainnetReadonlyClient,
+    _redact,
     build_query_string,
     is_mainnet_base_url,
     mask_api_key,
@@ -81,7 +84,26 @@ class BinanceSpotMainnetClient(BinanceSpotMainnetReadonlyClient):
         signed: bool,
     ) -> Any:
         cleaned = _validate_endpoint(path)
-        return super()._request_json(method, cleaned, params=params, signed=signed)
+        query = build_query_string(params)
+        url = f"{self.base_url}{cleaned}"
+        if query:
+            url = f"{url}?{query}"
+        headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
+        req = request.Request(url=url, method=method.upper(), headers=headers)
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            message = _redact(body or str(exc), self.api_key, self.api_secret)
+            raise BinanceMainnetRequestError(f"HTTP {exc.code} calling {cleaned}: {message}") from None
+        except Exception as exc:
+            message = _redact(str(exc), self.api_key, self.api_secret)
+            raise BinanceMainnetRequestError(f"Request failed for {cleaned}: {message}") from None
+        try:
+            return json.loads(body or "{}")
+        except Exception as exc:
+            raise BinanceMainnetRequestError(f"Invalid JSON from {cleaned}: {exc}") from None
 
 
 def _validate_endpoint(path: str) -> str:
