@@ -225,10 +225,11 @@ class BinanceLiveOperationsControllerTests(unittest.TestCase):
         self.assertIn('live_max_daily_notional_reached', result['blocking_reasons'])
         self.assertEqual(result['remaining_daily_notional'], 0.0)
 
-    def test_insufficient_balance_blocks_and_budget_uses_min(self) -> None:
+    def test_insufficient_balance_warns_and_budget_uses_min(self) -> None:
         self._write_readonly(quote_free='4.0')
         result = evaluate_binance_live_operations(artifacts_dir=self.root, env=self._env(), now=self.now)
-        self.assertIn('live_insufficient_quote_balance_precheck', result['blocking_reasons'])
+        self.assertNotIn('live_insufficient_quote_balance_precheck', result['blocking_reasons'])
+        self.assertIn('live_quote_balance_below_requested_notional', result['warnings'])
         self.assertEqual(result['effective_order_budget'], 3.96)
 
     def test_previous_error_requires_manual_review(self) -> None:

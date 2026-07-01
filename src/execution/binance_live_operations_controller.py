@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.execution.binance_live_manual_review import load_binance_live_manual_review
 from src.execution.binance_live_readiness import evaluate_binance_live_readiness
 from src.execution.binance_live_soak_status import evaluate_binance_live_soak_status
 from src.execution.binance_mainnet_readonly_preflight import ARTIFACTS_SUBDIR, DEFAULT_MAINNET_BASE_URL
@@ -69,6 +70,7 @@ def evaluate_binance_live_operations(
     readonly_payload = _load_json(readonly_path)
     live_result = _load_json(root / _RESULT_FILENAME)
     halt_state = _load_json(root / _HALT_FILENAME)
+    manual_review = load_binance_live_manual_review(artifacts_dir=root)
     soak_status = evaluate_binance_live_soak_status(artifacts_dir=root, now=moment)
 
     live_mode = _normalize_mode(source_env.get(LIVE_MODE_ENV))
@@ -84,7 +86,7 @@ def evaluate_binance_live_operations(
     scheduled_window_enabled = str(source_env.get(LIVE_SCHEDULED_WINDOW_ENABLED_ENV) or "").strip() == "1"
     quote_free_balance = _extract_quote_free_balance_from_readonly(readonly_payload, LIVE_QUOTE_ASSET)
     quote_buffer_pct = _safe_float(source_env.get(LIVE_QUOTE_BALANCE_BUFFER_PCT_ENV), _DEFAULT_QUOTE_BUFFER_PCT)
-    daily_usage = _derive_daily_usage(live_result=live_result, moment=moment)
+    daily_usage = _derive_daily_usage(live_result=live_result, manual_review=manual_review, moment=moment)
 
     remaining_daily_notional: float | None = None
     if daily_usage["daily_notional_used"] is not None:
@@ -132,12 +134,10 @@ def evaluate_binance_live_operations(
         warnings.append("live_quote_balance_unavailable")
     elif effective_order_budget is None:
         warnings.append("live_effective_order_budget_unavailable")
-    elif effective_order_budget <= 0:
-        blocking_reasons.append("live_insufficient_quote_balance_precheck")
     else:
         required_for_first_order = min(float(max_notional), float(remaining_daily_notional or 0.0))
-        if effective_order_budget < required_for_first_order:
-            blocking_reasons.append("live_insufficient_quote_balance_precheck")
+        if effective_order_budget <= 0 or effective_order_budget < required_for_first_order:
+            warnings.append("live_quote_balance_below_requested_notional")
 
     window_ok = True
     if live_mode == MODE_SCHEDULED_WINDOW:
@@ -169,6 +169,7 @@ def evaluate_binance_live_operations(
         warnings
         + [str(item) for item in list(readiness.get("warnings") or []) if str(item).strip()]
         + [str(item) for item in list(soak_status.get("blockers") or []) if str(item).strip()]
+        + (["manual_review_acknowledged"] if isinstance(manual_review, Mapping) and str(manual_review.get("acknowledged_error_run_id") or "").strip() else [])
     )
 
     ignored_prepare_blockers = {
@@ -179,6 +180,7 @@ def evaluate_binance_live_operations(
         "live_insufficient_quote_balance_precheck",
         "live_effective_order_budget_unavailable",
         "live_quote_balance_unavailable",
+        "live_quote_balance_below_requested_notional",
         "live_manual_arm_token_required",
         "live_trading_enabled_flag_required",
         "live_confirm_submit_yes_required",
@@ -239,6 +241,7 @@ def evaluate_binance_live_operations(
         "soak_status": str(soak_status.get("soak_status") or "INCOMPLETE"),
         "soak_days_required": soak_status.get("days_required"),
         "soak_days_passed": soak_status.get("days_passed"),
+        "manual_review_acknowledged": bool(isinstance(manual_review, Mapping) and str(manual_review.get("acknowledged_error_run_id") or "").strip()),
         "next_allowed_mode": next_allowed_mode,
         "blocking_reasons": blocking_reasons,
         "warnings": warnings,
@@ -248,6 +251,7 @@ def evaluate_binance_live_operations(
             "live_readiness": str(root / "binance_live_readiness.json"),
             "live_result": str(root / _RESULT_FILENAME),
             "live_halt_state": str(root / _HALT_FILENAME),
+            "live_manual_review": str(root / "binance_live_manual_review.json"),
             "live_soak_status": str(root / "binance_live_soak_status.json"),
         },
         "artifacts": {
@@ -287,7 +291,7 @@ def _normalize_mode(raw: str | None) -> str:
     return candidate if candidate in _ALLOWED_MODES else MODE_OFF
 
 
-def _derive_daily_usage(*, live_result: Any, moment: datetime) -> dict[str, Any]:
+def _derive_daily_usage(*, live_result: Any, manual_review: Any, moment: datetime) -> dict[str, Any]:
     result = {
         "daily_order_count": 0,
         "daily_notional_used": 0.0,
@@ -303,7 +307,8 @@ def _derive_daily_usage(*, live_result: Any, moment: datetime) -> dict[str, Any]
     if stamp.date() != moment.date():
         return result
     status = str(live_result.get("status") or "").upper()
-    if status == "ERROR" and not bool(live_result.get("manual_review_acknowledged")):
+    review_matches = _manual_review_matches(live_result=live_result, manual_review=manual_review)
+    if status == "ERROR" and not bool(live_result.get("manual_review_acknowledged")) and not review_matches:
         result["previous_error_requires_review"] = True
     if bool(live_result.get("daily_cap_consumed")):
         requested = _safe_float(live_result.get("requested_notional"), None)
@@ -397,6 +402,14 @@ def _parse_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def _manual_review_matches(*, live_result: Any, manual_review: Any) -> bool:
+    if not isinstance(live_result, Mapping) or not isinstance(manual_review, Mapping):
+        return False
+    run_id = str(live_result.get("run_id") or "").strip()
+    reviewed_run_id = str(manual_review.get("acknowledged_error_run_id") or "").strip()
+    return bool(run_id and reviewed_run_id and run_id == reviewed_run_id and bool(manual_review.get("reviewed_by_operator")))
 
 
 def _has_hard_blocker(blocking_reasons: list[str], ignore: set[str] | None = None) -> bool:

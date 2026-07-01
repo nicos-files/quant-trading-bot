@@ -196,6 +196,8 @@ def _run_execute(
     result["readiness_dependency"] = _summarize_readiness(root=root, readiness=readiness)
     live_operations = evaluate_binance_live_operations(artifacts_dir=root, env=source_env, now=moment)
     result["live_operations"] = _summarize_live_operations(root=root, live_operations=live_operations)
+    if live_operations.get("quote_free_balance") is not None:
+        result["quote_free_balance"] = live_operations.get("quote_free_balance")
     result["blocking_reasons"].extend(_preflight_gates(source_env=source_env, readiness=readiness, for_execute=True))
     result["blocking_reasons"].extend(_controller_execute_blockers(live_operations))
 
@@ -209,6 +211,14 @@ def _run_execute(
 
     result["blocking_reasons"] = _dedupe_warnings(list(result["blocking_reasons"]))
     if result["blocking_reasons"]:
+        if not result.get("failure_stage"):
+            blockers = set(result["blocking_reasons"])
+            if "previous_live_error_requires_manual_review" in blockers:
+                result["failure_stage"] = "previous_error_review_gate"
+            elif any(item.startswith("live_daily_order_cap_reached") for item in blockers) or "live_max_daily_orders_reached" in blockers or "live_max_daily_notional_reached" in blockers:
+                result["failure_stage"] = "daily_cap_gate"
+            else:
+                result["failure_stage"] = "pre_client_gate"
         return _finalize(root=root, filename=_RESULT_FILENAME, payload=result, status="BLOCKED", phase="pre_client_gates")
 
     api_key: str | None = None
